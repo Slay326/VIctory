@@ -516,16 +516,6 @@ fn indexed_loads_and_atomics_of_structured_buffers_read_raw_views() {
 /// indices"): a texture descriptor read as a buffer one is a wild address.
 #[test]
 fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
-    let shader = build(
-        HEAP_ELEMENT_WAVE32,
-        vec![
-            param(RootType::Constants, 0),
-            param(RootType::ResourceHeap, 1),
-            param(RootType::Table, 2),
-        ],
-        vec![entry(ResourceType::Uav, 4, 2)],
-        32,
-    );
     let texel = [[1.0f32, 2.0, 3.0, 4.0]];
     let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -537,6 +527,21 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // The null views lie at the end of the host's view heap, which is
+        // smaller on a host that caps it: translated for each host (the
+        // test host's heap for `View::NullBuffers` is sized the same way).
+        let slots = host.view_heap_limit();
+        super::set_view_heap(slots, slots);
+        let shader = build(
+            HEAP_ELEMENT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        );
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -555,6 +560,8 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         let words = host
             .dispatch(&root, &pso, &dispatch)
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        // As other tests translate: for a heap of the default size.
+        super::set_view_heap(super::HEAP_VIEWS, super::HEAP_VIEWS);
         assert_eq!(words[0], [0; 32], "{label}");
         ran += 1;
     }
