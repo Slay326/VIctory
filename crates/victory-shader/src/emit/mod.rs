@@ -231,7 +231,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
-    VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, heap_views,
+    HEAP_USED, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, heap_views,
     null_buffer_view, set_view_heap, title_views,
 };
 
@@ -335,6 +335,12 @@ pub struct HostShader {
     /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
     /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
+    /// Whether the host binds the heap-usage bitmap `u1` in
+    /// [`MEMORY_SPACE`]: shaders taking resource views from the heap itself
+    /// set bit `index` for each slot they read (once per wave when uniform),
+    /// so that the host makes the views it left null (placed textures) the
+    /// next time.
+    pub heap_usage: bool,
     /// Whether it reads buffer views' title addresses from their
     /// descriptors: the host binds the view addresses `t1` in
     /// [`MEMORY_SPACE`] (module notes, "Title memory").
@@ -560,6 +566,7 @@ pub fn emit_with(
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        heap_usage: l.heap_usage,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -919,6 +926,7 @@ mod tests {
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            heap_usage: false,
             view_addresses: false,
             heap: false,
             heap_writes: false,
@@ -936,6 +944,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
+                heap_usage: false,
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,

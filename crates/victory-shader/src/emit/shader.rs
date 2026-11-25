@@ -74,6 +74,9 @@ pub const VIEW_MARKS: u32 = 2;
 /// The written-pages bitmap of buffer views: `u1` (a raw root UAV) in
 /// [`MEMORY_SPACE`].
 pub const VIEW_WRITES: u32 = 1;
+/// The heap-usage bitmap's register: `u3` (a raw root UAV) in
+/// [`MEMORY_SPACE`] (`u1` is the buffer views' written-pages bitmap).
+pub const HEAP_USED: u32 = 3;
 /// A view-mark table entry's base for a slot whose writes are not marked.
 pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the written-pages bitmap of buffer views; marks past it go to
@@ -148,6 +151,8 @@ pub(crate) struct Shader {
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
     pub memory_dirty: Option<V>,
+    /// The heap-usage bitmap's handle, once a heap slot is marked.
+    pub heap_used: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
     /// The view-mark table's and the buffer views' written-pages bitmap's
@@ -217,6 +222,7 @@ impl Shader {
             root_uavs: Vec::new(),
             memory: None,
             memory_dirty: None,
+            heap_used: None,
             view_addresses: None,
             view_marks: None,
             view_writes: None,
@@ -501,6 +507,17 @@ impl Shader {
         h
     }
 
+    /// The handle of the heap-usage bitmap (`u3` in [`MEMORY_SPACE`], a raw
+    /// buffer), made in the entry block.
+    pub fn heap_used_handle(&mut self) -> V {
+        if let Some(h) = self.heap_used {
+            return h;
+        }
+        let h = self.memory_space_handle(HEAP_USED, true);
+        self.heap_used = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -596,6 +613,7 @@ impl Shader {
             || !self.root_uavs.is_empty()
             || self.memory.is_some()
             || self.memory_dirty.is_some()
+            || self.heap_used.is_some()
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
             || self.view_writes.is_some()
@@ -695,7 +713,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() || self.heap_used.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -710,6 +728,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .chain(self.heap_used.map(|_| (MEMORY_SPACE, HEAP_USED)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
