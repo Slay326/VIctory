@@ -93,6 +93,7 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave_max: 64,
     });
     let result = result?;
     let shader = HostShader {
