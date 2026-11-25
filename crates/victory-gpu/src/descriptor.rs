@@ -181,9 +181,7 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
-                }
+                host.sync(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
         }
     }
@@ -838,6 +836,51 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5), "made at the sync");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    /// A sync goes over every slot of the 64 KiB the title wrote in: the
+    /// slots whose records stayed keep what they were made from, a slot
+    /// whose record went is unmade, and one that gets a record is made.
+    #[cfg(windows)]
+    #[test]
+    fn a_sync_makes_only_the_slots_whose_records_changed() {
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            // SAFETY: (all three) 16 bytes of a slot of the heap's memory,
+            // ours; its page is guarded (our handler opens it).
+            let write = |slot: u64, record: &[u64; 2]| unsafe {
+                std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), (memory as u64 + slot * 16) as *mut u8, 16);
+            };
+            write(5, &elsewhere);
+            sync_heaps();
+            assert!(host.made(5) && !host.made(9));
+            write(9, &elsewhere);
+            sync_heaps();
+            assert!(host.made(5) && host.made(9), "the slot written, the other as it was");
+            write(5, &[0; 2]);
+            sync_heaps();
+            assert!(!host.made(5) && host.made(9), "a record that went");
+            write(5, &elsewhere);
+            sync_heaps();
+            assert!(host.made(5) && host.made(9), "and came back");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
