@@ -5084,12 +5084,32 @@ impl<'a> Lower<'a> {
     /// buffer one (a wild address: the texture's address shifted 8 bits
     /// down) and faulted the device.
     fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
-        // Typed, raw and structured buffers (DXIL resource kinds 10-12).
-        if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
+        if sampler || !self.is_heap_direct(src) {
             return index;
         }
+        // Typed, raw and structured buffers (DXIL resource kinds 10-12).
+        let buffer = (10..=12).contains(&(props.0 & 0xFF));
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let (views, title) = (super::heap_views(), super::title_views());
+        // The null unordered access view sits just below the null SRV.
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
+        // A host whose heaps mirror fewer title slots than the title may
+        // have (`super::set_view_heap`): what follows them there are the
+        // host's own slots, not the title's, so an index from data at or
+        // past them reads a null slot. Not where a path takes the
+        // descriptor from a table: a table made afresh lies past them.
+        let index = if title < views && self.is_heap_only(src) {
+            let end = self.s.m.i32(title);
+            let past = self.s.m.cmp(c, pred::IUGE, index, end);
+            let none = self.s.m.i32(if buffer { null } else { views - 1 });
+            self.s.m.select(c, past, none, index)
+        } else {
+            index
+        };
+        if !buffer {
+            return index;
+        }
+        let last = self.s.m.i32(views - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5101,10 +5121,14 @@ impl<'a> Lower<'a> {
         let stride = self.as_int(x);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
-        // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
+    }
+
+    /// Whether a descriptor comes from the resource heap itself on every
+    /// path.
+    fn is_heap_only(&self, src: &Source) -> bool {
+        src.leaves().iter().all(|l| self.is_heap_direct(l))
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
