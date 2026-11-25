@@ -624,7 +624,7 @@ impl HostHeap {
             // made afresh on a host whose heap is smaller than the title's
             // read past the title slots' entries: whatever followed the
             // buffer, or a GPU fault).
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -664,7 +664,7 @@ impl HostHeap {
         let (_, data, _) = self.addresses.get()?.as_ref()?;
         assert!(index < self.address_slots());
         // SAFETY: an entry of the mapped view addresses (checked).
-        let [lo, hi] = unsafe { ((data + 8 * index as usize) as *const [u32; 2]).read_unaligned() };
+        let [lo, hi] = unsafe { ((data + 16 * index as usize) as *const [u32; 2]).read_unaligned() };
         Some(u64::from(hi) << 32 | u64::from(lo))
     }
 
@@ -993,14 +993,35 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 }
 
 /// Writes slot `index`'s view address into the view addresses at `data`
-/// (the caller keeps `index` below [`HostHeap::address_slots`]):
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// (the caller keeps `index` below [`HostHeap::address_slots`]): a
+/// buffer view's title address (dword 0 low, dword 1 bits 0-15 high), its
+/// record count (dword 2) and its format and type (dword 3), the last two
+/// as the title's own descriptor holds them; zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
     let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    let words = view
+        .filter(|v| buffer_range(v).is_some())
+        .and_then(buffer_words)
+        .unwrap_or([0; 10]);
+    let table = [
+        address as u32,
+        (address >> 32) as u32 & 0xFFFF,
+        words[2],
+        words[3],
+    ];
+    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(table) };
+}
+
+/// The title's own descriptor words of a buffer view (the console's buffer
+/// descriptor, 10 dwords), for the fields a shader reads as data.
+fn buffer_words(view: &View) -> Option<[u32; 10]> {
+    match view {
+        View::Shader(_, Some(desc)) => Some(*desc),
+        View::Unordered(_, _, Some(desc)) => Some(*desc),
+        View::Placed(_, resource, words) if resource[0] == 1 => words[..10].try_into().ok(),
+        _ => None,
+    }
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
