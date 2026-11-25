@@ -4075,9 +4075,36 @@ impl<'a> Lower<'a> {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
+                if let Some(scc) = self.drained_scc(b, i) {
+                    let clear = self.s.m.bool(false);
+                    self.vals.insert(scc, Val::Bit(clear));
+                }
                 Ok(())
             }
         }
+    }
+
+    /// The SCC instruction `i` of block `b` writes, where it is known clear
+    /// wherever it is read: a scalar operation writing EXEC sets SCC to
+    /// "EXEC is not empty", and a block that ends in `s_cbranch_execnz` to
+    /// itself (the compiler's loop over the lanes of a non-uniform index)
+    /// is left only with EXEC empty. Nothing in the block may write EXEC
+    /// after it or read that SCC (there it still says whether to loop).
+    fn drained_scc(&self, b: usize, i: usize) -> Option<Value> {
+        let blk = &self.x.p.blocks[b];
+        let inst = &blk.insts[i];
+        let scc = inst.write(Reg::Scc)?;
+        let exec = |x: &Inst| x.write(Reg::S(EXEC)).is_some() || x.write(Reg::S(EXEC + 1)).is_some();
+        if !matches!(inst.fields, Fields::Sop { .. }) || !exec(inst) {
+            return None;
+        }
+        let last = blk.insts.last()?;
+        let loops = last.name() == "s_cbranch_execnz"
+            && matches!(blk.exit, Exit::Branch { taken, .. } if taken == b);
+        let later = &blk.insts[i + 1..];
+        let untouched = later.iter().all(|x| !exec(x) && x.read(Reg::Scc) != Some(scc));
+        let joined = blk.phis.iter().any(|p| p.args.contains(&scc));
+        (loops && untouched && !joined).then_some(scc)
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -12017,6 +12044,34 @@ mod tests {
         ];
         let (layout, used) = texture_and_uav_tables();
         lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    #[test]
+    fn the_scc_a_drained_lane_loop_leaves_is_clear() {
+        // As `bvh_skinning:CSComputeSkinningPedBlendShapes*` after an empty
+        // loop over the lanes of an index: `s_cselect_b32` reads the SCC of
+        // the loop's `s_andn2_wrexec_b32`, clear once EXEC is empty, which
+        // is the only way out of the loop. The mask it picks (none) is then
+        // joined with a comparison and selects per lane.
+        let words = [
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0xBE83_037E, // s_mov_b32 s3, exec_lo
+            0xBE86_037E, // s_mov_b32 s6, exec_lo
+            0x7E0E_0510, // L: v_readfirstlane_b32 s7, v16
+            0x7DA4_2007, // v_cmpx_eq_u32 exec_lo, s7, v16
+            0xBE86_4706, // s_andn2_wrexec_b32 s6, s6
+            0xBF89_FFFC, // s_cbranch_execnz L
+            0xBEFE_0303, // s_mov_b32 exec_lo, s3
+            0x7D8A_0080, // v_cmp_ne_u32 vcc_lo, 0, v0
+            0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+            0x8803_036A, // s_or_b32 s3, vcc_lo, s3
+            0xD501_0001,
+            0x000E_2100, // v_cndmask_b32 v1, v0, v16, s3
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
     }
 
     #[test]
