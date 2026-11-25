@@ -50,6 +50,53 @@ pub(crate) struct Staging {
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
+    /// Whether the staging buffer was detiled since a submitted list last
+    /// copied it into the host texture, and whether one has copied it at
+    /// all: a list records the copy only then. (Every list that sampled a
+    /// title texture copied all of it again, changed or not: about 3,000
+    /// subresource copies in a world frame of Grand Theft Auto VI, 23 ms
+    /// of its GPU time.)
+    held: Held,
+}
+
+/// Whether a host texture holds its staging buffer's contents.
+struct Held {
+    /// The staging buffer was detiled since a submitted list last copied it.
+    dirty: std::sync::atomic::AtomicBool,
+    /// A submitted list has copied it.
+    uploaded: std::sync::atomic::AtomicBool,
+}
+
+impl Held {
+    fn new() -> Held {
+        Held { dirty: false.into(), uploaded: false.into() }
+    }
+
+    /// Whether the host texture has the staging buffer's contents: a list
+    /// need not copy them.
+    fn current(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.load(Relaxed) && !self.dirty.load(Relaxed)
+    }
+
+    /// Whether the staging buffer was detiled and no list has copied it
+    /// since.
+    fn waiting(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The staging buffer was detiled.
+    fn detiled(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A list being submitted copies the staging buffer into the host
+    /// texture.
+    fn copied(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -187,10 +234,13 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
-/// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// Records, once per list, the detiling that refreshes `resource`'s
+/// staging buffer at submission if the memory changed, and the copy of the
+/// staging buffer into the host copy if that does not hold its contents
+/// yet (the texture is then left in the copy destination state). What the
+/// check at submission finds changed, the next list recorded that samples
+/// the texture copies: a frame late where every list of the frame was
+/// recorded before that check.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
@@ -202,11 +252,45 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    if staging.held.current() {
+        // The host texture has the staging buffer's contents: only the
+        // check at submission is left.
+        #[cfg(feature = "diagnostics")]
+        COPIES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        list.defer_texture(staging);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    COPIES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     record(list, resource, texture, &staging);
+    // When the list is submitted, its copy takes what the staging buffer
+    // holds by then: noted before the check below, which sets `dirty`
+    // again if it detiles (the next list then copies once more).
+    {
+        let staging = staging.clone();
+        list.defer_host(move || staging.held.copied());
+    }
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
+}
+
+/// Lists that recorded a texture's copy from its staging buffer, and lists
+/// that did not need to, since the last frame-rate line (diagnostics).
+#[cfg(feature = "diagnostics")]
+static COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Logs [`COPIES`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_copies(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [copied, skipped] = [0, 1].map(|i| COPIES[i].swap(0, Relaxed) as f64 / frames.max(1.0));
+    if copied + skipped > 0.0 {
+        tracing::info!(
+            "sampled title textures per frame: {copied:.1} copied from their staging buffers by a list, {skipped:.1} uses by lists that found them current"
+        );
+    }
 }
 
 /// For textures shaders reach through the heap itself, at submission
@@ -221,11 +305,15 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     let Some(staging) = staging(resource, texture) else {
         return false;
     };
-    if !staging.refresh() {
+    // Also what an earlier check detiled and no list has copied since.
+    let detiled = staging.refresh();
+    if !detiled && !staging.held.waiting() {
         return false;
     }
     record(list, resource, texture, &staging);
     list.keep(&staging.buffer);
+    // The list runs in this submission, ahead of its other lists.
+    staging.held.copied();
     true
 }
 
@@ -342,6 +430,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        self.held.detiled();
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -478,6 +567,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
+        held: Held::new(),
     });
     *held = Some(s.clone());
     Some(s)
@@ -486,6 +576,27 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list copies a texture's staging buffer only while the host
+    /// texture does not hold its contents: before the first copy, and after
+    /// a check at submission detiled the memory again.
+    #[test]
+    fn a_texture_is_copied_again_only_after_it_was_detiled() {
+        let held = Held::new();
+        assert!(!held.current(), "never copied");
+        // The first list's submission: its copy is noted, then the check
+        // detiles (everything is changed at first).
+        held.copied();
+        held.detiled();
+        assert!(!held.current(), "the next list copies once more");
+        held.copied();
+        assert!(held.current(), "later lists do not");
+        // The title writes the memory: found at a submission.
+        held.detiled();
+        assert!(!held.current() && held.waiting());
+        held.copied();
+        assert!(held.current() && !held.waiting());
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
