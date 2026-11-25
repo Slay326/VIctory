@@ -977,6 +977,7 @@ impl Host {
         // Copies in the GPU's own memory: what changed goes up, ahead of
         // the lists on the queue.
         let _carded = self.card_before();
+        let card_marks = self.card_marks();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1002,6 +1003,13 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // Behind the last of the lists: the written-pages bitmap
+                // comes down from the GPU's memory.
+                if i + 1 == groups.len()
+                    && let Some((marks, _)) = &card_marks
+                {
+                    self.queue.ExecuteCommandLists(&[Some(marks.clone())]);
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1098,6 +1106,9 @@ impl Host {
         // Of copies in the GPU's memory, what shaders wrote without marks
         // comes down first, for the snapshots' compares below.
         self.card_declared(runs);
+        if let Some((_, bytes)) = &card_marks {
+            crate::shadow::marks_fetched(*bytes);
+        }
         crate::shadow::copy_back_marks(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);

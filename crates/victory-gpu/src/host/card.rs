@@ -36,6 +36,8 @@ struct Work {
     sync: OwnList,
     /// After it ran: what shaders wrote comes down.
     fetch: OwnList,
+    /// Behind a submission's lists: the written-pages bitmap comes down.
+    marks: OwnList,
     /// For the waits for fetches.
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
@@ -144,6 +146,7 @@ impl Host {
             Ok(Work {
                 sync: list()?,
                 fetch: list()?,
+                marks: list()?,
                 fence: self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
                 sent: 0,
@@ -160,7 +163,10 @@ impl Host {
             return Vec::new();
         }
         let dirty = crate::shadow::card_dirty();
-        if dirty.is_empty() {
+        // The written-pages bitmap in the GPU's memory starts each
+        // submission clear (the last one's bits were fetched).
+        let marks = crate::shadow::card_marks();
+        if dirty.is_empty() && marks.is_none() {
             return Vec::new();
         }
         let Some(work) = work() else {
@@ -174,6 +180,9 @@ impl Host {
             (|| -> windows::core::Result<()> {
                 allocator.Reset()?;
                 list.Reset(allocator, None)?;
+                if let Some((marks, zeros, _, bytes)) = &marks {
+                    list.CopyBufferRegion(marks, 0, zeros, 0, *bytes);
+                }
                 for (shadow, ranges) in &dirty {
                     let Some(staging) = shadow.card_staging() else {
                         continue;
@@ -193,6 +202,31 @@ impl Host {
             fail(format_args!("host copies in GPU memory could not be brought up to date ({e})"));
         }
         dirty.into_iter().map(|(shadow, _)| shadow).collect()
+    }
+
+    /// With the written-pages bitmap in the GPU's memory: the list that
+    /// copies it down, to send behind the submission's lists (the wait for
+    /// them is the wait for it), and the bytes it copies
+    /// (`crate::shadow::marks_fetched`, once it has run).
+    pub(super) fn card_marks(&self) -> Option<(ID3D12CommandList, u64)> {
+        let (marks, _, fetched, bytes) = crate::shadow::card_marks()?;
+        let work = work()?;
+        let (allocator, list) = &work.marks;
+        // SAFETY: the list's last run finished (it ran behind a submission
+        // that was waited for); live buffers of at least `bytes` bytes.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<ID3D12CommandList> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.CopyBufferRegion(&fetched, 0, &marks, 0, bytes);
+                list.Close()?;
+                list.cast()
+            })()
+        };
+        match recorded {
+            Ok(list) => Some((list, bytes)),
+            Err(e) => fail(format_args!("the views' written pages could not be fetched from GPU memory ({e})")),
+        }
     }
 
     /// After the submission ran: the ranges its lists declared as written
