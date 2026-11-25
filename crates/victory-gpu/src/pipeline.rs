@@ -178,6 +178,9 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
+    // The device first: it tells the translator (and the shader cache's
+    // key) its widest wave.
+    crate::host::host();
     let (host, cached) = crate::shader_cache::host_shader(container);
     (host.and_then(|host| with_resources(container, host)), cached)
 }

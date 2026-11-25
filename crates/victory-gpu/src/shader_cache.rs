@@ -23,25 +23,45 @@ use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
-static CACHE: OnceLock<Cache> = OnceLock::new();
+/// The folder `use_shader_cache` names, and the cache in it, opened on first
+/// use ([`cache`]).
+static BASE: OnceLock<PathBuf> = OnceLock::new();
+static CACHE: OnceLock<Option<(Cache, PathBuf)>> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in a folder of `dir` from now on: the folder
-/// of this translator, `None` if it cannot be opened.
-pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
-    match Cache::open(&dir) {
-        Ok(cache) => {
-            tracing::info!(dir = %dir.display(), "shader cache");
-            let _ = CACHE.set(cache);
-            Some(dir)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "no shader cache");
-            None
-        }
-    }
+/// Keeps translated shaders in a folder of `dir` from now on: the folder of
+/// this translator and its settings. It is opened on the first translation,
+/// not here: the key names the device's widest wave, which a run learns
+/// only when it creates its device, after this.
+pub fn use_shader_cache(dir: PathBuf) {
+    let _ = BASE.set(dir);
+}
+
+/// The cache's folder, opening it now (`None`: no cache, or it cannot be
+/// opened). After the device, if one is to set the wave width.
+pub fn shader_cache_dir() -> Option<PathBuf> {
+    cache().map(|(_, dir)| dir.clone())
+}
+
+fn cache() -> Option<&'static (Cache, PathBuf)> {
+    CACHE
+        .get_or_init(|| {
+            let dir = BASE
+                .get()?
+                .join(&blake3::Hash::from(*build()).to_hex()[..16]);
+            match Cache::open(&dir) {
+                Ok(cache) => {
+                    tracing::info!(dir = %dir.display(), "shader cache");
+                    Some((cache, dir))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no shader cache");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -94,8 +114,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+    match cache() {
+        Some((cache, _)) => cached(cache, build(), container, translate),
         None => (translate(container), false),
     }
 }
