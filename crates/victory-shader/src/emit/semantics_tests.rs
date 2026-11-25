@@ -248,6 +248,11 @@ fn program(body: &[u32], scalar: bool) -> Vec<u32> {
 /// bytes of LDS; one view table at s4 (the input buffer, then the output
 /// UAV), the group id in s6.
 fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+    lower_waves(words, false)
+}
+
+/// [`lower_program`], the group as one wave of 64 with `wave64`.
+fn lower_waves(words: &[u32], wave64: bool) -> Result<HostShader, String> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -260,7 +265,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -2976,6 +2981,47 @@ fn ds(op: u32, vdst: u8, addr: u8, data: u8, offset: u8) -> [u32; 2] {
         0xD800_0000 | op << 18 | u32::from(offset),
         u32::from(vdst) << 24 | u32::from(data) << 8 | u32::from(addr),
     ]
+}
+
+/// A group that is one console wave shares LDS without `s_barrier` (the
+/// wave's lanes run in lockstep, so the console compiler leaves the
+/// source's barriers out): each thread reads what another one wrote, then
+/// what that one wrote next, whatever the host's wave size.
+#[test]
+fn one_wave_shares_lds_on_any_host() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let inputs: Vec<[u32; 4]> = (0..128).map(|t| [3 * t + 7, 0, 0, 0]).collect();
+    let mut body = vec![vop2(0x1A, 11, int(2), 0)]; // v_lshlrev_b32 v11, 2, v0
+    body.extend(ds(0x0D, 0, 11, 1, 0)); // ds_write_b32 v11, v1
+    body.push(vop2(0x1D, 12, int(63), 0)); // v_xor_b32 v12, 63, v0
+    body.push(vop2(0x1A, 12, int(2), 12)); // v_lshlrev_b32 v12, 2, v12
+    body.extend(ds(0x36, 5, 12, 0, 0)); // ds_read_b32 v5, v12
+    body.push(vop2(0x25, 13, int(1), 5)); // v_add_nc_u32 v13, 1, v5
+    body.extend(ds(0x0D, 0, 11, 13, 0)); // ds_write_b32 v11, v13
+    body.extend(ds(0x36, 6, 12, 0, 0)); // ds_read_b32 v6, v12
+    let shader = lower_waves(&program(&body, false), true).expect("lowers");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("valid DXIL");
+    }
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no {label} device; skipped");
+            continue;
+        };
+        // No wave size asked for: a host with waves of 32 runs it too.
+        let out = run(&host, &shader, &inputs, false).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for (t, got) in out.iter().enumerate() {
+            let other = t / 64 * 64 + 63 - t % 64;
+            assert_eq!(
+                got[..2],
+                [inputs[other][0], inputs[t][0] + 1],
+                "{label}: thread {t}"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no device ran it");
 }
 
 /// LDS bytes and halves: zero and sign extension on reads, partial writes
