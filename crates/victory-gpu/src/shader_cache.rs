@@ -23,25 +23,45 @@ use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
-static CACHE: OnceLock<Cache> = OnceLock::new();
+/// The folder `use_shader_cache` names, and the cache in it, opened on first
+/// use ([`cache`]).
+static BASE: OnceLock<PathBuf> = OnceLock::new();
+static CACHE: OnceLock<Option<(Cache, PathBuf)>> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in a folder of `dir` from now on: the folder
-/// of this translator, `None` if it cannot be opened.
-pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
-    match Cache::open(&dir) {
-        Ok(cache) => {
-            tracing::info!(dir = %dir.display(), "shader cache");
-            let _ = CACHE.set(cache);
-            Some(dir)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "no shader cache");
-            None
-        }
-    }
+/// Keeps translated shaders in a folder of `dir` from now on: the folder of
+/// this translator and its settings. It is opened on the first translation,
+/// not here: the key names the device's widest wave, which a run learns
+/// only when it creates its device, after this.
+pub fn use_shader_cache(dir: PathBuf) {
+    let _ = BASE.set(dir);
+}
+
+/// The cache's folder, opening it now (`None`: no cache, or it cannot be
+/// opened). After the device, if one is to set the wave width.
+pub fn shader_cache_dir() -> Option<PathBuf> {
+    cache().map(|(_, dir)| dir.clone())
+}
+
+fn cache() -> Option<&'static (Cache, PathBuf)> {
+    CACHE
+        .get_or_init(|| {
+            let dir = BASE
+                .get()?
+                .join(&blake3::Hash::from(*build()).to_hex()[..16]);
+            match Cache::open(&dir) {
+                Ok(cache) => {
+                    tracing::info!(dir = %dir.display(), "shader cache");
+                    Some((cache, dir))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no shader cache");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -53,7 +73,9 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// change at run time, and the host's widest wave, which decides whether
+/// console wave64 programs run split). Taken on first use, after the device
+/// has set the wave width.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,18 +86,24 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            victory_shader::emit::host_wave_max(),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, wave: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&wave.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -113,8 +141,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         victory_shader::emit::heap_views(),
         victory_shader::emit::title_views(),
     );
-    match CACHE.get() {
-        Some(cache) => cached(
+    match cache() {
+        Some((cache, _)) => cached(
             cache,
             &host_build(build(), views, title),
             container,
@@ -463,15 +491,17 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
+    /// this file's encoding, the loop limit, the host's wave width) makes
+    /// another key, so no entry
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 64);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 64));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 64));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 64));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 64));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 32));
         // A host with smaller view heaps has entries of its own.
         let views = victory_shader::emit::HEAP_VIEWS;
         assert_eq!(host_build(&k, views, views), k);
@@ -485,7 +515,8 @@ mod tests {
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::host_wave_max()
             )
         );
         // The encoding part is this file as built.
