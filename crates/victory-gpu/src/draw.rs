@@ -930,6 +930,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             dropped(list, self.pipeline, "dispatch");
+            list.note_op(|| self.op_text(format!("SKIPPED dispatch {x}x{y}x{z}"), true));
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1840,6 +1841,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
                 crate::texture::upload(list, *resource as This, t);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_read(list, *resource as This);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.

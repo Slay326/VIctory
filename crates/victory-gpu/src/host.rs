@@ -1061,6 +1061,28 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        // Diagnostics (local): a timed list that runs on is
+                        // named with its commands while it still runs.
+                        #[cfg(feature = "diagnostics")]
+                        if timing() {
+                            let mut waits = 0u32;
+                            while WaitForSingleObject(self.event, 5000).0 != 0 {
+                                waits += 1;
+                                if waits == 1 {
+                                    let notes = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner());
+                                    tracing::warn!(sub = *submitted, commands = notes.len(), "host list still running after 5 s");
+                                    for (k, (op, _)) in notes.iter().enumerate() {
+                                        let op: String = op.chars().take(160).collect();
+                                        tracing::warn!("still running list command #{k}: {op}");
+                                    }
+                                } else {
+                                    tracing::warn!(sub = *submitted, seconds = waits * 5, "host list still running");
+                                }
+                            }
+                        } else {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        #[cfg(not(feature = "diagnostics"))]
                         WaitForSingleObject(self.event, INFINITE);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),

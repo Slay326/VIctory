@@ -257,6 +257,27 @@ pub(crate) fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
+/// Diagnostics (local): `VICTORY_DUMP_READS=<hash,...>`: textures a
+/// pipeline with one of those shaders reads are dumped after the
+/// submission too (`-by-read...` in the name), in listed frames.
+pub(crate) fn note_read(list: &crate::host::HostList, resource: crate::object::This) {
+    static READS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    if resource.is_null() || !dump_on() {
+        return;
+    }
+    let reads = READS.get_or_init(|| {
+        let list = std::env::var("VICTORY_DUMP_READS").unwrap_or_default();
+        list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
+    });
+    if reads.is_empty() {
+        return;
+    }
+    let by = WRITER.with(|w| w.borrow().clone());
+    if reads.iter().any(|h| by.contains(h.as_str())) {
+        list.note_target(resource as usize, &format!("read{by}"));
+    }
+}
+
 /// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
 static WRITERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
@@ -628,6 +649,16 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            let mut alpha = [0usize; 256];
+            for y in 0..h {
+                for x in 0..w {
+                    alpha[usize::from(px(x, y, 4)[3])] += 1;
+                }
+            }
+            let mut top: Vec<(usize, usize)> = alpha.iter().copied().enumerate().filter(|a| a.1 > 0).collect();
+            top.sort_by_key(|a| std::cmp::Reverse(a.1));
+            top.truncate(12);
+            tracing::info!(format, ?top, "target alpha values (value, pixels)");
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -664,7 +695,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        42..=43 => (4, Box::new(move |b| [u32_at(b, 0) as f32; 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -704,7 +736,16 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
     let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    let mut hist: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for v in &values {
+        if hist.len() < 4096 {
+            *hist.entry(v[0].to_bits()).or_default() += 1;
+        }
+    }
+    let mut top: Vec<(f32, usize)> = hist.into_iter().map(|(k, n)| (f32::from_bits(k), n)).collect();
+    top.sort_by_key(|a| std::cmp::Reverse(a.1));
+    top.truncate(8);
+    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, ?top, "target values");
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
