@@ -171,7 +171,12 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        #[cfg(feature = "diagnostics")]
+        let taking = std::time::Instant::now();
+        let taken = written.take(start as usize, usize::MAX);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncTakeUs, taking.elapsed().as_micros() as u64);
+        for (from, to) in taken {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
@@ -181,6 +186,11 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::SyncPages, 1);
+                    crate::copystat::add(crate::copystat::C::SyncSlots, last.min(u64::from(heap.desc.count)).saturating_sub(first));
+                }
                 host.sync(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
         }

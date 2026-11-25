@@ -94,8 +94,20 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// (local) Preparing a submission, by part.
+    SyncHeapsUs,
+    DeferredUs,
+    CardBeforeUs,
+    CardMarksUs,
+    /// (local) Heap sync: time taking the written ranges, pages and slots
+    /// looked at, slots made again, of those the ones left for a draw.
+    SyncTakeUs,
+    SyncPages,
+    SyncSlots,
+    SyncMade,
+    SyncLater,
 }
-const COUNTERS: usize = 57;
+const COUNTERS: usize = 66;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -290,6 +302,21 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "  preparing by part per frame: heap sync {:.1} ms, deferred steps {:.1} ms, copies sent up {:.1} ms, marks list {:.1} ms",
+        ms(c[C::SyncHeapsUs as usize]),
+        ms(c[C::DeferredUs as usize]),
+        ms(c[C::CardBeforeUs as usize]),
+        ms(c[C::CardMarksUs as usize]),
+    );
+    tracing::info!(
+        "  heap sync per frame: {:.1} ms taking written ranges, {:.0} pages, {:.0} slots looked at, {:.0} made again ({:.0} of them left for a draw)",
+        ms(c[C::SyncTakeUs as usize]),
+        c[C::SyncPages as usize],
+        c[C::SyncSlots as usize],
+        c[C::SyncMade as usize],
+        c[C::SyncLater as usize],
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()
