@@ -781,6 +781,11 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
+            #[cfg(feature = "diagnostics")]
+            if !for_draw {
+                crate::copystat::add(crate::copystat::C::SyncMade, 1);
+                crate::copystat::add(crate::copystat::C::SyncLater, u64::from(later));
+            }
             made[index as usize] = if later { 0 } else { key };
             let (kept, mark) = if later {
                 (None, None)

@@ -910,7 +910,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        #[cfg(feature = "diagnostics")]
+        let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -963,6 +967,8 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        #[cfg(feature = "diagnostics")]
+        let deferring = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::DeferredUs);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -974,10 +980,20 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(deferring);
         // Copies in the GPU's own memory: what changed goes up, ahead of
         // the lists on the queue.
+        #[cfg(feature = "diagnostics")]
+        let carding = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CardBeforeUs);
         let _carded = self.card_before();
+        #[cfg(feature = "diagnostics")]
+        drop(carding);
+        #[cfg(feature = "diagnostics")]
+        let marking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CardMarksUs);
         let card_marks = self.card_marks();
+        #[cfg(feature = "diagnostics")]
+        drop(marking);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
