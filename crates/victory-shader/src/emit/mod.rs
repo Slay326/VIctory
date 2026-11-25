@@ -209,6 +209,8 @@ mod semantics_tests;
 mod shader;
 mod split;
 #[cfg(all(test, windows))]
+mod heap_mark_tests;
+#[cfg(all(test, windows))]
 mod split_perf_tests;
 #[cfg(all(test, windows))]
 mod split_tests;

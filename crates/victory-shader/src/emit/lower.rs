@@ -272,6 +272,10 @@ struct Lower<'a> {
     /// Guarded regions ([`Self::begin_guarded`]) open around `cur`: their
     /// lanes are a subset, so no barrier there.
     guard_depth: u32,
+    /// Heap-usage marks (bitmap byte offset, bit) not yet set: each is set
+    /// at the end of the block that read the slot, only where still clear
+    /// ([`Self::flush_heap_marks`]).
+    heap_marks: Vec<(V, V)>,
     /// Values known to be (or not be) the same in every lane
     /// ([`Self::uniform_value`]).
     uniform: std::cell::RefCell<HashMap<Value, bool>>,
@@ -350,6 +354,10 @@ thread_local! {
     /// Timing only (`split_perf_tests`): lower without thread-group
     /// barriers, to measure what they cost. Results are then undefined.
     pub(crate) static NO_GROUP_BARRIERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `heap_mark_tests`: lower with heap-usage marks (off in other tests,
+    /// see [`heap_usage_marks`]); with the second `false`, every read's
+    /// atomic right away, unguarded (as before the guard, for timing).
+    pub(crate) static TEST_HEAP_MARKS: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, true)) };
 }
 
 /// Exchange dwords per host wave in a split program.
@@ -740,6 +748,7 @@ impl<'a> Lower<'a> {
             mode16: Some(0),
             split,
             guard_depth: 0,
+            heap_marks: Vec::new(),
             uniform: std::cell::RefCell::new(HashMap::new()),
         }
     }
@@ -1461,7 +1470,9 @@ impl<'a> Lower<'a> {
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
-                    // A pixel's discard: the lanes stay on as helpers.
+                    // A pixel's discard: the lanes stay on as helpers (whose
+                    // marks would be dropped: set them first).
+                    self.flush_heap_marks();
                     let at = self.cur;
                     let offset = p.blocks[b].insts[i].machine.offset;
                     let kill = self
@@ -1482,6 +1493,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            self.flush_heap_marks();
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -5831,11 +5843,14 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
-    /// Sets bit `index` of the heap-usage bitmap, in every lane.
-    /// shortcut: no branch to a single lane when the index is uniform:
-    /// callers keep emitting into the block they started in, so a split
-    /// here broke dominance ("forward reference outside a phi", run vu12);
-    /// every lane's atomic OR costs more GPU time.
+    /// Marks heap slot `index` read: bit `index` of the heap-usage bitmap.
+    /// Callers keep emitting into the block they started in, so no branch
+    /// here (a split broke dominance, "forward reference outside a phi"):
+    /// the mark waits for the end of the block ([`Self::flush_heap_marks`]),
+    /// where a load comes first and the atomic OR only where the bit is
+    /// still clear. Unconditional atomics, every lane on the same dword,
+    /// cost ~100 ms of GPU time a frame in the world. Inside guarded code
+    /// the index does not reach the block's end: an atomic right away.
     fn mark_heap_use(&mut self, index: V, _uniform: bool) {
         let bitmap = self.s.heap_used_handle();
         let c = self.cur;
@@ -5844,13 +5859,46 @@ impl<'a> Lower<'a> {
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Byte offset of the bitmap dword; operation 2 is OR.
+        // Byte offset of the bitmap dword.
         let word = self.s.m.bin(c, Bin::LShr, index, k5);
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, index, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        #[cfg(test)]
+        let guarded = TEST_HEAP_MARKS.with(std::cell::Cell::get).1;
+        #[cfg(not(test))]
+        let guarded = true;
+        if self.guard_depth == 0 && guarded {
+            if !self.heap_marks.contains(&(word, bit)) {
+                self.heap_marks.push((word, bit));
+            }
+            return;
+        }
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 2 is OR.
         self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+    }
+
+    /// Sets the heap-usage marks of the block so far ([`Self::mark_heap_use`]),
+    /// each only in the lanes that find its bit clear: most reads find their
+    /// slot marked, a load and no atomic.
+    fn flush_heap_marks(&mut self) {
+        if self.heap_marks.is_empty() {
+            return;
+        }
+        let bitmap = self.s.heap_used_handle();
+        for (word, bit) in std::mem::take(&mut self.heap_marks) {
+            let c = self.cur;
+            let zero = self.s.m.i32(0);
+            let old = self.raw_dword(bitmap, word);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            let at = self.begin_guarded(Some(clear));
+            let (k2, iu) = (self.s.m.i32(2), self.s.m.undef(self.s.t.i32));
+            // Operation 2 is OR.
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+            self.end_guarded(at, &[]);
+        }
     }
 
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
@@ -9823,6 +9871,10 @@ impl<'a> Lower<'a> {
         if e.compressed {
             return Err("a compressed export");
         }
+        if self.s.pixel {
+            // Lanes a pixel export discards drop their marks.
+            self.flush_heap_marks();
+        }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
@@ -11463,10 +11515,15 @@ mod tests {
 /// (`VICTORY_HEAP_USAGE`, on unless 0). Off, shaders are as before.
 fn heap_usage_marks() -> bool {
     // shortcut: off in unit tests, whose hardware harness binds only the
-    // root parameters each test names (the bitmap would be unbound).
-    if cfg!(test) {
-        return false;
+    // root parameters each test names (the bitmap would be unbound), but
+    // for the tests that bind it (`TEST_HEAP_MARKS`).
+    #[cfg(test)]
+    {
+        TEST_HEAP_MARKS.with(std::cell::Cell::get).0
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
+    }
 }
