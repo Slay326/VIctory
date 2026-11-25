@@ -1260,6 +1260,10 @@ impl State {
         if !listed && probed.is_empty() {
             return;
         }
+        // (local) a listed frame: what a dispatch reads.
+        if listed && compute {
+            tracing::info!(target: "victory_gpu::trace", "compute {:#x} reads {:?}", self.pipeline, self.reads(true));
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
         for stage in &p.stages {
             let wanted = probed.iter().any(|h| stage.shader.hash.starts_with(h.as_str()));
@@ -1397,11 +1401,14 @@ impl State {
                         if buffer.0.Map(0, None, Some(&mut data)).is_err() {
                             return;
                         }
-                        let n = (f.Footprint.RowPitch * f.Footprint.Height) as usize / 4;
+                        // (local) every slice of a 3D texture.
+                        let n = (f.Footprint.RowPitch * f.Footprint.Height * f.Footprint.Depth.max(1)) as usize / 4;
                         let w = std::slice::from_raw_parts(data.cast::<u32>(), n);
                         let set = w.iter().filter(|&&x| x != 0).count();
+                        let at = w.iter().position(|&x| x != 0);
                         let first: Vec<f32> = w.iter().take(8).map(|&x| f32::from_bits(x)).collect();
-                        tracing::info!(target: "victory_gpu::trace", "written {who} right after the dispatch: {set} of {n} dwords set, first {first:?}");
+                        let some: Vec<String> = at.map(|a| w[a..].iter().take(8).map(|&x| format!("{x:x}")).collect()).unwrap_or_default();
+                        tracing::info!(target: "victory_gpu::trace", "written {who} right after the dispatch: {set} of {n} dwords set (all slices), first {first:?}, first set at dword {at:?}: {some:?}");
                         buffer.0.Unmap(0, None);
                     }
                 });
@@ -1738,6 +1745,10 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.probe_written(list);
+        }
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1861,7 +1872,7 @@ fn describe(view: Option<&View>) -> String {
             // Its console memory: another view of it (a placed one) is
             // another host texture.
             let at = crate::resource::texture_memory(r).map_or(0, |(p, _)| p as u64);
-            format!("{}x{} f{} flags {:#x} mem {at:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!("{}x{}x{} f{} flags {:#x} mem {at:#x} res {:#x}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.Flags.0, r as usize)
         })
     };
     // Small buffers (exposure, counters): their title memory now, as floats.
