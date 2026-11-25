@@ -46,9 +46,10 @@
 //! mapping not in memory at that moment read as zeros from then on, which
 //! the host reads as stored pipelines (the same fork: device removals right
 //! after a save). With the handle open they keep reading the old file
-//! (`a_replaced_library_file_still_reads_from_the_disk`). Where a system
-//! refuses to replace a mapped file, the new library waits beside it
-//! ([`NEXT_FILE`]) and takes its place at the next start.
+//! (`a_replaced_library_file_still_reads_from_the_disk`). A save goes to
+//! [`NEXT_FILE`] first and from there over the library: where a system
+//! refuses to replace a mapped file, the new library waits there and takes
+//! its place at the next start.
 //! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 
 use std::collections::{HashMap, HashSet};
@@ -303,9 +304,11 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
-/// A saved library that could not replace [`LIBRARY_FILE`] while this run
-/// had it mapped (a system that refuses to replace a mapped file): the next
-/// start renames it over the library first ([`Blob::of`]).
+/// The library saved last, while it has not yet replaced [`LIBRARY_FILE`]:
+/// every save is renamed here first, then over the library
+/// ([`replace_library`]). Where the second rename is refused (a system that
+/// refuses to replace a mapped file), the next start renames it over the
+/// library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
@@ -682,14 +685,22 @@ fn zeroed(n: usize) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// Renames the written library `tmp` over the library's file in `dir`.
-/// This run may have that file mapped: Windows replaces a mapped file it
-/// opened for sharing, and the mapping goes on reading the old one (its
-/// handle is held). Where a system refuses, the new library is left
-/// beside it as [`NEXT_FILE`] for the next start.
+/// Puts the written library `tmp` in the library's place in `dir`: renamed
+/// over [`NEXT_FILE`], then from there over the library's file, as a start
+/// does ([`Blob::of`]). So a pending file is always the newest library
+/// saved: a save that replaces the library takes it along, and one that
+/// cannot is it. (Renamed straight over the library, a save left an older
+/// pending file in place, which the next start renamed over it.)
+/// This run may have the library's file mapped: Windows replaces a mapped
+/// file it opened for sharing, and the mapping goes on reading the old one
+/// (its handle is held). Where a system refuses, the new library waits as
+/// [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE))
-        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    std::fs::rename(tmp, &next)?;
+    // Saved either way: if refused, the next start takes it.
+    let _ = std::fs::rename(&next, dir.join(LIBRARY_FILE));
+    Ok(())
 }
 
 /// Title pipelines created, and their distinct keys.
@@ -1170,6 +1181,58 @@ mod tests {
         );
     }
 
+    /// A save that cannot replace the library's file waits as the pending
+    /// file, and a later save that can takes that along: the next start
+    /// reads the newest library saved, not an older pending one.
+    #[test]
+    fn the_next_start_reads_the_library_saved_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, next) = (dir.path().join(LIBRARY_FILE), dir.path().join(NEXT_FILE));
+        let save = |byte: u8| {
+            write_library(dir.path(), 4096, |out| {
+                out.fill(byte);
+                Ok(())
+            })
+        };
+        // Opened without delete sharing, a file cannot be renamed over.
+        let hold = |path: &std::path::Path| {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1) // FILE_SHARE_READ
+                .open(path)
+                .unwrap()
+        };
+        save(1).unwrap();
+        let held = hold(&path);
+        save(2).unwrap();
+        assert_eq!(
+            std::fs::read(&next).unwrap(),
+            [2u8; 4096],
+            "waits as the pending file"
+        );
+        // Still held: the newer save replaces the pending one.
+        save(3).unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), [3u8; 4096]);
+        drop(held);
+        // Released: the next save replaces the library, pending file and all.
+        save(4).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [4u8; 4096]);
+        assert!(!next.exists(), "an older pending file left");
+        assert_eq!(Blob::of(dir.path()).bytes(), [4u8; 4096]);
+        // A pending file that cannot be replaced fails the save, and the
+        // one saved before it is what the next start reads.
+        let held = hold(&path);
+        save(5).unwrap();
+        let pending = hold(&next);
+        assert!(save(6).is_err(), "the pending file held");
+        drop((held, pending));
+        assert_eq!(Blob::of(dir.path()).bytes(), [5u8; 4096]);
+        assert!(!next.exists());
+        let left = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(left, 1, "no staging file left");
+    }
+
     /// The bytes at `at` of the pattern the test below writes.
     fn pattern(at: usize, out: &mut [u8]) {
         for (i, word) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -1307,51 +1370,28 @@ mod tests {
 
     /// A load removes the staging files of runs that ended during a save,
     /// and leaves those of running processes, this one's and other files.
+    /// No process is started for it: an ID no process can have stands for
+    /// an ended run (IDs are multiples of four from a table far smaller).
     #[test]
     fn staging_files_of_ended_runs_are_removed() {
-        let exited = |keep: bool| {
-            let mut child = std::process::Command::new("cmd")
-                .args(["/c", "exit 0"])
-                .spawn()
-                .unwrap();
-            child.wait().unwrap();
-            let pid = child.id();
-            // Dropped, no handle keeps the process: no such process. Kept,
-            // it has exited but its object lives on.
-            if keep {
-                (pid, Some(child))
-            } else {
-                (pid, None)
-            }
-        };
-        let (gone, _) = exited(false);
-        let (zombie, _held) = exited(true);
-        assert!(ended(gone), "no such process");
-        assert!(ended(zombie), "exited, a handle open");
-        assert!(!ended(std::process::id()), "this one");
+        const GONE: u32 = u32::MAX - 3;
+        assert!(ended(GONE), "no such process");
+        assert!(!ended(std::process::id()), "this one, running");
         assert!(!ended(4), "the system, which we may not open");
-        let mut running = std::process::Command::new("cmd")
-            .args(["/c", "pause"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        assert!(!ended(running.id()), "a running process");
         let dir = tempfile::tempdir().unwrap();
         let file = |name: String| {
             std::fs::write(dir.path().join(&name), b"staged").unwrap();
             name
         };
         let removed = [
-            file(format!("{LIBRARY_FILE}.tmp-{gone}-3")),
-            file(format!("{EARLY_FILE}.tmp-{gone}-0")),
-            file(format!("{PREBUILT_FILE}.tmp-{zombie}-1")),
+            file(format!("{LIBRARY_FILE}.tmp-{GONE}-3")),
+            file(format!("{EARLY_FILE}.tmp-{GONE}-0")),
+            file(format!("{PREBUILT_FILE}.tmp-{GONE}-1")),
         ];
         let kept = [
             file(format!("{LIBRARY_FILE}.tmp-{}-0", std::process::id())),
-            file(format!("{LIBRARY_FILE}.tmp-{}-0", running.id())),
             file(format!("{LIBRARY_FILE}.tmp-4-0")),
-            file(format!("other.tmp-{gone}-0")),
+            file(format!("other.tmp-{GONE}-0")),
             file(LIBRARY_FILE.to_owned()),
         ];
         let blob = Blob::of(dir.path());
@@ -1362,8 +1402,6 @@ mod tests {
         for name in &kept {
             assert!(dir.path().join(name).exists(), "{name} removed");
         }
-        let _ = running.kill();
-        let _ = running.wait();
     }
 
     /// The process's own memory a library file costs: read into memory and
