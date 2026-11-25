@@ -207,13 +207,27 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<u64> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
-    crate::host::name(&bitmap, || "heap slots read".into());
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
-    // SAFETY: a live buffer.
-    let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
-    list.keep(&bitmap);
+    let size = (words as u64 * 4).next_multiple_of(256);
+    // Shaders OR into the bitmap once per texture read, all lanes of a wave
+    // on the same dword: in system memory that held lists for seconds. In
+    // GPU memory (zeroed when made), copied to read-back memory as the
+    // list closes; `VICTORY_HEAP_USAGE_CARD=0`: system memory as before.
+    static CARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let card = *CARD.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE_CARD").map_or(true, |v| v != "0"));
+    let (gpu, data) = match card.then(|| list.usage_bitmap(size)).flatten() {
+        // A later bind of the same recording: the read-back is handled.
+        Some((gpu, _, false)) => return Some(gpu),
+        Some((gpu, data, true)) => (gpu, data),
+        None => {
+            let (bitmap, data) = crate::host::host()?.shared_buffer(size)?;
+            crate::host::name(&bitmap, || "heap slots read".into());
+            // SAFETY: our mapped buffer of at least `words` dwords.
+            unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+            list.keep(&bitmap);
+            // SAFETY: a live buffer.
+            (unsafe { bitmap.GetGPUVirtualAddress() }, data)
+        }
+    };
     let data = data as usize;
     list.defer_after(move || {
         // SAFETY: the bitmap is mapped and the list's run is over.

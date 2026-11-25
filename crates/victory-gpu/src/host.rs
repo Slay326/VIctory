@@ -500,6 +500,14 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
+    /// Commands recorded just before the list is closed (copies of what
+    /// its shaders wrote into read-back memory).
+    closing: Mutex<Vec<Box<dyn FnOnce(&ID3D12GraphicsCommandList) + Send>>>,
+    /// The heap-usage bitmap in GPU memory and its mapped read-back buffer
+    /// (`crate::descriptor::usage_bitmap`), kept across resets, and whether
+    /// this recording zeroed it already.
+    usage: OnceLock<Option<(ID3D12Resource, ID3D12Resource, usize)>>,
+    usage_zeroed: std::sync::atomic::AtomicBool,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -909,6 +917,9 @@ impl Host {
                 allocator,
                 list,
                 deferred: Mutex::default(),
+                closing: Mutex::default(),
+                usage: OnceLock::new(),
+                usage_zeroed: false.into(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -1543,6 +1554,10 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let closing = std::mem::take(&mut *self.closing.lock().unwrap_or_else(|e| e.into_inner()));
+        for work in closing {
+            work(&self.list);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1564,6 +1579,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.usage_zeroed.store(false, Ordering::Relaxed);
+        self.closing.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1957,6 +1974,50 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    /// The list's heap-usage bitmap in GPU memory (`size` bytes, made once
+    /// and kept across resets): its GPU address and the mapped read-back
+    /// buffer it is copied into as the list closes, or `None` if they cannot
+    /// be made. The first call of a recording zeroes it (a copy from zeros)
+    /// and records that copy back; later calls of the same recording return
+    /// the same bitmap with `false`.
+    pub(crate) fn usage_bitmap(&self, size: u64) -> Option<(u64, *mut u8, bool)> {
+        let (bitmap, back, data) = self.usage.get_or_init(|| make_usage_bitmap(size)).as_ref()?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
+        if self.usage_zeroed.swap(true, Ordering::Relaxed) {
+            return Some((gpu, *data as *mut u8, false));
+        }
+        let zeros = usage_zeros(size)?;
+        // SAFETY: an open list; the buffers live with the list, the zeros for
+        // the process. Buffers start a recording in the common state.
+        unsafe {
+            self.list.CopyBufferRegion(bitmap, 0, zeros, 0, size);
+            self.list.ResourceBarrier(&[transition(
+                bitmap,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        let (bitmap, back) = (bitmap.clone(), back.clone());
+        self.on_close(move |l| {
+            // SAFETY: an open list; both buffers live with it.
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    &bitmap,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&back, 0, &bitmap, 0, size);
+            }
+        });
+        Some((gpu, *data as *mut u8, true))
+    }
+
+    /// Records `work` into the list just before it is closed.
+    pub(crate) fn on_close(&self, work: impl FnOnce(&ID3D12GraphicsCommandList) + Send + 'static) {
+        self.closing.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(work));
+    }
+
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
@@ -3031,6 +3092,74 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+/// A heap-usage bitmap in GPU memory and a mapped read-back buffer of
+/// `size` bytes (`HostList::usage_bitmap`).
+fn make_usage_bitmap(size: u64) -> Option<(ID3D12Resource, ID3D12Resource, usize)> {
+    let device = &host()?.device;
+    let desc = |flags| D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    };
+    let mut bitmap: Option<ID3D12Resource> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: plain creation of two buffers and the mapping of the
+    // read-back one.
+    let made = unsafe {
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut bitmap,
+            )
+            .and_then(|()| {
+                device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc(D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+            })
+            .and_then(|()| {
+                let b = back.as_ref().ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))
+            })
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, size, "no heap-usage bitmap in GPU memory");
+        return None;
+    }
+    let bitmap = bitmap?;
+    name(&bitmap, || "heap slots read".into());
+    Some((bitmap, back?, data as usize))
+}
+
+/// An upload buffer of `size` zero bytes, made once, that heap-usage
+/// bitmaps are cleared from.
+fn usage_zeros(size: u64) -> Option<&'static ID3D12Resource> {
+    static ZEROS: OnceLock<Option<ID3D12Resource>> = OnceLock::new();
+    ZEROS
+        .get_or_init(|| {
+            let (buffer, data) = host()?.upload_buffer(size)?;
+            // SAFETY: our mapped upload buffer of `size` bytes.
+            unsafe { std::ptr::write_bytes(data, 0, size as usize) };
+            Some(buffer)
+        })
+        .as_ref()
 }
 
 pub(crate) fn transition(
