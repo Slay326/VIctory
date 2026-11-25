@@ -67,6 +67,9 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+mod card;
+pub(crate) use card::card_fetch;
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -971,6 +974,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Copies in the GPU's own memory: what changed goes up, ahead of
+        // the lists on the queue.
+        let _carded = self.card_before();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1089,6 +1095,9 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // Of copies in the GPU's memory, what shaders wrote without marks
+        // comes down first, for the snapshots' compares below.
+        self.card_declared(runs);
         crate::shadow::copy_back_marks(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
@@ -2533,6 +2542,7 @@ impl Meter {
                 crate::shadow::log_views(copy_frames);
                 gpu_times::log(copy_frames);
                 crate::texture::log_copies(copy_frames);
+                card::log(copy_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
