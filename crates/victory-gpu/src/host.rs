@@ -559,15 +559,15 @@ mod gpu_times {
     /// words.
     pub(super) fn kind(note: &str) -> String {
         let word = note.split(' ').next().unwrap_or_default();
-        let shaders = note.find('[').and_then(|a| {
-            let rest = &note[a..];
-            let end = rest.find(']')?;
-            let inner = &rest[1..end];
-            ["vertex ", "pixel ", "compute ", "mesh ", "amplification "]
-                .iter()
-                .any(|s| inner.starts_with(s))
-                .then(|| &rest[..=end])
-        });
+        // The first brackets that name shaders (others may come before).
+        let shaders = ["[vertex ", "[pixel ", "[compute ", "[mesh ", "[amplification "]
+            .iter()
+            .filter_map(|s| note.find(s))
+            .min()
+            .and_then(|a| {
+                let rest = &note[a..];
+                Some(&rest[..=rest.find(']')?])
+            });
         match shaders {
             Some(shaders) => format!("{word} {shaders}"),
             None => note.split(' ').take(2).collect::<Vec<_>>().join(" "),
@@ -625,6 +625,10 @@ mod gpu_times {
             );
             assert_eq!(kind("texture upload 0x29689dbd450 (1536x1748x1 f56 mips 1) sub 0"), "texture upload");
             assert_eq!(kind("clear"), "clear");
+            assert_eq!(
+                kind("indirect kind 2 max 1 at 0xdc799b440 was Some([3840, 1, 1, 0]) [compute 8bbcbda6008eaa37] | x"),
+                "indirect [compute 8bbcbda6008eaa37]"
+            );
         }
     }
 }
