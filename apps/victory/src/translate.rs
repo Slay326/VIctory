@@ -488,6 +488,17 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
+    // Diagnostics (local): `VICTORY_SHADER_ONLY=<hash,...>` keeps only the
+    // containers whose logged hash starts with one of them.
+    if let Ok(only) = std::env::var("VICTORY_SHADER_ONLY") {
+        let size = bytes.get(0x18..0x1c).map_or(bytes.len(), |b| {
+            u32::from_le_bytes(b.try_into().unwrap_or_default()) as usize
+        });
+        let logged = blake3::hash(&bytes[..size.min(bytes.len())]).to_hex()[..16].to_owned();
+        if !only.split(',').any(|h| !h.is_empty() && logged.starts_with(h.trim())) {
+            return;
+        }
+    }
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };

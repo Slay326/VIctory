@@ -538,6 +538,97 @@ fn timing() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
+/// With `VICTORY_GPU_TIMING` (and `VICTORY_D3D12_DRED`, which notes the
+/// commands): GPU time summed over every list since the last frame-rate
+/// line, by what the commands run. The slow-list lines name only lists of
+/// 50 ms and more; in the world most of a frame's GPU time is in shorter
+/// ones.
+#[cfg(feature = "diagnostics")]
+mod gpu_times {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Lists run, their milliseconds (sent to done, each alone), and per
+    /// kind of command (milliseconds, commands).
+    type Totals = (u64, f64, HashMap<String, (f64, u64)>);
+
+    static TOTALS: Mutex<Option<Totals>> = Mutex::new(None);
+
+    /// What a noted command runs: its first word and the shaders named in
+    /// its first brackets ("indirect [compute 8bbc...]"), or its first two
+    /// words.
+    pub(super) fn kind(note: &str) -> String {
+        let word = note.split(' ').next().unwrap_or_default();
+        let shaders = note.find('[').and_then(|a| {
+            let rest = &note[a..];
+            let end = rest.find(']')?;
+            let inner = &rest[1..end];
+            ["vertex ", "pixel ", "compute ", "mesh ", "amplification "]
+                .iter()
+                .any(|s| inner.starts_with(s))
+                .then(|| &rest[..=end])
+        });
+        match shaders {
+            Some(shaders) => format!("{word} {shaders}"),
+            None => note.split(' ').take(2).collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    /// A list ran for `ms` in all; its commands' times.
+    pub(super) fn add(ms: f64, commands: &[(f64, String)]) {
+        let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+        let (lists, all, by) = totals.get_or_insert_with(Default::default);
+        *lists += 1;
+        *all += ms;
+        for (ms, note) in commands {
+            let entry = by.entry(kind(note)).or_default();
+            entry.0 += ms;
+            entry.1 += 1;
+        }
+    }
+
+    /// Logs the totals per frame over `frames`, the 24 largest kinds.
+    pub(super) fn log(frames: f64) {
+        let Some((lists, all, by)) = TOTALS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let frames = frames.max(1.0);
+        let timed: f64 = by.values().map(|v| v.0).sum();
+        tracing::info!(
+            "GPU time per frame: {:.1} lists, {:.1} ms sent to done, {:.1} ms in {:.0} noted commands of {} kinds",
+            lists as f64 / frames,
+            all / frames,
+            timed / frames,
+            by.values().map(|v| v.1).sum::<u64>() as f64 / frames,
+            by.len()
+        );
+        let mut kinds: Vec<(String, (f64, u64))> = by.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        for (kind, (ms, n)) in kinds.into_iter().take(24) {
+            tracing::info!("  GPU time: {:.2} ms/frame in {:.1} commands/frame: {kind}", ms / frames, n as f64 / frames);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::kind;
+
+        #[test]
+        fn commands_are_grouped_by_their_shaders() {
+            assert_eq!(
+                kind("indirect kind 2 max 1 at 0xdc799b440 [compute 8bbcbda6008eaa37] | 8bbcbda6008eaa37: u4=0xa15d00 [heap 330472: x]"),
+                "indirect [compute 8bbcbda6008eaa37]"
+            );
+            assert_eq!(
+                kind("indexed 72x1898 [vertex 4d4a2a8c824cceae, pixel 15c34c906ac8b908] | 4d4a: u9=0x23d5280"),
+                "indexed [vertex 4d4a2a8c824cceae, pixel 15c34c906ac8b908]"
+            );
+            assert_eq!(kind("texture upload 0x29689dbd450 (1536x1748x1 f56 mips 1) sub 0"), "texture upload");
+            assert_eq!(kind("clear"), "clear");
+        }
+    }
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -914,6 +1005,12 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                gpu_times::add(started.elapsed().as_secs_f64() * 1e3, &runs[i].timed(frequency));
+            }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -1299,6 +1396,16 @@ impl HostList {
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let mut times = self.timed(frequency);
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
+    /// Every noted command's time on the GPU, in the list's order, as
+    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn timed(&self, frequency: u64) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
@@ -1314,15 +1421,12 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
                 (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
             })
-            .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
-        times
+            .collect()
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -2405,6 +2509,7 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                gpu_times::log(copy_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

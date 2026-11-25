@@ -120,6 +120,19 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                // Diagnostics (local): `VICTORY_SHADER_ONLY=<hash,...>` keeps only
+                // the containers whose logged hash starts with one of them.
+                let logged = {
+                    let size = bytes.get(0x18..0x1c).map_or(bytes.len(), |b| {
+                        u32::from_le_bytes(b.try_into().unwrap_or_default()) as usize
+                    });
+                    blake3::hash(&bytes[..size.min(bytes.len())]).to_hex()[..16].to_owned()
+                };
+                if let Ok(only) = std::env::var("VICTORY_SHADER_ONLY")
+                    && !only.split(',').any(|h| !h.is_empty() && logged.starts_with(h.trim()))
+                {
+                    continue;
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
@@ -211,7 +224,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    println!("{}{} [{logged}]: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }
