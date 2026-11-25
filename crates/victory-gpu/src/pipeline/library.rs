@@ -132,10 +132,19 @@ impl Mapped {
     /// The file at `path`, mapped for reading and held open; `None` if it is
     /// not there, is empty or cannot be mapped.
     fn open(path: &std::path::Path) -> Option<Mapped> {
-        // Opened as the standard library opens a file to read: others may
-        // read, write, rename and delete it meanwhile, so a save still
-        // renames the new library over this one.
-        let file = std::fs::File::open(path).ok()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        // Others may read it, and rename or delete it (a save renames the
+        // new library over it), but not write it: a write in place would
+        // change the bytes under the host while it reads them, which is
+        // how the mapping removed the device on the fork. Opening it to
+        // write or truncate fails with a sharing violation meanwhile.
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_DELETE: u32 = 4;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+            .ok()?;
         let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
         let mut mapped = Mapped::map(&file, len, false)?;
         mapped._file = Some(file);
@@ -191,6 +200,7 @@ impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
+        remove_abandoned(dir);
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
@@ -558,6 +568,60 @@ fn staging(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".tmp-{}-{n}", std::process::id()));
     path.with_file_name(name)
+}
+
+/// Removes the staging files in `dir` of runs that ended during a save
+/// (killed, or crashed): their names carry the process's ID, so no later
+/// run reuses or removes them, and the library's are as big as the
+/// library. A file of a process still running, or one whose state cannot
+/// be told, is left.
+fn remove_abandoned(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(staging_pid) else {
+            continue;
+        };
+        if pid != std::process::id() && ended(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The process ID in a [`staging`] file's name of one of our files.
+fn staging_pid(name: &str) -> Option<u32> {
+    let rest = [LIBRARY_FILE, EARLY_FILE, PREBUILT_FILE]
+        .iter()
+        .find_map(|file| name.strip_prefix(file)?.strip_prefix(".tmp-"))?;
+    let (pid, n) = rest.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether process `pid` has ended: no process has that ID ("no such
+/// process" is the only refusal taken as that; denied access is a running
+/// process of another user), or the process has exited and only a handle
+/// to it lives on.
+fn ended(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain queries; the handle is closed.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let mut code = 0u32;
+        let exited = GetExitCodeProcess(process, &mut code) != 0 && code != STILL_ACTIVE as u32;
+        CloseHandle(process);
+        exited
+    }
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -1176,6 +1240,173 @@ mod tests {
                 "page {page} of the replaced library no longer reads as the old file"
             );
         }
+    }
+
+    /// While the library's file is mapped, no one may write it in place or
+    /// truncate it (the bytes would change under the host); reading it,
+    /// and a save renaming a new library over it, still work.
+    #[test]
+    fn a_mapped_library_file_cannot_be_written_meanwhile() {
+        const SHARING_VIOLATION: i32 = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let old = vec![0x5Au8; 3 * 4096];
+        std::fs::write(&path, &old).unwrap();
+        let mapped = Mapped::open(&path).expect("the file, mapped");
+        let write = std::fs::OpenOptions::new().write(true).open(&path);
+        assert_eq!(
+            write.err().and_then(|e| e.raw_os_error()),
+            Some(SHARING_VIOLATION),
+            "written in place"
+        );
+        let truncate = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path);
+        assert_eq!(
+            truncate.err().and_then(|e| e.raw_os_error()),
+            Some(SHARING_VIOLATION),
+            "truncated"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), old, "others still read it");
+        // A save renames over it; the mapping keeps the old bytes.
+        write_library(dir.path(), 4096, |out| {
+            out.fill(1);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!dir.path().join(NEXT_FILE).exists(), "replaced in place");
+        assert_eq!(std::fs::read(&path).unwrap(), [1u8; 4096]);
+        assert_eq!(mapped.bytes(), &old[..]);
+    }
+
+    /// A staging file's name gives the process that wrote it, for our files
+    /// only.
+    #[test]
+    fn staging_names_give_their_process() {
+        let dir = std::path::Path::new("d");
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_str().unwrap().to_owned();
+        for file in [LIBRARY_FILE, EARLY_FILE, PREBUILT_FILE] {
+            assert_eq!(
+                staging_pid(&name(&staging(&dir.join(file)))),
+                Some(std::process::id())
+            );
+        }
+        assert_eq!(staging_pid("host-pipelines.bin.tmp-12-0"), Some(12));
+        for other in [
+            "host-pipelines.bin",
+            "host-pipelines.next",
+            "host-pipelines.bin.tmp-12",
+            "host-pipelines.bin.tmp-x-0",
+            "host-pipelines.bin.tmp-12-x",
+            "shaders.bin.tmp-12-0",
+        ] {
+            assert_eq!(staging_pid(other), None, "{other}");
+        }
+    }
+
+    /// A load removes the staging files of runs that ended during a save,
+    /// and leaves those of running processes, this one's and other files.
+    #[test]
+    fn staging_files_of_ended_runs_are_removed() {
+        let exited = |keep: bool| {
+            let mut child = std::process::Command::new("cmd")
+                .args(["/c", "exit 0"])
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+            let pid = child.id();
+            // Dropped, no handle keeps the process: no such process. Kept,
+            // it has exited but its object lives on.
+            if keep {
+                (pid, Some(child))
+            } else {
+                (pid, None)
+            }
+        };
+        let (gone, _) = exited(false);
+        let (zombie, _held) = exited(true);
+        assert!(ended(gone), "no such process");
+        assert!(ended(zombie), "exited, a handle open");
+        assert!(!ended(std::process::id()), "this one");
+        assert!(!ended(4), "the system, which we may not open");
+        let mut running = std::process::Command::new("cmd")
+            .args(["/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(!ended(running.id()), "a running process");
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: String| {
+            std::fs::write(dir.path().join(&name), b"staged").unwrap();
+            name
+        };
+        let removed = [
+            file(format!("{LIBRARY_FILE}.tmp-{gone}-3")),
+            file(format!("{EARLY_FILE}.tmp-{gone}-0")),
+            file(format!("{PREBUILT_FILE}.tmp-{zombie}-1")),
+        ];
+        let kept = [
+            file(format!("{LIBRARY_FILE}.tmp-{}-0", std::process::id())),
+            file(format!("{LIBRARY_FILE}.tmp-{}-0", running.id())),
+            file(format!("{LIBRARY_FILE}.tmp-4-0")),
+            file(format!("other.tmp-{gone}-0")),
+            file(LIBRARY_FILE.to_owned()),
+        ];
+        let blob = Blob::of(dir.path());
+        assert_eq!(blob.bytes(), b"staged", "the library itself");
+        for name in &removed {
+            assert!(!dir.path().join(name).exists(), "{name} left");
+        }
+        for name in &kept {
+            assert!(dir.path().join(name).exists(), "{name} removed");
+        }
+        let _ = running.kill();
+        let _ = running.wait();
+    }
+
+    /// The process's own memory a library file costs: read into memory and
+    /// mapped (every page read once).
+    /// `cargo test --release -p victory-gpu --lib library_file_memory -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn library_file_memory() {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        fn private() -> f64 {
+            let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
+            // SAFETY: a plain query into our own counters.
+            unsafe {
+                GetProcessMemoryInfo(
+                    GetCurrentProcess(),
+                    (&raw mut c).cast(),
+                    size_of_val(&c) as u32,
+                );
+            }
+            c.PrivateUsage as f64 / (1 << 20) as f64
+        }
+        const LEN: usize = 256 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&path, vec![7u8; LEN]).unwrap();
+        let sum = |b: &[u8]| b.iter().step_by(4096).map(|&x| x as u64).sum::<u64>();
+        let before = private();
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(sum(&read), 7 * (LEN / 4096) as u64);
+        let held = private() - before;
+        drop(read);
+        let before = private();
+        let mapped = Mapped::open(&path).unwrap();
+        assert_eq!(sum(mapped.bytes()), 7 * (LEN / 4096) as u64);
+        let mapped_cost = private() - before;
+        drop(mapped);
+        eprintln!(
+            "256 MiB library file: {held:.1} MiB private read into memory, {mapped_cost:.1} MiB mapped"
+        );
+        assert!(mapped_cost < 16.0, "{mapped_cost:.1} MiB");
     }
 
     #[test]
