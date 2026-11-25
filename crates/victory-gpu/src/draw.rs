@@ -1641,7 +1641,15 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            // (local diagnostics) the first record as title memory has it now
+            // (what the GPU wrote there by the last submission).
+            let mut was = [0u8; 16];
+            let read = crate::host::read_into(arguments as *const u8, &mut was);
+            let words: Vec<u32> = was.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x} was {:?}", read.then_some(words)),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
