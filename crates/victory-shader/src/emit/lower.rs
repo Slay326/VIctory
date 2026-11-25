@@ -229,9 +229,6 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
-    /// Compute: instructions (block, index) a thread-group sync goes before
-    /// ([`lds_fences`]).
-    lds_fences: HashSet<(usize, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -470,113 +467,6 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
-/// Where thread-group syncs keep the order of LDS accesses that one console
-/// wave gets from running its lanes in lockstep (the console compiler leaves
-/// the source's barriers out when the group is one wave): every write of
-/// any lane before the reads that follow it in the program, every read
-/// before the writes that follow. The instructions (block, index) to sync
-/// before, each in a block every thread runs exactly once; `None` when reads
-/// and writes mix where threads take different paths or in a loop, or one
-/// instruction does both.
-fn lds_fences(p: &Program) -> Option<HashSet<(usize, usize)>> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Kind {
-        Read,
-        Write,
-    }
-    let blocks = &p.blocks;
-    let kind = |i: &Inst| -> Result<Option<Kind>, ()> {
-        if !matches!(i.fields, Fields::Ds { .. }) {
-            return Ok(None);
-        }
-        let n = i.name();
-        if n.starts_with("ds_read") {
-            Ok(Some(Kind::Read))
-        } else if n.starts_with("ds_write") || !n.contains("_rtn") && !n.contains("cmpst") && !n.contains("wrxchg") {
-            // Atomics without a result commute.
-            Ok(Some(Kind::Write))
-        } else {
-            Err(())
-        }
-    };
-    if blocks.iter().any(|b| b.exit == Exit::Indirect) {
-        return None;
-    }
-    // Blocks reached from `from` without entering `without`.
-    let reach = |from: &[usize], without: Option<usize>| -> Vec<bool> {
-        let mut seen = vec![false; blocks.len()];
-        let mut stack: Vec<usize> = from.iter().copied().filter(|&b| Some(b) != without).collect();
-        for &b in &stack {
-            seen[b] = true;
-        }
-        while let Some(b) = stack.pop() {
-            for s in blocks[b].exit.successors() {
-                if Some(s) != without && !seen[s] {
-                    seen[s] = true;
-                    stack.push(s);
-                }
-            }
-        }
-        seen
-    };
-    // Blocks every thread runs exactly once: on every path to an end and
-    // in no loop. In program order (each dominates the next).
-    let order = crate::ir::reverse_postorder(blocks);
-    let once: Vec<usize> = order
-        .iter()
-        .copied()
-        .filter(|&u| {
-            let around = reach(&[0], Some(u));
-            let ends = (0..blocks.len()).any(|b| around[b] && blocks[b].exit == Exit::End);
-            let again = reach(&blocks[u].exit.successors(), None)[u];
-            !ends && !again
-        })
-        .collect();
-    if once.first() != Some(&0) {
-        // Code before the first such block is a region without a place to
-        // sync before it; the entry block is one unless it is a loop's head.
-        return None;
-    }
-    let mut fences = HashSet::new();
-    // The kind of the accesses since the last sync, and the latest place
-    // after them a sync can go.
-    let mut last: Option<Kind> = None;
-    let mut place: Option<(usize, usize)> = None;
-    for (n, &u) in once.iter().enumerate() {
-        for (i, inst) in blocks[u].insts.iter().enumerate() {
-            place = Some((u, i));
-            let Some(k) = kind(inst).ok()? else { continue };
-            if last.is_some_and(|l| l != k) {
-                fences.insert((u, i));
-            }
-            last = Some(k);
-            place = None;
-        }
-        // What lies between this block and the next of them: threads take
-        // different paths there.
-        let next = once.get(n + 1).copied();
-        let between = reach(&blocks[u].exit.successors(), next);
-        let mut region: Option<Kind> = None;
-        for b in (0..blocks.len()).filter(|&b| between[b]) {
-            for inst in &blocks[b].insts {
-                let Some(k) = kind(inst).ok()? else { continue };
-                if region.is_some_and(|r| r != k) {
-                    return None;
-                }
-                region = Some(k);
-            }
-        }
-        if let Some(k) = region {
-            if last.is_some_and(|l| l != k) {
-                fences.insert(place?);
-            }
-            last = Some(k);
-            place = None;
-        }
-    }
-    Some(fences)
-}
-
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -597,7 +487,6 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
-        let mut fences = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -638,14 +527,7 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            // One wave sharing LDS, nothing else of the console's lanes: a
-            // sync where the wave's lockstep ordered writes before reads
-            // does the same on any host; without such places the host's
-            // wave has to be the console's.
-            if !console_lanes && one_wave && s.lds_dwords > 0 {
-                fences = lds_fences(p);
-            }
-            if console_lanes || one_wave && s.lds_dwords > 0 && fences.is_none() {
+            if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -739,7 +621,6 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
-            lds_fences: fences.unwrap_or_default(),
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -3393,14 +3274,6 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
-        if self.lds_fences.contains(&(b, i)) {
-            // Every thread of the group gets here once: the console wave's
-            // lanes had all run what comes before.
-            let mode = self.s.m.i32(1 | 8);
-            let void = self.s.t.void;
-            self.s
-                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        }
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
