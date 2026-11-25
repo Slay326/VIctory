@@ -720,7 +720,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let srv: [[u32; 10]; 2] = [[0, 1, 0x1688, 0, 0, 0, 16, 16, 0, 0], [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]];
         let uav: [[u32; 10]; 2] = [[0, 1, 0, 0, 16, 16, 0, 0, 0, 0], [39, 1, 0, 0, 64, 0, 0, 0, 1, 0]];
         for (read, write, what) in [(0, 1, "a structured view read"), (1, 0, "a structured unordered view read and written")] {
-            let Some(words) = add_through(&srv[read], &uav[write]) else {
+            let Some(words) = dispatch_through(&srv[read], &uav[write], ADD) else {
                 return; // no host GPU here
             };
             for (i, &v) in words.iter().enumerate() {
@@ -729,10 +729,41 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// The title's structured views of 16 elements of 16 bytes, made raw:
+    /// their sizes are the title's bytes (256), so the translation's record
+    /// count (bytes over the used-resource entry's stride) is the title's
+    /// element count, 16. Through the raw views a structured handle's
+    /// `GetDimensions` would give dwords or bytes instead (from
+    /// AlanQiang0418's review of #1762: `(64, 16)` and `(256, 16)` on an
+    /// RTX 5080), so the translation asks through raw handles.
+    #[test]
+    fn structured_views_made_raw_keep_the_titles_bytes() {
+        let srv = [0, 1, 0x1688, 0, 0, 0, 16, 16, 0, 0];
+        let uav = [0, 1, 0, 0, 16, 16, 0, 0, 0, 0];
+        const SIZES: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint s, d;
+    src.GetDimensions(s);
+    dst.GetDimensions(d);
+    dst.Store2(0, uint2(s, d));
+}
+"#;
+        let Some(words) = dispatch_through(&srv, &uav, SIZES) else {
+            return; // no host GPU here
+        };
+        assert_eq!(&words[..2], &[256, 256], "shader view bytes, unordered view bytes");
+        assert_eq!(words[0] / 16, 16, "the title's element count");
+    }
+
     /// What [`ADD`] leaves through a view `uav` of a buffer holding 0,
     /// 0x10000, 0x20000, ... with a view `srv` of one holding 1000, 1001, ...
     /// (64 dwords each).
-    fn add_through(srv: &[u32; 10], uav: &[u32; 10]) -> Option<Vec<u32>> {
+    fn dispatch_through(srv: &[u32; 10], uav: &[u32; 10], source: &str) -> Option<Vec<u32>> {
         let host = crate::host::host()?;
         let null = std::ptr::null();
         let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
@@ -762,7 +793,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_srv(null, src, srv, slot(0));
         crate::descriptor::create_uav(null, dst, null, uav, slot(1));
         let heap_host = title_heap.host().expect("a host view heap");
-        let (root, pso) = compile(ADD);
+        let (root, pso) = compile(source);
         let list = host.new_list().unwrap();
         // SAFETY: an open list, live objects of ours.
         unsafe {
