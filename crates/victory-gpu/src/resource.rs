@@ -1546,6 +1546,17 @@ const NEVER: u64 = u64::MAX;
 const BUDGET_HIGH: f64 = 0.90;
 #[cfg(windows)]
 const BUDGET_LOW: f64 = 0.85;
+/// Past the budget a texture is given up only once the title has not used
+/// it for this many presented frames and milliseconds: one read in every
+/// frame stays. Where the textures a frame reads do not fit the budget
+/// (8 GB cards in Grand Theft Auto VI: 4.4 GB of GPU-written textures, a
+/// 7.1 GB budget, 2.9 GB of textures read), giving up the least recently
+/// used of them made about 1,100 textures (700 MB) again in every frame,
+/// each null where its frame first read it (run 20261125-210619).
+#[cfg(windows)]
+const PRESSED_FRAMES: u64 = 2;
+#[cfg(windows)]
+const PRESSED_MS: u64 = 1_000;
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
@@ -1584,7 +1595,8 @@ fn evictable(t: &HostTexture) -> bool {
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
-/// the card's budget the least recently used ones until [`BUDGET_LOW`].
+/// the card's budget the least recently used ones until [`BUDGET_LOW`],
+/// but for those in use ([`PRESSED_FRAMES`]).
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1659,11 +1671,16 @@ fn candidates() -> Vec<Owned> {
 /// Of textures last used at (frame, ms) taking (bytes) each, those to give
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
-/// gone (indices).
+/// gone (indices). Those used within [`PRESSED_FRAMES`] or [`PRESSED_MS`]
+/// stay whatever is over.
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
-    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
-    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
+    let unused = |&(f, ms, _): &(u64, u64, u64), frames: u64, time: u64| {
+        frame.saturating_sub(f) >= frames && now.saturating_sub(ms) >= time
+    };
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..uses.len()).partition(|&i| unused(&uses[i], IDLE_FRAMES, IDLE_MS));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    rest.retain(|&i| unused(&uses[i], PRESSED_FRAMES, PRESSED_MS));
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
         if over == 0 {
@@ -2479,9 +2496,9 @@ mod tests {
     #[test]
     fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
         let (frame, now) = (1_000, 1_000_000);
-        let recent = (frame, now - 1_000, 10);
+        let recent = (frame - PRESSED_FRAMES, now - PRESSED_MS, 10);
         let idle = (frame - IDLE_FRAMES, now - IDLE_MS, 10);
-        let older = (frame, now - 5_000, 30);
+        let older = (frame - PRESSED_FRAMES, now - 5_000, 30);
         let uses = [recent, idle, older];
         assert_eq!(choose(&uses, frame, now, 0), vec![1], "idle only");
         assert_eq!(choose(&uses, frame, now, 10), vec![1], "the idle one covers the excess");
@@ -2489,6 +2506,21 @@ mod tests {
         assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+    }
+
+    /// Past the budget, textures the title used in the last frames or the
+    /// last second stay: the textures every frame reads are not given up and
+    /// made again in turn where they do not fit the budget together.
+    #[test]
+    fn past_the_budget_textures_in_use_stay() {
+        let (frame, now) = (1_000, 1_000_000);
+        let read_last_frame = (frame, now, 10);
+        let read_a_slow_frame_ago = (frame - 1, now - 5_000, 10);
+        let read_lately_at_speed = (frame - 20, now - PRESSED_MS + 1, 10);
+        let unused = (frame - PRESSED_FRAMES, now - PRESSED_MS, 10);
+        let uses = [read_last_frame, read_a_slow_frame_ago, read_lately_at_speed, unused];
+        assert_eq!(choose(&uses, frame, now, 1 << 20), vec![3], "only the one out of use");
+        assert!(choose(&uses[..3], frame, now, 1 << 20).is_empty(), "none of those in use");
     }
 
     /// Title textures of one memory share a key in any format of the same
