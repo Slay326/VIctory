@@ -2223,14 +2223,20 @@ mod tests {
             (desc, info.SizeInBytes)
         };
         assert_eq!(desc.Width, 16 * u64::from(end));
-        assert!(size >= desc.Width + 8, "room for the mark");
-        let past = (data + 16 * end as usize) as *mut u64;
-        let mark = 0x5a5a_5a5a_5a5a_5a5a;
-        // SAFETY: mapped memory of the buffer's allocation (checked).
-        unsafe { past.write_unaligned(mark) };
-        heap.note_address(end, Some(&view));
-        // SAFETY: as above.
-        assert_eq!(unsafe { past.read_unaligned() }, mark);
+        // A buffer of a whole number of 64 KiB (2^21 entries) leaves no
+        // room past it for the mark: then only the write is checked to go
+        // nowhere.
+        if size >= desc.Width + 8 {
+            let past = (data + 16 * end as usize) as *mut u64;
+            let mark = 0x5a5a_5a5a_5a5a_5a5a;
+            // SAFETY: mapped memory of the buffer's allocation (checked).
+            unsafe { past.write_unaligned(mark) };
+            heap.note_address(end, Some(&view));
+            // SAFETY: as above.
+            assert_eq!(unsafe { past.read_unaligned() }, mark);
+        } else {
+            heap.note_address(end, Some(&view));
+        }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
