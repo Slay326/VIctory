@@ -322,6 +322,7 @@ fn library() -> Option<&'static Shared> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            SAVED_BYTES.store(blob.bytes().len() as u64, Ordering::Relaxed);
             let tag = tag(blob.bytes());
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
@@ -488,14 +489,14 @@ thread_local! {
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `save_every` has passed for the library's size (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let every = save_every(SAVED_BYTES.load(Ordering::Relaxed));
+        if !now && last.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -515,6 +516,7 @@ pub(crate) fn save(now: bool) {
         let written = write_library(dir, size, |out| unsafe { l.library.Serialize(out) });
         match written {
             Ok(tag) => {
+                SAVED_BYTES.store(size as u64, Ordering::Relaxed);
                 l.added = 0;
                 l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
@@ -558,6 +560,22 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+/// The size of the library as loaded or last serialised.
+static SAVED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The time between periodic saves of a library of `bytes`: 20 s, or as
+/// long as writing it at `SAVE_RATE` takes. A save serialises and writes
+/// the whole library (the host has no partial form), which keeps the
+/// pipelines of every earlier translator: a pre-build into a 4.8 GB
+/// library, saved every 20 s, wrote 346 GB in 80 saves. A run that ends
+/// without its last save loses at most this much of its new pipelines.
+fn save_every(bytes: u64) -> std::time::Duration {
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    /// Bytes per second of saving, on average.
+    const SAVE_RATE: u64 = 25 << 20;
+    SAVE_EVERY.max(std::time::Duration::from_secs(bytes / SAVE_RATE))
 }
 
 /// Held while a file is written and renamed into place: concurrent worker
@@ -806,6 +824,16 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// Small libraries are saved every 20 s, big ones no faster than 25 MB/s.
+    #[test]
+    fn big_libraries_are_saved_less_often() {
+        use std::time::Duration;
+        assert_eq!(save_every(0), Duration::from_secs(20));
+        assert_eq!(save_every(300 << 20), Duration::from_secs(20));
+        assert_eq!(save_every(1 << 30), Duration::from_secs(40));
+        assert_eq!(save_every(4_812_430_094), Duration::from_secs(183));
     }
 
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
