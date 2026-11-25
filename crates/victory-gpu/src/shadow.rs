@@ -252,6 +252,79 @@ fn give_back(v: Vec<u8>) {
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
 
+/// The runs `[start, end)` of bytes where the copy differs from title
+/// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
+/// GPU wrote byte `i`: what a copy-back puts into title memory.
+fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < host.len() {
+        // Equal stretches a word at a time (most of a page is).
+        if i.is_multiple_of(8) && i + 8 <= host.len() && host[i..i + 8] == title[i..i + 8] {
+            i += 8;
+            continue;
+        }
+        if host[i] != title[i] && gpu(i) {
+            match runs.last_mut() {
+                Some((_, end)) if *end == i => *end = i + 1,
+                _ => runs.push((i, i + 1)),
+            }
+        }
+        i += 1;
+    }
+    runs
+}
+
+/// Runs of a copy-back closer than this go into title memory as one span,
+/// with title memory's bytes between them as the copy-back read them: a
+/// kernel copy per run cost over 1 ms per page in the world, where shaders
+/// change many scattered words of a page.
+const SPAN_GAP: usize = 256;
+
+/// Writes the runs `[start, end)` of `merged` (title memory as read, with
+/// the shaders' bytes in the runs) into title memory at `at`, and nothing
+/// far from them: the title's threads write the same pages while a
+/// copy-back runs, and a byte they wrote after the copy-back read the page
+/// must stay. (Putting back the whole page undid those writes.) True if a
+/// run was written.
+fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
+    if runs.is_empty() {
+        return false;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for &(start, end) in runs {
+        match spans.last_mut() {
+            Some((_, last)) if start - *last < SPAN_GAP => *last = end,
+            _ => spans.push((start, end)),
+        }
+    }
+    let _writing = crate::watch::writing(at, merged.len());
+    for (start, end) in spans {
+        crate::host::write_mapped((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
+    }
+    true
+}
+
+/// Outside `runs`, the copy takes title memory's bytes (`title`, read at the
+/// copy-back). True if that changed the copy (then a copy in the GPU's
+/// memory sends them up).
+fn take_others(host: &mut [u8], title: &[u8], runs: &[(usize, usize)]) -> bool {
+    let mut changed = false;
+    let mut take = |host: &mut [u8], title: &[u8]| {
+        if host != title {
+            host.copy_from_slice(title);
+            changed = true;
+        }
+    };
+    let mut at = 0;
+    for &(start, end) in runs {
+        take(&mut host[at..start], &title[at..start]);
+        at = end;
+    }
+    take(&mut host[at..], &title[at..]);
+    changed
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -328,38 +401,106 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        if let Some(t) = &self.tracked
-            && t.changed(page / PAGE)
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    page = format_args!("{page:#x}"),
-                    "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
-                )
-            });
-            return 0;
+        // A title write from here on saves the page's bytes from before it:
+        // armed before the check, and before a copy in the GPU's memory
+        // fetches the page (a round trip to the GPU, while the title runs).
+        let mut saved = None;
+        if let Some(t) = &self.tracked {
+            t.arm(from, to);
+            saved = t.saved(page / PAGE);
+            if saved.is_none() && t.changed(page / PAGE) {
+                t.unarm(page / PAGE);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        page = format_args!("{page:#x}"),
+                        "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
+                    )
+                });
+                return 0;
+            }
         }
-        let n = to - from;
         // A copy in the GPU's memory: the page comes down first.
         if self.card.is_some() {
             crate::host::card_fetch(&[(self, from - start, to - start)]);
         }
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        if !self.put_back(page, from, to, saved) {
             return 0;
         }
-        {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        }
-        // Our write is not the title's: the copy holds the page as it is.
+        // Our write is not the title's: the copy takes the page as it is.
         if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
+            self.take_and_read(t, page, from, to);
         }
-        n
+        to - from
+    }
+
+    /// After a copy-back: the page at `page` is taken, then the copy's bytes
+    /// `[from, to)` (title addresses) are read from title memory again. The
+    /// title writes the page while it goes back, so bytes read before the
+    /// guard is back may be old: a title write that lands before the guard is
+    /// in this read, and one after it faults and marks the page changed.
+    /// (Taking the page with the bytes read earlier lost such writes from the
+    /// copy, and a later copy-back of the page put the copy's older bytes
+    /// over them.) Of a copy in the GPU's memory, bytes that came from the
+    /// title this way go up to the GPU's side.
+    fn take_and_read(&self, t: &crate::watch::Tracked, page: usize, from: usize, to: usize) {
+        t.taken(&[page / PAGE]);
+        let at = from - self.start as usize;
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), to - from) };
+        if self.card.is_none() {
+            crate::host::read_into(from as *const u8, host);
+            return;
+        }
+        let mut title = vec![0u8; to - from];
+        if crate::host::read_into(from as *const u8, &mut title) && *host != title[..] {
+            host.copy_from_slice(&title);
+            self.card_changed(at, at + (to - from));
+        }
+    }
+
+    /// The copy-back of `[from, to)` in the page at `page`: the bytes the
+    /// shaders changed go into title memory, and no others (the title's
+    /// threads write the page meanwhile: a whole page put back undid their
+    /// writes since it was read), and the copy takes the title's others.
+    /// What the shaders changed differs from the copy's bytes before the
+    /// submission: `saved`, or what the page held when a title write landed
+    /// while it was read (saved by the guard while the page is armed), else
+    /// title memory. True if bytes were written.
+    fn put_back(&self, page: usize, from: usize, to: usize, saved: Option<Box<[u8]>>) -> bool {
+        let n = to - from;
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host =
+            unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
+        let mut title = vec![0u8; n];
+        let read = crate::host::read_into(from as *const u8, &mut title);
+        #[cfg(test)]
+        tests::after_read();
+        // Our own write below must not save the page for this copy again.
+        let saved = match &self.tracked {
+            Some(t) => {
+                t.unarm(page / PAGE);
+                saved.or_else(|| t.saved(page / PAGE))
+            }
+            None => saved,
+        };
+        if !read {
+            return false;
+        }
+        let runs = match &saved {
+            None => differing(host, &title, |_| true),
+            Some(before) => {
+                let before = &before[from - page..to - page];
+                differing(host, &title, |i| host[i] != before[i])
+            }
+        };
+        // The copy takes the title's other bytes, and holds what goes back.
+        if take_others(host, &title, &runs) {
+            // Not on the GPU's side of a copy there.
+            let at = from - self.start as usize;
+            self.card_changed(at, at + n);
+        }
+        write_runs(from, host, &runs)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -613,28 +754,18 @@ impl Shadow {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let (mut changed, mut stale) = (false, false);
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        stale |= *h != *t;
-                        *h = *t;
-                    }
-                    if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    // The title's bytes the copy took are not on the GPU's
-                    // side of a copy there.
-                    if stale {
+                    // The GPU's bytes go into title memory, and no others:
+                    // the title writes the piece meanwhile.
+                    let runs = differing(host, title, |i| host[i] != old[i]);
+                    // The copy takes the title's bytes in turn (not on the
+                    // GPU's side of a copy there).
+                    if take_others(host, title, &runs) {
                         self.card_changed(at, at + n);
                     }
-                    synced.push((start + at) / PAGE);
+                    if write_runs(start + at, host, &runs) {
+                        written += n;
+                    }
+                    synced.push((start + at, n));
                 }
                 at += n;
             }
@@ -643,8 +774,11 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+                for (address, n) in synced {
+                    if (first..last).contains(&(address / PAGE)) {
+                        self.take_and_read(t, address, address, address + n);
+                    }
+                }
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -683,53 +817,23 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        // Our own write below must not save the page for this copy again.
-        t.unarm(page / PAGE);
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
+            t.unarm(page / PAGE);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
             return 0;
         }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let (mut changed, mut stale) = (false, false);
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    stale |= *h != *t;
-                    *h = *t;
-                }
-                // The title's bytes the copy took are not on the GPU's side
-                // of a copy there.
-                if stale {
-                    self.card_changed(from - start, to - start);
-                }
-                changed.then_some(title.as_ptr())
-            }
-        };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
+        // A title write while the page is read saves its bytes from before
+        // (armed before a copy in the GPU's memory fetched the page:
+        // `copy_back_marks`).
+        t.arm(from, to);
+        let written = self.put_back(page, from, to, saved);
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+            self.take_and_read(t, page, from, to);
         }
-        written.map_or(0, |_| n)
+        if written { to - from } else { 0 }
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -1261,11 +1365,17 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     // Of copies in the GPU's memory, the marked pages come down to the
-    // CPU's sides first (one fetch for all of them).
+    // CPU's sides first (one fetch for all of them). They are armed before:
+    // the fetch is a round trip to the GPU while the title runs, and a title
+    // write meanwhile must save the page's bytes from before it
+    // (`Shadow::copy_back_marked`).
     let fetch: Vec<(&Shadow, usize, usize)> = pages
         .iter()
         .filter(|(copy, _)| copy.carded())
         .map(|(copy, page)| {
+            if let Some(t) = &copy.tracked {
+                t.arm(*page, *page + PAGE);
+            }
             let (from, to) = copy.inside(*page, PAGE);
             (&**copy, from, to)
         })
@@ -1631,6 +1741,95 @@ pub(crate) mod tests {
     thread_local! {
         /// [`card_least`] for the test on this thread.
         pub(super) static LEAST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// Title writes (address, 8 bytes) [`during_fetch`] makes, last first.
+        static DURING_FETCH: std::cell::RefCell<Vec<(usize, u64)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A title thread's write landing while a copy in the GPU's memory is
+    /// fetched to its CPU side (tests): the next of [`DURING_FETCH`]'s.
+    pub(crate) fn during_fetch() {
+        if let Some((at, value)) = DURING_FETCH.with(|w| w.borrow_mut().pop()) {
+            // SAFETY: 8 bytes of the test's title memory (guarded or not: a
+            // guard's fault opens it).
+            unsafe { (at as *mut u64).write_volatile(value) };
+        }
+    }
+
+    /// A BVH builder's node (fp16 boxes; an empty one is +inf..-inf,
+    /// `0xfc007c007c007c00`) next to a pointer the title keeps in the same
+    /// page of a copy in the GPU's memory. The slot held an empty box from
+    /// an earlier build; the title writes its pointer there while the
+    /// copy-back fetches the page from the GPU (a round trip). The pointer
+    /// stays and the node goes back, for a page shaders wrote at computed
+    /// addresses and a page they marked alike, and the GPU's side gets the
+    /// title's pointer. (Arming the page after the fetch, or putting back
+    /// the whole page, wrote the empty box over the pointer: the title then
+    /// read it as an address and faulted with rcx = 0xfc007c007c007c00.)
+    #[test]
+    fn a_title_pointer_next_to_builder_nodes_survives_a_card_copy_back() {
+        const EMPTY: u64 = 0xfc00_7c00_7c00_7c00;
+        const NODE: u64 = 0x3c00_3c00_bc00_bc00;
+        const POINTER: u64 = 0x0000_0234_5678_9ab0;
+        let (Some(host), Some(b)) = (host(), bitmap(false)) else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        // SAFETY: (all title reads and writes below) bytes of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u64).read_volatile() };
+        for page in [0, PAGE] {
+            // SAFETY: as above.
+            unsafe { ((p + page + 0x100) as *mut u64).write_volatile(EMPTY) };
+        }
+        register(p, p as u64, len as u64);
+        LEAST.with(|l| l.set(Some(0)));
+        let copy = find(p as u64, len as u64);
+        LEAST.with(|l| l.set(None));
+        let copy = copy.expect("a copy");
+        if !copy.carded() {
+            assert!(!cards(), "the copy is in GPU memory unless that is switched off");
+            unregister(p, p as u64);
+            return;
+        }
+        // The builder writes a node into the GPU's side of pages 0 and 1.
+        let (upload, data) = host.upload_buffer(256).unwrap();
+        // SAFETY: the buffer's mapping.
+        unsafe { data.cast::<u64>().write_unaligned(NODE) };
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        for page in [0, PAGE] {
+            // SAFETY: an open list; the bytes lie in both buffers.
+            unsafe { list.list.CopyBufferRegion(&copy.buffer, (page + 0x200) as u64, &upload, 0, 8) };
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!((title(0x200), title(PAGE + 0x200)), (0, 0), "nothing declared: nothing back yet");
+        // Page 1: written at addresses shaders computed.
+        DURING_FETCH.with(|w| *w.borrow_mut() = vec![(p + PAGE + 0x100, POINTER)]);
+        assert_eq!(copy.copy_back_page(p + PAGE), PAGE);
+        assert_eq!(title(PAGE + 0x100), POINTER, "the title's pointer stays, page 1: {:#x}", title(PAGE + 0x100));
+        assert_eq!(title(PAGE + 0x200), NODE, "the node goes back, page 1");
+        // Page 0: marked through a view no list declared.
+        DURING_FETCH.with(|w| *w.borrow_mut() = vec![(p + 0x100, POINTER)]);
+        let bit = copy.marks.expect("tracked memory gets mark bits") as usize;
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(bit / 32) |= 1 << (bit % 32) };
+        copy_back_marks(&[], false);
+        assert_eq!(title(0x100), POINTER, "the title's pointer stays, page 0: {:#x}", title(0x100));
+        assert_eq!(title(0x200), NODE, "the node goes back, page 0");
+        // The title's bytes the copy took go up with the next submission.
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        let gpu_side = |at: usize| {
+            let w = copy.read_host((p + at) as u64, 2);
+            u64::from(w[0]) | u64::from(w[1]) << 32
+        };
+        assert_eq!((gpu_side(0x100), gpu_side(PAGE + 0x100)), (POINTER, POINTER), "the GPU's side has the pointers");
+        assert_eq!((gpu_side(0x200), gpu_side(PAGE + 0x200)), (NODE, NODE));
+        drop(list);
+        unregister(p, p as u64);
     }
 
     /// Copies in the GPU's memory take at most 1 GiB and a quarter of the
@@ -2028,6 +2227,68 @@ pub(crate) mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
         unregister(p + 1, p as u64);
+        unregister(p, p as u64);
+    }
+
+    thread_local! {
+        /// Title writes [`after_read`] makes, last first.
+        static AFTER_READ: std::cell::RefCell<Vec<(usize, u8)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A title thread's write landing just after a copy-back read the page
+    /// (tests): the next of [`AFTER_READ`]'s.
+    pub(super) fn after_read() {
+        if let Some((at, value)) = AFTER_READ.with(|w| w.borrow_mut().pop()) {
+            // SAFETY: a byte of the test's title memory (guarded or not: a
+            // guard's fault opens it).
+            unsafe { (at as *mut u8).write_volatile(value) };
+        }
+    }
+
+    /// The title writes a page while it goes back, just after the copy-back
+    /// read it. Only the bytes the shaders changed go into title memory, for
+    /// a page marked through views and a page shaders wrote at computed
+    /// addresses alike: the title's byte stays (a whole page put back undid
+    /// it), and the copy has it too.
+    #[test]
+    fn a_copy_back_puts_back_only_the_bytes_the_gpu_changed() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shaders write a byte in each page.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        let title = |at: usize| (p + at) as *mut u8;
+        AFTER_READ.with(|w| *w.borrow_mut() = vec![(p + PAGE + 40, 0x88), (p + 40, 0x77)]);
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        // SAFETY: (reads below) bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        // Page 0 was marked through a view.
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+        assert_eq!(
+            (read(10), read(40)),
+            (0xaa, 0x77),
+            "the shader's byte and the title's, page 0"
+        );
+        assert_eq!(host(40), 0x77, "the copy reads the title's byte");
+        // Page 1 was written at addresses shaders computed.
+        assert_eq!(copy.copy_back_page(p + PAGE), PAGE);
+        assert_eq!(
+            (read(PAGE + 10), read(PAGE + 40)),
+            (0xbb, 0x88),
+            "both bytes, page 1"
+        );
+        assert_eq!(host(PAGE + 40), 0x88, "the copy reads the title's byte");
         unregister(p, p as u64);
     }
 
