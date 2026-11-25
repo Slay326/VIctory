@@ -1,12 +1,16 @@
 //! The console's rectangle lists on the host. A rectangle comes as three
-//! corners, the second between the other two, and the hardware adds the
-//! fourth at `v0 + v2 - v1`, for the position and every attribute. The host
-//! has no such primitive; a geometry shader made for the vertex shader that
-//! feeds it takes each triangle `(v0, v1, v2)` and emits it with its
-//! completion `(v0, v2, v3)`, both turning the same way. Integer outputs
-//! (which can only be flat) keep `v0`'s value at the fourth corner.
+//! corners in any order, and the hardware adds the fourth across the
+//! diagonal from the corner between the other two, for the position and
+//! every attribute: `a + b - c`, `c` the corner facing the longest side.
+//! Shaders differ: a full-screen rectangle can come as top left, bottom
+//! left, bottom right (`c` second), a blit or tile as top left, bottom left,
+//! top right (`c` first, as Mesa's own blits give them). The host has no
+//! such primitive; a geometry shader made for the vertex shader that feeds
+//! it takes each triangle `(v0, v1, v2)` and emits it with its completion
+//! `(a, b, v3)`, both turning the same way. Integer outputs (which can only
+//! be flat) keep `v0`'s value at the fourth corner.
 
-use super::bitcode::{Attr, Bin, Term};
+use super::bitcode::{Attr, Bin, Term, pred};
 use super::shader::Shader;
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC};
@@ -45,25 +49,79 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         }
         corners.push(values);
     }
-    let fourth: Vec<Vec<_>> = elements
+    // Which corner is between the other two: the one facing the longest
+    // side, in screen space. Without a position (or with ties, a degenerate
+    // rectangle) the second one.
+    let (first, third) = match elements
         .iter()
-        .enumerate()
-        .map(|(id, e)| {
-            (0..usize::from(e.cols))
-                .map(|col| {
-                    let [v0, v1, v2] = [0, 1, 2].map(|k| corners[k][id][col]);
-                    if e.comp == 9 {
-                        let sum = s.m.bin(b, Bin::Add, v0, v2);
-                        s.m.bin(b, Bin::Sub, sum, v1)
+        .position(|e| e.kind == 3 && e.comp == 9 && e.cols >= 2)
+    {
+        Some(p) => {
+            let xy: Vec<_> = (0..3)
+                .map(|k| {
+                    let c = &corners[k][p];
+                    let (x, y) = (c[0], c[1]);
+                    if c.len() >= 4 {
+                        (
+                            s.m.bin(b, Bin::SDiv, x, c[3]),
+                            s.m.bin(b, Bin::SDiv, y, c[3]),
+                        )
                     } else {
-                        v0
+                        (x, y)
                     }
                 })
-                .collect()
-        })
-        .collect();
-    corners.push(fourth);
-    for triangle in [[0, 1, 2], [0, 2, 3]] {
+                .collect();
+            let mut side = |i: usize, j: usize| {
+                let dx = s.m.bin(b, Bin::Sub, xy[i].0, xy[j].0);
+                let dy = s.m.bin(b, Bin::Sub, xy[i].1, xy[j].1);
+                let (xx, yy) = (s.m.bin(b, Bin::Mul, dx, dx), s.m.bin(b, Bin::Mul, dy, dy));
+                s.m.bin(b, Bin::Add, xx, yy)
+            };
+            let (d01, d02, d12) = (side(0, 1), side(0, 2), side(1, 2));
+            let mut longest = |d: _, e: _, f: _| {
+                let over_e = s.m.cmp(b, pred::OGT, d, e);
+                let over_f = s.m.cmp(b, pred::OGT, d, f);
+                s.m.bin(b, Bin::And, over_e, over_f)
+            };
+            (Some(longest(d12, d01, d02)), Some(longest(d01, d02, d12)))
+        }
+        None => (None, None),
+    };
+    // Corner k's value, picked by the corner between the others: the
+    // completion is `(a, b, a + b - c)`, `(v0, v2, ..)` when it is the
+    // second, `(v2, v1, ..)` when the first, `(v1, v0, ..)` when the third.
+    let pick = |m: &mut super::bitcode::Module, [if_first, if_second, if_third]: [_; 3]| {
+        let v = match third {
+            Some(t) => m.select(b, t, if_third, if_second),
+            None => if_second,
+        };
+        match first {
+            Some(f) => m.select(b, f, if_first, v),
+            None => v,
+        }
+    };
+    let mut completion: [Vec<Vec<_>>; 3] = Default::default();
+    for (id, e) in elements.iter().enumerate() {
+        let [mut a, mut bs, mut fourth] = [Vec::new(), Vec::new(), Vec::new()];
+        let columns = corners[0][id].iter().zip(&corners[1][id]).zip(&corners[2][id]);
+        for ((&v0, &v1), &v2) in columns.take(usize::from(e.cols)) {
+            let (va, vb) = (pick(&mut s.m, [v2, v0, v1]), pick(&mut s.m, [v1, v2, v0]));
+            a.push(va);
+            bs.push(vb);
+            fourth.push(if e.comp == 9 {
+                let c = pick(&mut s.m, [v0, v1, v2]);
+                let sum = s.m.bin(b, Bin::Add, va, vb);
+                s.m.bin(b, Bin::Sub, sum, c)
+            } else {
+                v0
+            });
+        }
+        completion[0].push(a);
+        completion[1].push(bs);
+        completion[2].push(fourth);
+    }
+    corners.extend(completion);
+    for triangle in [[0, 1, 2], [3, 4, 5]] {
         for k in triangle {
             for (id, e) in elements.iter().enumerate() {
                 let suffix = if e.comp == 9 { ".f32" } else { ".i32" };
@@ -155,35 +213,55 @@ mod tests {
     /// attribute interpolated over it, the top-right half included.
     #[test]
     fn rectangles_get_their_fourth_corner() {
-        let (vs, ps) = (shader(false), shader(true));
-        let gs = super::rectangle_gs(&vs).unwrap();
-        if let Ok(mut v) =
-            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
-        {
-            for c in [&vs, &gs, &ps] {
-                v.validate(&mut c.clone()).unwrap();
-            }
-        }
-        #[rustfmt::skip]
+        // The corner between the other two second.
+        draws_the_square(&[[-0.5, 0.5], [-0.5, -0.5], [0.5, -0.5]]);
+    }
+
+    /// Tiles and blits give the corners as top left, bottom left, top
+    /// right: the corner between the others first, its fourth the bottom
+    /// right. Completed across the wrong diagonal (`v0 + v2 - v1`), the
+    /// second triangle lands on the square above, and the bottom-right half
+    /// is never drawn.
+    #[test]
+    fn rectangles_with_the_corner_first_complete_across_their_diagonal() {
+        draws_the_square(&[[-0.5, 0.5], [-0.5, -0.5], [0.5, 0.5]]);
+    }
+
+    /// The corner between the others third (top right, bottom left, top
+    /// left): the fourth is the bottom right as well.
+    #[test]
+    fn rectangles_with_the_corner_third_complete_across_their_diagonal() {
+        draws_the_square(&[[0.5, 0.5], [-0.5, -0.5], [-0.5, 0.5]]);
+    }
+
+    /// A zero w at the second corner leaves the diagonal comparisons
+    /// unordered. The old completion puts the fourth above the first
+    /// and third, and its attribute contributes to the upper half.
+    #[test]
+    fn rectangles_with_zero_w_complete_from_the_second_corner() {
         let vertices = [
-            -0.5, 0.5, 0.5, 1.0, -0.5, 0.5,
-            -0.5, -0.5, 0.5, 1.0, -0.5, -0.5,
-            0.5, -0.5, 0.5, 1.0, 0.5, -0.5,
+            [-0.5, 0.0, 0.5, 1.0, 0.0, 0.0],
+            [0.0, -0.5, 0.5, 0.0, 1.0, 1.0],
+            [0.5, 0.0, 0.5, 1.0, 0.0, 0.0],
         ];
-        for warp in [false, true] {
-            let Ok(host) = Host::new(warp) else { continue };
-            let root = host.root_signature_for(&[]).unwrap();
-            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
-            let draw = Draw {
-                roots: Vec::new(),
-                textures: &[],
-                samplers: &[],
-                vertices: &vertices,
-                stride: 24,
-                size: (32, 32),
-                mesh_groups: 0,
-            };
-            let texels = host.draw(&root, &pso, &draw).unwrap();
+        draw_rectangle(vertices.as_flattened(), |warp, texels| {
+            // At y = 3/32 the fourth corner has screen-space weight 3/8.
+            // Its w is 2, giving it a perspective-correct weight of 3/13.
+            let t = texels[14 * 32 + 16];
+            let want = [-3.0 / 13.0, -3.0 / 13.0, 1.0, 1.0];
+            assert!(
+                t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4),
+                "warp {warp} pixel (16, 14): {t:?}, want {want:?}"
+            );
+        });
+    }
+
+    /// Draws one rectangle of the given corners (clip x, y; the attribute
+    /// is the same x, y) into 32x32 and checks every pixel: the square
+    /// `|x|, |y| < 0.5` holds its coordinates, the rest nothing.
+    fn draws_the_square(corners: &[[f32; 2]; 3]) {
+        let vertices = corners.map(|[x, y]| [x, y, 0.5, 1.0, x, y]);
+        draw_rectangle(vertices.as_flattened(), |warp, texels| {
             for (i, t) in texels.iter().enumerate() {
                 let (x, y) = ((i % 32) as f32, (i / 32) as f32);
                 let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
@@ -192,6 +270,40 @@ mod tests {
                 let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
                 assert!(near, "warp {warp} pixel ({x}, {y}): {t:?}, want {want:?}");
             }
+        });
+    }
+
+    fn draw_rectangle(vertices: &[f32], check: impl Fn(bool, &[[f32; 4]])) {
+        let (vs, ps) = (shader(false), shader(true));
+        let gs = super::rectangle_gs(&vs).unwrap();
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            for c in [&vs, &gs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+        let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let adapters: &[bool] = if warp_only { &[true] } else { &[false, true] };
+        for &warp in adapters {
+            let host = match Host::new(warp) {
+                Ok(host) => host,
+                Err(error) if warp_only => panic!("WARP adapter: {error}"),
+                Err(_) => continue,
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices,
+                stride: 24,
+                size: (32, 32),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            check(warp, &texels);
         }
     }
 }
