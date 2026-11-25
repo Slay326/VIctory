@@ -1012,6 +1012,8 @@ fn into_destination(
         offset,
         len,
         pages = pages.len(),
+        zeros = pages.iter().filter(|&&p| p == 0).count(),
+        first = pages.first().copied().unwrap_or(0),
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
