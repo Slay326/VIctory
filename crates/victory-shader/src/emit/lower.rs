@@ -579,7 +579,13 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(
+                        n,
+                        "v_readlane_b32"
+                            | "v_writelane_b32"
+                            | "v_permlane16_b32"
+                            | "v_permlanex16_b32"
+                    )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -6856,6 +6862,37 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let me = self.lane_index();
+                let k8 = self.s.m.i32(8);
+                let k7 = self.s.m.i32(7);
+                let k4 = self.s.m.i32(4);
+                let k15 = self.s.m.i32(15);
+                let zero = self.s.m.i32(0);
+                let hi_half = self.s.m.bin(c, Bin::And, me, k8);
+                let use_s2 = self.s.m.cmp(c, pred::NE, hi_half, zero);
+                let sel_word = self.s.m.select(c, use_s2, s2, s1);
+                let lane_in_8 = self.s.m.bin(c, Bin::And, me, k7);
+                let sh = self.s.m.bin(c, Bin::Mul, lane_in_8, k4);
+                let shifted = self.s.m.bin(c, Bin::LShr, sel_word, sh);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let base = if name == "v_permlanex16_b32" {
+                    let mask = self.s.m.i32(!31u32);
+                    let row = self.s.m.bin(c, Bin::And, me, mask);
+                    let k16 = self.s.m.i32(16);
+                    let half = self.s.m.bin(c, Bin::And, me, k16);
+                    let other_half = self.s.m.bin(c, Bin::Xor, half, k16);
+                    self.s.m.bin(c, Bin::Or, row, other_half)
+                } else {
+                    let mask = self.s.m.i32(!15u32);
+                    self.s.m.bin(c, Bin::And, me, mask)
+                };
+                let lane = self.s.m.bin(c, Bin::Or, base, pick);
+                let r = self.read_lane(a, lane);
+                int(self, r)
+            }
             "v_readfirstlane_b32"
                 if inst
                     .writes
@@ -11539,6 +11576,19 @@ mod tests {
         // No parameter starts in rows 1, 3 or 4.
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
+        }
+    }
+
+    #[test]
+    fn permlane16_lowers() {
+        for opcode in [0x377u32, 0x378u32] {
+            let words = [
+                // v_permlane16_b32 / v_permlanex16_b32 v2, v0, s0, s1
+                (0xD5u32 << 24) | (opcode << 16) | 2,
+                (1 << 18) | 0x100,
+                S_ENDPGM,
+            ];
+            lowers(&words, 0).expect("v_permlane(x)16_b32 should lower");
         }
     }
 }
