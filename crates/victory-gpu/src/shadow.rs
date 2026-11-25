@@ -130,6 +130,38 @@ fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usi
     runs
 }
 
+/// [`differing`] of a copy-back with no bytes saved (every differing byte
+/// goes back), by whole 32-byte lines: a line with a differing byte is a run.
+/// The line's other bytes are title memory's as read, as between the runs
+/// [`write_runs`] joins (gaps under [`SPAN_GAP`]). Byte by byte, the
+/// world's written pages (many lines differ) cost ~33 us each, ~50 ms per
+/// frame (run d16 20261125-225812).
+fn differing_rows(host: &[u8], title: &[u8]) -> Vec<(usize, usize)> {
+    const BLOCK: usize = 1 << 10;
+    const LINE: usize = 32;
+    let n = host.len().min(title.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut block = 0;
+    while block < n {
+        let block_end = (block + BLOCK).min(n);
+        if host[block..block_end] != title[block..block_end] {
+            let mut line = block;
+            while line < block_end {
+                let line_end = (line + LINE).min(block_end);
+                if host[line..line_end] != title[line..line_end] {
+                    match runs.last_mut() {
+                        Some((_, end)) if *end == line => *end = line_end,
+                        _ => runs.push((line, line_end)),
+                    }
+                }
+                line = line_end;
+            }
+        }
+        block = block_end;
+    }
+    runs
+}
+
 /// Runs of a copy-back closer than this go into title memory as one span,
 /// with title memory's bytes between them as the copy-back read them: a
 /// kernel copy per run cost over 1 ms per page in the world, where shaders
@@ -332,15 +364,15 @@ impl Shadow {
             return false;
         }
         let runs = match &saved {
-            None => differing(host, title, |_| true),
+            None => differing_rows(host, title),
             Some(before) => {
                 let before = &before[from - page..to - page];
                 differing(host, title, |i| host[i] != before[i])
             }
         };
         // The copy takes the title's other bytes, and holds what goes back.
-        // Without bytes saved, the runs are every byte that differs: the
-        // others are the title's already (copying them cost a 64 KiB write
+        // Without bytes saved, the runs hold every byte that differs (by
+        // lines: `differing_rows`): the others are the title's already (copying them cost a 64 KiB write
         // per page).
         if saved.is_some() {
             take_others(host, title, &runs);
@@ -1860,6 +1892,23 @@ pub(crate) mod tests {
                 naive(&host, &title, &|_| true),
                 "length {len}"
             );
+            // By lines: in order, apart, on line edges, each line holding a
+            // differing byte, and every differing byte inside one.
+            let rows = differing_rows(&host, &title);
+            assert!(rows.windows(2).all(|w| w[0].1 < w[1].0), "length {len}: apart, in order");
+            for &(a, b) in &rows {
+                assert!(a % 32 == 0 && (b % 32 == 0 || b == len) && a < b, "length {len}: {a}..{b} on line edges");
+                for line in (a..b).step_by(32) {
+                    let end = (line + 32).min(b);
+                    assert!(host[line..end] != title[line..end], "length {len}: line {line} differs");
+                }
+            }
+            for (a, b) in naive(&host, &title, &|_| true) {
+                assert!(
+                    rows.iter().any(|&(x, y)| x <= a && b <= y),
+                    "length {len}: {a}..{b} inside a line run"
+                );
+            }
         }
     }
 
@@ -1886,6 +1935,71 @@ pub(crate) mod tests {
         let t = copy.tracked.as_ref().expect("tracked memory");
         assert!(!t.changed(p / PAGE), "still taken");
         assert_eq!(copy.copy_back(p, PAGE), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// A copy-back with no bytes saved puts back whole 32-byte lines: title
+    /// bytes outside the lines the shaders changed stay, also those the title
+    /// writes while the page goes back. With bytes saved (the title wrote the
+    /// page after the copy took it) it stays byte by byte: a title write in
+    /// the shader's very line, before and while the page goes back, stays.
+    #[test]
+    fn copy_backs_by_lines_leave_the_titles_other_bytes() {
+        // By lines, into plain memory: the title writes bytes after the
+        // copy-back read them, outside the changed lines (next line, a gap
+        // over SPAN_GAP away, the last byte) and they stay.
+        let read_title = vec![0x5au8; PAGE];
+        let mut host = read_title.clone();
+        host[100] = 0xaa;
+        host[5000] = 0xab;
+        let runs = differing_rows(&host, &read_title);
+        assert_eq!(runs, [(96, 128), (4992, 5024)]);
+        let mut memory = read_title.clone();
+        memory[128] = 0x11;
+        memory[95] = 0x12;
+        memory[2000] = 0x13;
+        memory[PAGE - 1] = 0x14;
+        assert!(write_runs(memory.as_mut_ptr() as usize, &host, &runs));
+        let mut want = read_title.clone();
+        (want[100], want[5000], want[128], want[95], want[2000], want[PAGE - 1]) = (0xaa, 0xab, 0x11, 0x12, 0x13, 0x14);
+        assert!(memory == want, "only the two lines written");
+
+        // Through the copy: page 0 goes back by lines (nothing saved), page
+        // 1 byte by byte (saved).
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        let title = |at: usize| (p + at) as *mut u8;
+        // SAFETY: (title writes and reads below) bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        // SAFETY: as above.
+        unsafe { title(130).write_volatile(0x77) };
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shaders write a byte in line 96..128 of each page.
+        copy.write_host((p + 100) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 100) as u64, &[0xbb]);
+        // Page 1: the title writes the shader's line before the copy-back
+        // (saved), and again while the copy-backs run.
+        // SAFETY: as above.
+        unsafe { title(PAGE + 105).write_volatile(0x55) };
+        AFTER_READ.with(|w| *w.borrow_mut() = vec![(p + PAGE + 110, 0x66)]);
+        for n in [base, base + 1] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+        }
+        copy_back_marks(&[], false);
+        assert_eq!((read(100), read(130)), (0xaa, 0x77), "page 0: the shader's line, the title's byte after it");
+        assert_eq!(
+            (read(PAGE + 100), read(PAGE + 105), read(PAGE + 110)),
+            (0xbb, 0x55, 0x66),
+            "page 1 (saved): the shader's byte and both title writes in its line"
+        );
         unregister(p, p as u64);
     }
 
