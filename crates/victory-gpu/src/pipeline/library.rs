@@ -493,25 +493,32 @@ pub(crate) fn save(now: bool) {
     }
     let (bytes, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a plain query.
-        let size = unsafe { l.library.GetSerializedSize() };
-        // SAFETY: a buffer of the size the library asks for.
-        let written = write_library(dir, size, |out| unsafe { l.library.Serialize(out) });
-        match written {
-            Ok(tag) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag, &l.prebuilt));
-                (size, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not saved");
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed {
+            if !used_changed {
                 return;
+            }
+            // Only the early list changed: the library is as saved, and is
+            // not serialised and written again (#2180).
+            (0, None)
+        } else {
+            // SAFETY: a plain query.
+            let size = unsafe { l.library.GetSerializedSize() };
+            // SAFETY: a buffer of the size the library asks for.
+            let written = write_library(dir, size, |out| unsafe { l.library.Serialize(out) });
+            match written {
+                Ok(tag) => {
+                    l.added = 0;
+                    l.prebuilt_changed = false;
+                    // Kept beside the bytes it holds for (also when a run adds
+                    // pipelines).
+                    let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag, &l.prebuilt));
+                    (size, prebuilt)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not saved");
+                    return;
+                }
             }
         }
     };
