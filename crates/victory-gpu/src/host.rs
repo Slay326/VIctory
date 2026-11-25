@@ -2514,6 +2514,7 @@ impl Meter {
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
                 gpu_times::log(copy_frames);
+                crate::texture::log_copies(copy_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
