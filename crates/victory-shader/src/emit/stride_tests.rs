@@ -141,6 +141,29 @@ const HALF_STORE_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s0 a table with a structured SRV (12-byte elements), s2 a
+/// table with a structured UAV (8-byte elements). Each lane loads dword 1
+/// of SRV element `lane` and adds it atomically to dword 1 of UAV element
+/// `lane`: indexed accesses the translation reads through raw handles at
+/// `index * stride + offset`, as the host makes structured views raw.
+const STRUCTURED_LOAD_ATOMIC_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE030_2004,
+    0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE0C8_2004,
+    0x8004_0200, // buffer_atomic_add v2, v0, s[16:19], 0 idxen offset:4
+    0xBF81_0000, // s_endpgm
+];
+
 fn param(root: RootType, user_data: u8) -> RootParam {
     RootParam {
         root,
@@ -297,6 +320,71 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// From rminzao's review of #1762: indexed loads and atomics of structured
+/// buffers (strides from their used-resource entries) read and write the
+/// right bytes through the raw views the host makes of structured views,
+/// and declare raw handles (a structured handle on a raw view is undefined
+/// in D3D12).
+#[test]
+fn indexed_loads_and_atomics_of_structured_buffers_read_raw_views() {
+    let structured = |kind, user_data, stride| UsedResource {
+        stride,
+        ..entry(kind, 4, user_data)
+    };
+    let shader = build(
+        STRUCTURED_LOAD_ATOMIC_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![
+            structured(ResourceType::Srv, 0, 12),
+            structured(ResourceType::Uav, 2, 8),
+        ],
+        32,
+    );
+    // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
+    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let views = [
+        View::RawUav(64),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(12),
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The SRV's table at heap index 1 (byte 32), the UAV's at 0.
+            ud[u.index as usize] = if u.slot == 0 { 32 } else { 0 };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..32).flat_map(|l| [0, 200 + l]).collect();
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
