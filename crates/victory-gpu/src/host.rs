@@ -68,6 +68,9 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+mod card;
+pub(crate) use card::card_fetch;
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -1270,6 +1273,11 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Copies in the GPU's own memory: what changed goes up, ahead of
+        // the lists on the queue; the bitmaps there come down behind them.
+        let card_marks = crate::shadow::card_marks();
+        let _carded = self.card_before(&card_marks);
+        let card_marks_list = self.card_marks(&card_marks);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1287,6 +1295,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        // Whether the bitmaps were fetched from the GPU's memory (not
+        // without groups: timing a submission of no lists).
+        let mut marks_sent = false;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1295,6 +1306,14 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // Behind the last of the lists: the bitmaps come down from
+                // the GPU's memory.
+                if i + 1 == groups.len()
+                    && let Some(marks) = &card_marks_list
+                {
+                    self.queue.ExecuteCommandLists(&[Some(marks.clone())]);
+                    marks_sent = true;
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1414,6 +1433,12 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // Of copies in the GPU's memory, what shaders wrote without marks
+        // comes down first, for the snapshots' compares below.
+        self.card_declared(runs);
+        if marks_sent {
+            crate::shadow::marks_fetched(&card_marks);
+        }
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2954,6 +2979,7 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                card::log(copy_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
