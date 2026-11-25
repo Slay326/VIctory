@@ -343,6 +343,13 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// Timing only (`split_perf_tests`): lower without thread-group
+    /// barriers, to measure what they cost. Results are then undefined.
+    pub(crate) static NO_GROUP_BARRIERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Exchange dwords per host wave in a split program.
 const SPLIT_SLOTS: u32 = 2;
 
@@ -3199,6 +3206,10 @@ impl<'a> Lower<'a> {
 
     /// A thread-group barrier that orders group-shared memory.
     fn group_barrier(&mut self, at: usize) {
+        #[cfg(test)]
+        if NO_GROUP_BARRIERS.with(std::cell::Cell::get) {
+            return;
+        }
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
