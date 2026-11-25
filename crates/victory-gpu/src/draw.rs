@@ -421,7 +421,7 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
-            if !crate::resource::allows_render_target(texture) {
+            if !crate::resource::allows_render_target(&texture) {
                 tracing::warn!(
                     resource = ?record.resource,
                     "skipping render target: host texture lacks ALLOW_RENDER_TARGET"
