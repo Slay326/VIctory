@@ -11066,6 +11066,9 @@ impl<'a> Lower<'a> {
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
+        // Ballots and mask numbers below go at the end of the block writing
+        // the mask.
+        self.cur_ir = usize::MAX;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -11109,6 +11112,18 @@ impl<'a> Lower<'a> {
                     {
                         self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
                     }
+                    // A lane mask joined with a number (a traversal keeps
+                    // lane masks as numbers on its LDS stack): with console
+                    // lanes the mask as a number is the console's.
+                    (_, false)
+                        if read
+                            && self.mask_data == MaskData::Console
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.mask_dword(arg)
+                            .map_err(|why| Stop::Retry(phi.value, why))?
+                    }
                     (Some(Val::Missing(why)), _) if read => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -11143,6 +11158,15 @@ impl<'a> Lower<'a> {
                     (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
                     (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
+                    }
+                    // No lane from this edge reads it (a register the
+                    // compiler reuses): any mask will do.
+                    (None, _) if self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg) => self.s.m.bool(false),
+                    // A mask that arrives as a number (popped from a
+                    // traversal's stack): with console lanes it is the
+                    // console's, and the lane takes its own bit.
+                    (None, Some(&Val::I32(word))) if self.console_lanes && !self.x.native.wave64 => {
+                        self.lane_bit(qb, word, None)
                     }
                     (None, _) => return Err(unsupported(offset, UNTRACKED)),
                 };
