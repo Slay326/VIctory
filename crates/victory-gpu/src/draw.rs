@@ -1245,11 +1245,77 @@ impl State {
     /// is submitted (before the GPU runs it) and after it has run.
     #[cfg(feature = "diagnostics")]
     fn probe_small(&self, list: &HostList, compute: bool) {
-        if !crate::capture::listed(crate::queue::presented() + 1) {
+        // Diagnostics (local): `VICTORY_DIAG_PROBE=<hash,...>` logs, for the
+        // first dispatches of those shaders, every buffer of 4096 bytes at
+        // most their tables name: title memory when recorded and the host
+        // copy at submission, as hex dwords.
+        static PROBED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        static LEFT: AtomicU64 = AtomicU64::new(400);
+        let probed = PROBED.get_or_init(|| {
+            std::env::var("VICTORY_DIAG_PROBE")
+                .map(|v| v.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect())
+                .unwrap_or_default()
+        });
+        let listed = crate::capture::listed(crate::queue::presented() + 1);
+        if !listed && probed.is_empty() {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
         for stage in &p.stages {
+            let wanted = probed.iter().any(|h| stage.shader.hash.starts_with(h.as_str()));
+            if wanted {
+                for u in &stage.translated().used {
+                    let (RootType::Table, Some(Root::Table(table))) =
+                        (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                    else {
+                        continue;
+                    };
+                    let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                        continue;
+                    };
+                    let range = match view {
+                        View::Constant(address, size) => Some((address, u64::from(size))),
+                        ref v => crate::descriptor::host::buffer_range(v),
+                    };
+                    // (local) `VICTORY_DIAG_PROBE_AT=<table offset in dwords>:<byte
+                    // offset>`: of the view at that table offset, 16 bytes at
+                    // that offset, whatever the view's size.
+                    static AT: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
+                    let probe_at = *AT.get_or_init(|| {
+                        let v = std::env::var("VICTORY_DIAG_PROBE_AT").ok()?;
+                        let (t, o) = v.split_once(':')?;
+                        Some((t.trim().parse().ok()?, u64::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok()?))
+                    });
+                    let range = match (probe_at, range) {
+                        (Some((t, o)), Some((at, len))) if t == u32::from(u.table_offset_dwords) && o + 16 <= len => {
+                            Some((at + o, 16))
+                        }
+                        (Some(_), _) => None,
+                        (None, r) => r,
+                    };
+                    let Some((at, len)) = range.filter(|r| r.1 <= 4096) else {
+                        continue;
+                    };
+                    if LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_err() {
+                        continue;
+                    }
+                    let mut bytes = vec![0u8; len as usize];
+                    let title = if crate::host::read_into(at as *const u8, &mut bytes) {
+                        bytes.as_chunks::<4>().0.iter().map(|&c| format!("{:x}", u32::from_le_bytes(c))).collect::<Vec<_>>().join(" ")
+                    } else {
+                        "unreadable".to_owned()
+                    };
+                    let who = format!("{} {:?} s{}+{} {at:#x}+{len}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
+                    tracing::info!("probe {who} title when recorded: {title}");
+                    match crate::shadow::find(at, len) {
+                        Some(shadow) => list.defer_host(move || tracing::info!("probe {who} host copy at submission: {}", shadow.peek_words(at, len))),
+                        None => tracing::info!("probe {who}: no host copy"),
+                    }
+                }
+            }
+            if !listed {
+                continue;
+            }
             for u in &stage.translated().used {
                 let (RootType::Table, Some(Root::Table(table))) =
                     (u.root, self.roots_ref(compute).get(usize::from(u.slot)))

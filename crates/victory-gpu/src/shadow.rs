@@ -136,6 +136,19 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// Up to 4096 bytes of the copy at title address `address`, as hex
+    /// dwords (diagnostics, local).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek_words(&self, address: u64, len: u64) -> String {
+        let at = address.saturating_sub(self.start) as usize;
+        let n = (len.min(4096) as usize).min((self.len as usize).saturating_sub(at)) / 4;
+        // SAFETY: inside the mapping (checked); a racing GPU write only makes
+        // the logged value stale.
+        let v = unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n) };
+        let words: Vec<String> = v.iter().map(|w| format!("{w:x}")).collect();
+        format!("copy {:#x}+{:#x} {}", self.start, self.len, words.join(" "))
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start
