@@ -84,6 +84,8 @@ impl Map {
 #[derive(Default)]
 struct Layout {
     copies: Vec<Arc<Shadow>>,
+    /// Where each copy's changes show (`Shadow::changed_place`).
+    places: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
 }
@@ -313,6 +315,7 @@ impl Shared {
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
+            places: named.iter().map(|c| c.changed_place()).collect(),
             copies: named,
             blocks,
             owner,
@@ -348,9 +351,18 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         Some(s.layout.clone())
     })
     .flatten();
-    for c in layout.iter().flat_map(|l| &l.copies) {
-        let (start, len) = c.range();
-        add(c, start as usize, len as usize);
+    // The world has some 4,100 copies and a frame two dozen submissions
+    // that read title memory: only the copies with something changed are
+    // asked for (the others would be found unchanged one by one).
+    for (c, place) in layout.iter().flat_map(|l| l.copies.iter().zip(&l.places)) {
+        let changed = match *place {
+            Some(place) => crate::watch::changed_at(place),
+            None => !c.unchanged(),
+        };
+        if changed {
+            let (start, len) = c.range();
+            add(c, start as usize, len as usize);
+        }
     }
 }
 
@@ -400,7 +412,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         })
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner } = &*layout(key);
+        let Layout { copies, blocks, owner, .. } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };

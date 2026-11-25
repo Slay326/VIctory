@@ -1870,11 +1870,15 @@ impl HostList {
                     continue;
                 }
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    if batch.all_due(0, std::sync::Arc::as_ptr(viewed) as usize) {
+                        crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    if batch.all_due(1, heap) {
+                        crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
             };
@@ -1908,6 +1912,10 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The view heaps whose views' ranges (0, by the heap's views) and
+    /// whose page tables' copies (1, by the heap's key) were all asked for
+    /// since the last title write.
+    all: std::collections::HashSet<(u8, usize)>,
 }
 
 impl Batch {
@@ -1934,12 +1942,22 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// Whether everything a view heap reaches (`kind` 0, `key` its views)
+    /// or its page table names (`kind` 1, `key` the heap's) is still to be
+    /// asked for in this submission (and notes it asked): every list of a
+    /// world submission that uses the heap asks, and walking the heap's
+    /// thousands of copies for each list found them all asked already.
+    fn all_due(&mut self, kind: u8, key: usize) -> bool {
+        self.all.insert((kind, key))
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
         self.current.clear();
+        self.all.clear();
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -2941,6 +2959,21 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn a_heaps_copies_are_asked_for_once_per_submission() {
+        let mut batch = Batch::default();
+        // The first list using a heap's page table asks for its copies ...
+        assert!(batch.all_due(1, 0x1000));
+        // ... later lists do not; the heap's views are asked on their own.
+        assert!(!batch.all_due(1, 0x1000));
+        assert!(batch.all_due(0, 0x1000));
+        assert!(batch.all_due(1, 0x2000));
+        // After a step that may have written title memory, again.
+        batch.title_written();
+        assert!(batch.all_due(1, 0x1000));
+        assert!(batch.all_due(0, 0x1000));
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
