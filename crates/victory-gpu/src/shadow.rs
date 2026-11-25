@@ -908,6 +908,22 @@ struct Bitmap {
     _buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
+    /// With copies in the GPU's memory ([`cards`]): the bitmap shaders
+    /// write is there too (every marked store waited for the bus), `gpu`
+    /// is its address, and `data` is the CPU's bitmap, which takes its bits
+    /// after each submission ([`marks_fetched`]).
+    card: Option<CardMarks>,
+}
+
+/// The written-pages bitmap in the GPU's memory.
+struct CardMarks {
+    /// What shaders write.
+    marks: ID3D12Resource,
+    /// Zeros of its size, to clear it from.
+    zeros: ID3D12Resource,
+    /// Where it is fetched to after a submission: system memory, mapped.
+    fetched: ID3D12Resource,
+    fetched_data: usize,
 }
 
 // SAFETY: D3D12 resources are free-threaded; the mapping is read and cleared
@@ -921,19 +937,59 @@ fn bitmap() -> Option<&'static Bitmap> {
     BITMAP
         .get_or_init(|| {
             let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
-            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            let host = host()?;
+            let (buffer, data) = host.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            let card = (cards() && host.card_ready())
+                .then(|| {
+                    let (fetched, fetched_data) = host.shared_buffer(bytes)?;
+                    let (marks, zeros) = (host.card_buffer(bytes)?, host.card_buffer(bytes)?);
+                    crate::host::name(&marks, || "views' written pages (GPU memory)".into());
+                    Some(CardMarks { marks, zeros, fetched, fetched_data: fetched_data as usize })
+                })
+                .flatten();
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let gpu = unsafe { card.as_ref().map_or(&buffer, |c| &c.marks).GetGPUVirtualAddress() };
             Some(Bitmap {
                 _buffer: buffer,
                 data: data as usize,
                 gpu,
+                card,
             })
         })
         .as_ref()
+}
+
+/// With the written-pages bitmap in the GPU's memory: the bitmap, zeros to
+/// clear it from, where it is fetched to, and the bytes of it that copies'
+/// bits lie in (none: nothing to clear or fetch).
+pub(crate) fn card_marks() -> Option<(ID3D12Resource, ID3D12Resource, ID3D12Resource, u64)> {
+    let card = bitmap()?.card.as_ref()?;
+    let bytes = u64::from(marks().end.div_ceil(32)) * 4;
+    (bytes > 0).then(|| (card.marks.clone(), card.zeros.clone(), card.fetched.clone(), bytes))
+}
+
+/// After a submission, with the written-pages bitmap in the GPU's memory:
+/// its first `bytes` bytes were fetched ([`card_marks`]); the bits go into
+/// the CPU's bitmap, which [`copy_back_marks`] reads.
+pub(crate) fn marks_fetched(bytes: u64) {
+    let Some((b, card)) = bitmap().and_then(|b| Some((b, b.card.as_ref()?))) else {
+        return;
+    };
+    let words = (bytes / 4) as usize;
+    // SAFETY: both mappings hold the whole bitmap, of which `bytes` are
+    // within; the GPU is done with them (one submission runs at a time).
+    let (bits, fetched) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(b.data as *mut u32, words),
+            std::slice::from_raw_parts(card.fetched_data as *const u32, words),
+        )
+    };
+    for (bit, &f) in bits.iter_mut().zip(fetched) {
+        *bit |= f;
+    }
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
