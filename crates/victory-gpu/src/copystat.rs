@@ -308,6 +308,20 @@ pub(crate) fn log(frames: f64) {
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+    // (local diagnostics) every range of the refresh batches, not only the
+    // ten below.
+    {
+        let (n, bytes, us) = ranges
+            .iter()
+            .fold((0u64, 0u64, 0u64), |t, &(_, (n, bytes, us, _))| (t.0 + n, t.1 + bytes, t.2 + us));
+        tracing::info!(
+            "  refresh batch ranges per frame: {:.0} brought up to date ({} distinct), {:.1} MB asked, {:.1} ms in them",
+            n as f64 / frames,
+            ranges.len(),
+            bytes as f64 / 1e6 / frames,
+            us as f64 / 1e3 / frames
+        );
+    }
     for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
