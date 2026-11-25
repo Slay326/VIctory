@@ -2525,6 +2525,7 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        memory_use::made(&memory_use::UPLOAD, size, made.is_ok());
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -2683,6 +2684,8 @@ impl Meter {
                 crate::descriptor::USAGE.2.swap(0, Ordering::Relaxed),
                 crate::descriptor::host::PLACED_FAILED.swap(0, Ordering::Relaxed),
             );
+            crate::texture::release_idle();
+            memory_use::log();
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
@@ -2971,6 +2974,7 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        memory_use::made(&memory_use::SHARED, size, made.is_ok());
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -3033,6 +3037,108 @@ pub(crate) fn video_memory() -> Option<(u64, u64)> {
     }
     .ok()?;
     Some((info.Budget, info.CurrentUsage))
+}
+
+/// Where the memory is (the frame-rate line's companion): the adapter's
+/// dedicated and shared memory in use against the budgets the system gives
+/// this process, the process's and the system's commit, and what our own
+/// kinds of host memory add up to.
+pub(crate) mod memory_use {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    use windows::Win32::Graphics::Dxgi::*;
+
+    /// Upload and shared (system-memory) buffers made: count, bytes, and
+    /// those the host refused.
+    pub(crate) static UPLOAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    pub(crate) static SHARED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    pub(crate) fn made(kind: &[AtomicU64; 3], size: u64, ok: bool) {
+        if ok {
+            kind[0].fetch_add(1, Relaxed);
+            kind[1].fetch_add(size, Relaxed);
+        } else {
+            kind[2].fetch_add(1, Relaxed);
+        }
+    }
+
+    struct Adapter(Option<IDXGIAdapter3>);
+    // SAFETY: DXGI adapters are free-threaded; only queried.
+    unsafe impl Send for Adapter {}
+    // SAFETY: as above.
+    unsafe impl Sync for Adapter {}
+
+    /// The device's adapter, for its memory budgets.
+    fn adapter() -> Option<&'static IDXGIAdapter3> {
+        static ADAPTER: OnceLock<Adapter> = OnceLock::new();
+        ADAPTER
+            .get_or_init(|| {
+                // SAFETY: plain DXGI queries for the adapter our device is on.
+                Adapter(unsafe {
+                    super::host().and_then(|h| {
+                        let luid = h.device.GetAdapterLuid();
+                        let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                        factory.EnumAdapterByLuid::<IDXGIAdapter3>(luid).ok()
+                    })
+                })
+            })
+            .0
+            .as_ref()
+    }
+
+    /// Dedicated and shared adapter memory: (budget, in use) each, bytes.
+    pub(crate) fn video() -> Option<[(u64, u64); 2]> {
+        let adapter = adapter()?;
+        let mut out = [(0, 0); 2];
+        for (i, group) in [DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL].into_iter().enumerate() {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            // SAFETY: a live adapter and an out structure.
+            unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+            out[i] = (info.Budget, info.CurrentUsage);
+        }
+        Some(out)
+    }
+
+    /// The process's commit and working set, and the system's commit in
+    /// use and limit, bytes.
+    pub(crate) fn commit() -> (u64, u64, u64, u64) {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        let mut p = PERFORMANCE_INFORMATION { cb: size_of::<PERFORMANCE_INFORMATION>() as u32, ..Default::default() };
+        // SAFETY: our own process and sized structures.
+        unsafe {
+            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+            K32GetPerformanceInfo(&mut p, p.cb);
+        }
+        let page = p.PageSize as u64;
+        (c.PagefileUsage as u64, c.WorkingSetSize as u64, p.CommitTotal as u64 * page, p.CommitLimit as u64 * page)
+    }
+
+    pub(crate) fn log() {
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let video = video().unwrap_or_default();
+        let (process, working, total, limit) = commit();
+        let (textures, texture_bytes, used, ..) = crate::resource::texture_counts();
+        let (placed, placed_bytes) = crate::resource::placed_counts();
+        let (staging, read, released, remade) = crate::texture::upload_memory();
+        let copies: u64 = crate::shadow::all().iter().map(|s| s.range().1).sum();
+        tracing::info!(
+            "memory: GPU dedicated {:.0}/{:.0} MB, shared {:.0}/{:.0} MB (in use/budget); process commit {:.0} MB, working set {:.0} MB; system commit {:.0}/{:.0} MB; \
+             host textures {textures} {:.0} MB ({:.0} MB used by lists; placed by the title {placed} {:.0} MB); texture staging {:.0} MB, read rooms {:.0} MB, {released} staging let go, {remade} made again; \
+             copies of title buffers {:.0} MB; upload buffers made {} {:.0} MB ({} refused), shared buffers made {} {:.0} MB ({} refused)",
+            mb(video[0].1), mb(video[0].0), mb(video[1].1), mb(video[1].0),
+            mb(process), mb(working), mb(total), mb(limit),
+            mb(texture_bytes), mb(used), mb(placed_bytes),
+            mb(staging), mb(read),
+            mb(copies),
+            UPLOAD[0].load(Relaxed), mb(UPLOAD[1].load(Relaxed)), UPLOAD[2].load(Relaxed),
+            SHARED[0].load(Relaxed), mb(SHARED[1].load(Relaxed)), SHARED[2].load(Relaxed),
+        );
+    }
 }
 
 /// Host resources that view heap slots stopped viewing while a submission

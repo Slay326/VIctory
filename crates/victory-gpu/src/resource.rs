@@ -1740,6 +1740,22 @@ fn now_ms() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// Resources made for placed views, and the bytes of their distinct host
+/// textures.
+#[cfg(windows)]
+pub(crate) fn placed_counts() -> (usize, u64) {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = std::collections::HashSet::new();
+    let bytes = map
+        .by_view
+        .values()
+        .filter_map(|p| resource(p.resource as This).host_made())
+        .filter(|h| seen.insert(std::sync::Arc::as_ptr(h) as usize))
+        .map(|h| h.bytes)
+        .sum();
+    (map.by_view.len() + map.replaced.len(), bytes)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use. The use is noted
 /// under the lock [`let_go_idle`] looks under: a resource handed out is not
