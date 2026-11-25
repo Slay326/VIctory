@@ -4992,23 +4992,38 @@ impl<'a> Lower<'a> {
         }
         let bitmap = self.s.memory_dirty_handle();
         let at = self.begin_guarded(marks);
-        let c = self.cur;
-        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
+        let (k5, k31, k2, one, zero) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1), k(self, 0));
         let iu = self.s.m.undef(self.s.t.i32);
-        for n in bits {
+        let first = bits[0];
+        for (i, &n) in bits.iter().enumerate() {
+            let c = self.cur;
             // Byte offset of the bitmap dword; operation 2 is OR.
             let word = self.s.m.bin(c, Bin::LShr, n, k5);
             let word = self.s.m.bin(c, Bin::Shl, word, k2);
             let bit = self.s.m.bin(c, Bin::And, n, k31);
             let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            // Most accesses find their page marked already (every lane of a
+            // wave writes the same few pages): a load, and the atomic only
+            // where the bit is still clear. The runtime keeps the bitmap in
+            // system memory, where an atomic per store, all lanes on the
+            // same dword, held a list of the XboxBvhBuilder for minutes.
+            let old = self.raw_dword(bitmap, word);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            if i == 1 {
+                let other = self.s.m.cmp(c, pred::NE, n, first);
+                clear = self.s.m.bin(c, Bin::And, clear, other);
+            }
+            let inner = self.begin_guarded(Some(clear));
             self.s.op(
-                c,
+                self.cur,
                 "atomicBinOp.i32",
                 Attr::NoUnwind,
                 self.s.t.i32,
                 78,
                 &[bitmap, k2, word, iu, iu, bit],
             );
+            self.end_guarded(inner, &[]);
         }
         self.end_guarded(at, &[]);
         (e.handle, e.offset)
