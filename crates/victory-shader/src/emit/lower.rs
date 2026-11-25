@@ -11466,6 +11466,7 @@ impl<'a> Lower<'a> {
                     // lanes the mask as a number is the console's.
                     (_, false)
                         if read
+                            && self.uniform_join(b)
                             && self.mask_data == MaskData::Console
                             && (self.x.st.masks.contains_key(&arg)
                                 || self.x.st.highs.contains_key(&arg)) =>
