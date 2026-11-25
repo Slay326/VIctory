@@ -2480,9 +2480,12 @@ mod tests {
         heap.raw_pair_at(first, None, 0);
         assert_eq!(heap.address_at(first), Some(0), "a view pair");
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
-        // Slots past the dynamic ones (host copies' view pairs) have no
-        // entry, and nothing is written past the last: a mark there (the
-        // buffer's allocation reaches past it) stays.
+        // The entries reach every slot (by host slot where the title's lie
+        // by blocks) and at least `heap_views`, which shaders clamp indices
+        // from data below (#2342); none past them, and nothing is written
+        // past the last: a mark there (the buffer's allocation reaches past
+        // it) stays.
+        let end = heap.address_slots().max(victory_shader::emit::heap_views());
         assert_eq!(heap.address_at(end), None);
         let host = host().unwrap();
         let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
