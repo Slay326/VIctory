@@ -43,8 +43,34 @@ use std::sync::{Arc, Mutex};
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
-/// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+/// of pages it armed; then how many the changed pages are (kept under the
+/// set's lock, read without it: a tracker with none has nothing to copy,
+/// and most have none at most submissions) and the tracker's place in
+/// [`COUNTS`], if it has one.
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, std::sync::atomic::AtomicUsize, Option<u32>);
+
+/// The trackers' numbers of changed pages again, side by side, each at its
+/// tracker's place ([`Tracked::place`]): a walk over thousands of copies
+/// that asks which of them changed reads these, not each copy's tracker
+/// (three objects apart in memory).
+static COUNTS: [std::sync::atomic::AtomicU32; 1 << 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 16];
+
+/// Places of [`COUNTS`] never given out (from this one on) and given back.
+static PLACES: Mutex<(u32, Vec<u32>)> = Mutex::new((0, Vec::new()));
+
+/// Whether the tracker at `place` has changed pages.
+pub(crate) fn changed_at(place: u32) -> bool {
+    COUNTS[place as usize].load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+impl Drop for Changed {
+    fn drop(&mut self) {
+        if let Some(place) = self.3 {
+            COUNTS[place as usize].store(0, std::sync::atomic::Ordering::Release);
+            PLACES.lock().unwrap_or_else(|e| e.into_inner()).1.push(place);
+        }
+    }
+}
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -57,6 +83,42 @@ struct Saved {
 }
 
 impl Changed {
+    /// A tracker's pages, all changed, with a place in [`COUNTS`] while
+    /// there is one.
+    fn new(pages: BTreeSet<usize>) -> Changed {
+        let place = {
+            let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+            places.1.pop().or_else(|| {
+                let next = places.0;
+                ((next as usize) < COUNTS.len()).then(|| {
+                    places.0 += 1;
+                    next
+                })
+            })
+        };
+        let changed = Changed(Mutex::new(BTreeSet::new()), Mutex::default(), 0.into(), place);
+        changed.count(&pages);
+        *changed.0.lock().unwrap_or_else(|e| e.into_inner()) = pages;
+        changed
+    }
+
+    /// Marks `page` changed: whether it was not before.
+    fn mark(&self, page: usize) -> bool {
+        let mut pages = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let first = pages.insert(page);
+        self.count(&pages);
+        first
+    }
+
+    /// Notes how many pages `pages`, the locked set, holds now.
+    fn count(&self, pages: &BTreeSet<usize>) {
+        use std::sync::atomic::Ordering::Release;
+        self.2.store(pages.len(), Release);
+        if let Some(place) = self.3 {
+            COUNTS[place as usize].store(pages.len().min(u32::MAX as usize) as u32, Release);
+        }
+    }
+
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
         self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
@@ -214,7 +276,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed::new(pages.clone().collect()));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -291,7 +353,7 @@ impl Tracked {
     /// only partly in `[from, to)` is copied in part and stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (from, to) = (from.max(self.start), to.min(self.end));
-        if from >= to {
+        if from >= to || !self.any_changed() {
             return Vec::new();
         }
         let pages: Vec<usize> = {
@@ -328,6 +390,7 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        self.changed.count(&changed);
         drop(changed);
         drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -361,6 +424,20 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        self.changed.count(&changed);
+    }
+
+    /// Whether any page changed since it was taken. Without the tracker's
+    /// lock: a write under way shows at the next ask, as it would have a
+    /// moment later.
+    pub(crate) fn any_changed(&self) -> bool {
+        self.changed.2.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// Where [`changed_at`] answers [`Tracked::any_changed`] for this
+    /// tracker, if it has such a place.
+    pub(crate) fn place(&self) -> Option<u32> {
+        self.changed.3
     }
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
@@ -482,7 +559,7 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            let first_write = c.mark(page);
             if first_write && save {
                 c.save(page);
             }
@@ -705,6 +782,42 @@ pub(crate) mod tests {
         assert_eq!(a.take(p, p + 4 * PAGE), [(p + 3 * PAGE, p + 4 * PAGE)]);
         title_memory_remapped(p, PAGE);
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
+        drop((a, b));
+        free(p);
+    }
+
+    /// A tracker knows without a look at its pages whether any changed:
+    /// all at first, none once taken, again after a write, a reported write
+    /// or a remapping, and while a page taken in part stays changed. The
+    /// same answers are side by side at the trackers' places.
+    #[test]
+    fn a_tracker_knows_whether_anything_changed() {
+        let p = pool(3);
+        let (a, b) = (track(p, 3 * PAGE, true).expect("tracked"), track(p + PAGE, PAGE, true).expect("tracked"));
+        assert!(a.any_changed() && b.any_changed());
+        // Part of a page: it stays changed.
+        assert_eq!(a.take(p + 16, p + 32), [(p + 16, p + 32)]);
+        assert!(a.any_changed());
+        a.take(p, p + 3 * PAGE);
+        b.take(p, p + 3 * PAGE);
+        assert!(!a.any_changed() && !b.any_changed());
+        assert!(a.take(p, p + 3 * PAGE).is_empty());
+        // SAFETY: a committed page of ours, guarded: the handler opens it.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
+        assert!(a.any_changed() && b.any_changed());
+        assert_eq!(a.take(p, p + 3 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        assert!(!a.any_changed() && b.any_changed());
+        b.taken(&[p / PAGE + 1]);
+        assert!(!b.any_changed());
+        drop(writing(p + 2 * PAGE, 1));
+        assert!(a.any_changed() && !b.any_changed());
+        a.take(p, p + 3 * PAGE);
+        title_memory_remapped(p, PAGE);
+        assert!(a.any_changed() && !b.any_changed());
+        let (at_a, at_b) = (a.place().expect("a place"), b.place().expect("a place"));
+        assert!(at_a != at_b && changed_at(at_a) && !changed_at(at_b));
+        a.take(p, p + 3 * PAGE);
+        assert!(!changed_at(at_a));
         drop((a, b));
         free(p);
     }

@@ -492,6 +492,20 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether nothing of the copy's memory changed since the copy took it:
+    /// no range of it has anything to bring up to date. Never for memory
+    /// that is not tracked (copied whole each time).
+    pub(crate) fn unchanged(&self) -> bool {
+        self.tracked.as_ref().is_some_and(|t| !t.any_changed())
+    }
+
+    /// Where `crate::watch::changed_at` says whether the copy is not
+    /// [`Shadow::unchanged`], for walks over many copies; `None` for a copy
+    /// to ask itself.
+    pub(crate) fn changed_place(&self) -> Option<u32> {
+        self.tracked.as_ref().and_then(crate::watch::Tracked::place)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -499,6 +513,18 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
+            return 0;
+        }
+        // Nothing of the copy's memory changed since it was taken: nothing
+        // to copy anywhere in it (most copies at most submissions).
+        if self.unchanged() {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Watches, 1);
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from) as u64);
+            }
             return 0;
         }
         let mut busy: Vec<(usize, usize)> = self

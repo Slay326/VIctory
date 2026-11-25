@@ -254,7 +254,9 @@ impl Uploads {
 /// is shaders marking the pages they write (as `crate::memory` does).
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     for (shadow, address, len, _) in viewed.ranges() {
-        add(&shadow, address as usize, len as usize);
+        if !shadow.unchanged() {
+            add(&shadow, address as usize, len as usize);
+        }
     }
 }
 
