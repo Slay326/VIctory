@@ -253,6 +253,124 @@ fn build(
     shader
 }
 
+/// A buffer descriptor's dword 2 (its record count) read as data, beside a
+/// load or store through the same descriptor: records of the structure
+/// stride for structured views however the code addresses them (by index,
+/// at byte offsets, by scalar loads), bytes for raw views, texels for typed
+/// ones; and the right element through the raw views the host makes. The
+/// cases are AlanQiang0418's regression from the review of #1762: on an
+/// RTX 5080 byte-offset accesses counted 192 bytes instead of 16 records,
+/// and indexed loads through structured handles of raw views read element 0
+/// or 1 for strides 8 to 24.
+#[test]
+fn a_buffer_descriptors_record_count_reads_as_its_views_kind() {
+    use Stride::{Raw, Structured, Typed};
+    // 48 dwords, floats 100.0, 101.0, ...: 16 records of 12 bytes, 12
+    // RGBA32F texels.
+    let data: Vec<u32> = (0..48).map(|i| (100.0f32 + i as f32).to_bits()).collect();
+    // v3 = 1 (index) or 12 (byte); the access leaves its value in v2.
+    let load_index = [0x7E06_0281, 0xE030_2000, 0x8002_0203]; // buffer_load_dword v2, v3, s[8:11], 0 idxen
+    let load_byte = [0x7E06_028C, 0xE030_1000, 0x8002_0203]; // buffer_load_dword v2, v3, s[8:11], 0 offen
+    let load_scalar = [0xF420_0504, 0xFA00_000C, 0xBF8C_C07F, 0x7E04_0214]; // s_buffer_load_dword s20, s[8:11], 12; v2 = s20
+    let load_typed = [0x7E06_0281, 0xE000_2000, 0x8002_0203]; // buffer_load_format_x v2, v3, s[8:11], 0 idxen
+    // v2 = 42 stored to the first dword of record 1.
+    let store_index = [0x7E04_02AA, 0x7E06_0281, 0xE070_2000, 0x8002_0203];
+    let store_byte = [0x7E04_02AA, 0x7E06_028C, 0xE070_1000, 0x8002_0203];
+    // (what, the access, the view, unordered, [record count, value]).
+    type Case<'a> = (&'a str, &'a [u32], Stride, bool, [u32; 2]);
+    let cases: [Case; 11] = [
+        ("4-byte records by index", &load_index, Structured(4), false, [48, data[1]]),
+        ("8-byte records by index", &load_index, Structured(8), false, [24, data[2]]),
+        ("12-byte records by index", &load_index, Structured(12), false, [16, data[3]]),
+        ("16-byte records by index", &load_index, Structured(16), false, [12, data[4]]),
+        ("24-byte records by index", &load_index, Structured(24), false, [8, data[6]]),
+        ("12-byte records at a byte offset", &load_byte, Structured(12), false, [16, data[3]]),
+        ("12-byte records by a scalar load", &load_scalar, Structured(12), false, [16, data[3]]),
+        ("raw bytes", &load_byte, Raw, false, [192, data[3]]),
+        ("typed texels", &load_typed, Typed, false, [12, data[4]]),
+        ("12-byte unordered records by index", &store_index, Structured(12), true, [16, 42]),
+        ("12-byte unordered records at a byte offset", &store_byte, Structured(12), true, [16, 42]),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [("hardware", false), ("warp", true)]
+        .into_iter()
+        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, h)))
+        .collect();
+    assert!(!hosts.is_empty(), "neither hardware nor WARP SM 6.6 device available");
+    let mut wrong = Vec::new();
+    for (name, access, view, unordered, [count, value]) in cases {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0402,
+            0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_020A, // v_mov_b32 v1, s10 (dword 2: the record count)
+        ];
+        words.extend_from_slice(access);
+        words.extend([
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x8004_0100, // buffer_store_dword v1, v0, s[16:19], 0 offen
+            0xE070_1004,
+            0x8004_0200, // buffer_store_dword v2, v0, s[16:19], 0 offen offset:4
+            0xBF81_0000, // s_endpgm
+        ]);
+        let kind = if unordered { ResourceType::Uav } else { ResourceType::Srv };
+        let stride = match view {
+            Structured(bytes) => bytes,
+            Typed => 16,
+            _ => 0,
+        };
+        let output = UsedResource {
+            table_offset_dwords: 8,
+            ..entry(ResourceType::Uav, 4, 0)
+        };
+        let shader = build(
+            &words,
+            vec![param(RootType::Table, 0)],
+            vec![UsedResource { stride, ..entry(kind, 4, 0) }, output],
+            1,
+        );
+        let input = if unordered {
+            View::RawUav(48)
+        } else {
+            View::Buffer { data: &data, stride: view }
+        };
+        let views = [input, View::RawUav(2)];
+        for (label, host) in &hosts {
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} {name}: compute_pipeline failed: {e}"));
+            let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name}: dispatch failed: {e}"));
+            let got = out.last().cloned().unwrap_or_default();
+            if got != [count, value] {
+                wrong.push(format!("{label} {name}: {got:?}, want [{count}, {value}]"));
+            }
+            if unordered && out[0].get(3) != Some(&value) {
+                wrong.push(format!("{label} {name}: byte 12 holds {:?}, want {value}", out[0].get(3)));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     let shader = build(

@@ -1376,10 +1376,12 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes: made a raw view of the same
-    /// bytes, as the runtime makes the title's structured views (NVIDIA
-    /// reads a structured view by its own stride whatever the shader's read;
-    /// from marquezinii's and welisonzika14-jpg's reviews of #1762).
+    /// Structured, elements of this many bytes. A translated program reads
+    /// it through a raw view of the same bytes, as the runtime makes the
+    /// title's structured views (NVIDIA reads a structured view by its own
+    /// stride whatever the shader's read; from marquezinii's and
+    /// welisonzika14-jpg's reviews of #1762); native PC code, which declares
+    /// a structured buffer, through a structured view ([`Host::dispatch_native`]).
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
@@ -1404,6 +1406,29 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, false)
+    }
+
+    /// [`Self::dispatch`] for native PC code: [`Stride::Structured`] views
+    /// are structured, as its declarations are (a structured declaration
+    /// read through a raw view reads wrong on NVIDIA: an RTX 5080 got every
+    /// lane wrong; from AlanQiang0418's review of #1762).
+    pub fn dispatch_native(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, true)
+    }
+
+    fn dispatch_as(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        native: bool,
     ) -> Result<Vec<Vec<u32>>, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
@@ -1788,6 +1813,12 @@ impl Host {
                                 DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 data.len() / 4,
                                 0,
+                                D3D12_BUFFER_SRV_FLAG_NONE,
+                            ),
+                            Stride::Structured(s) if native => (
+                                DXGI_FORMAT_UNKNOWN,
+                                data.len() * 4 / s as usize,
+                                s,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
                             Stride::Structured(_) => (

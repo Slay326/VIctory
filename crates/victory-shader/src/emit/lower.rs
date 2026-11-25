@@ -4373,13 +4373,16 @@ impl<'a> Lower<'a> {
                 };
                 ((kind | u, 0x409), Some(kind))
             }
-            Fields::Buffer { idxen, format, .. } => {
+            Fields::Buffer { format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                } else if format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                    // A structured view's descriptor counts records, also
+                    // when the code reads it at byte offsets (`offen`; from
+                    // AlanQiang0418's review of #1762).
                     (12 | u, stride)
                 } else {
                     (11 | u, 0)
