@@ -26,6 +26,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The record each slot was last left unmade for (a placed texture's
+    /// view, made when a draw reads it): [`Self::sync`] does not go over
+    /// such a slot again while its record stays. Locked after `made`.
+    left: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -261,6 +265,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            left: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -764,6 +769,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            self.left.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = 0;
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
@@ -782,6 +788,7 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
+            self.left.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = if later { key } else { 0 };
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -797,6 +804,40 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// [`Self::mirror`] (not for a draw) for the slots `first..last`, whose
+    /// records start at `start` and lie `step` bytes apart: the title wrote
+    /// somewhere in their memory. Most of them hold the record they held
+    /// (the title's writes are seen by 64 KiB block, 2048 slots), so the
+    /// slots whose record is the one they were made from, or left unmade
+    /// for, or is still none, are told apart first, under one lock each of
+    /// the slots and the views; `mirror` does the rest.
+    pub(crate) fn sync(&self, first: u32, last: u32, start: u64, step: u64) {
+        // Slots the host heap has none for: counted there.
+        let mut changed: Vec<u32> = (first.max(self.count)..last).collect();
+        let last = last.min(self.count);
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let left = self.left.lock().unwrap_or_else(|e| e.into_inner());
+            let views = super::VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            for index in first..last {
+                let handle = start + u64::from(index) * step;
+                // SAFETY: the handle is a descriptor slot in title memory.
+                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let key = u64::from(generation) << 32 | u64::from(i);
+                let alive = tag == super::VIEW_TAG
+                    && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation);
+                let (made, left) = (made[index as usize], left[index as usize]);
+                let same = if alive { made == key || left == key } else { made == 0 && left == 0 };
+                if !same {
+                    changed.push(index);
+                }
+            }
+        }
+        for index in changed {
+            self.mirror(index, start + u64::from(index) * step, false);
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
