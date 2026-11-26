@@ -220,14 +220,14 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
-/// `VICTORY_BVH_CAPTURE`: the BVH builder's dispatches get host lists of
+/// `VICTORY_BVH_CAPTURE` (only next to a captured submission, `cut_window`): the BVH builder's dispatches get host lists of
 /// their own (a cut as at a wait, `wait`), so that a capture's pages are
 /// taken after the work recorded before the builder in the same title list
 /// (skinning and the like, whose results its stages read) and its bitmaps
 /// are the builder's alone (`crate::bvh_replay::capture`).
 #[cfg(all(windows, feature = "diagnostics"))]
 fn cut_around_builder(this: This) {
-    if !crate::bvh_replay::capture::enabled() {
+    if !crate::bvh_replay::capture::cutting() {
         return;
     }
     let Some(current) = host_list(this) else { return };

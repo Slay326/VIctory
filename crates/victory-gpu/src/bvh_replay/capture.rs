@@ -139,6 +139,12 @@ static BUILDER_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 
 /// At a submission of `runs`: the index of the first run with a builder
 /// dispatch if this submission is to be captured.
+/// Whether the lists recorded now are cut around the builder
+/// ([`super::cut_window`]).
+pub(crate) fn cutting() -> bool {
+    enabled() && super::cut_window(BUILDER_SUBMISSIONS.load(Ordering::Relaxed), ordinals())
+}
+
 pub(crate) fn due(runs: &[&HostList]) -> Option<usize> {
     if !enabled() {
         return None;
