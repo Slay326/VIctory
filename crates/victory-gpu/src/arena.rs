@@ -285,6 +285,8 @@ struct Stats {
     asked: u64,
     /// Pages at committed addresses of the host's memory (not given).
     host: u64,
+    /// Title writes not sent up because shaders wrote their arena page.
+    kept: u64,
     /// Missed addresses below 256 MiB (dropped), and missed pages not yet
     /// missed in enough frames.
     low: u64,
@@ -329,6 +331,8 @@ struct Arena {
     capped: bool,
     /// Pages misses got this frame ([`faults_per_frame`]).
     faults: u64,
+    /// Arena pages shaders wrote ([`note_shader_pages`]).
+    shader_pages: HashSet<u64>,
     /// Missed pages without a slot: in how many frames, and the last one
     /// ([`want_pages`]; old entries pruned in [`log_frame`]).
     misses: std::collections::HashMap<u64, (u32, u64)>,
@@ -371,6 +375,7 @@ fn new_arena() -> Arena {
         reserved: false,
         capped: false,
         faults: 0,
+        shader_pages: HashSet::new(),
         misses: std::collections::HashMap::new(),
         builder_now: false,
         scans: 0,
@@ -555,6 +560,20 @@ pub(crate) fn want_region(l1: usize) {
     with(|a| {
         a.wanted_regions.insert(l1);
     });
+}
+
+/// Whether the builder's writes to title buffers that do not go back stay
+/// in their copies instead of taking title memory's bytes again
+/// (`VICTORY_BVH_ARENA_KEEP`, on with the arena).
+pub(crate) fn keep_builder_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled() && *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_KEEP").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Arena pages shaders wrote (by title address): the title's writes there
+/// no longer go up ([`refresh`]), they would land over the builder's.
+pub(crate) fn note_shader_pages(pages: &[u64]) {
+    with(|a| a.shader_pages.extend(pages.iter().map(|&p| p / PAGE)));
 }
 
 /// Shaders wrote `n` arena pages (they stay on the card).
@@ -1084,6 +1103,12 @@ fn refresh(a: &mut Arena) {
             }
             for &at in &found[..count] {
                 let at = at as u64;
+                // Pages shaders wrote keep what they wrote (the title's
+                // pieces went up over the builder's: ~42,000 a frame).
+                if a.shader_pages.contains(&(at / PAGE)) {
+                    a.stats.kept += 1;
+                    continue;
+                }
                 if let Some(slot) = a.dir.get(at / PAGE) {
                     let g = u64::from(granularity.max(4096));
                     pieces.push((slot, at & !(g - 1), g));
@@ -1171,7 +1196,7 @@ pub(crate) fn log_frame() {
         "BVH arena this frame: input buffers scanned {} MB -> {} structure pages; prepared before the builder ran {} pages; builder root addresses {}, \
          builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
          no memory there {}, host memory {}, below 256 MiB {}, missed in too few frames {} (tracked {}), \
-         regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms); \
+         regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms), not sent (page written by shaders) {}; \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
         s.scanned >> 20,
         s.found,
@@ -1195,6 +1220,7 @@ pub(crate) fn log_frame() {
         s.writes,
         s.refreshed,
         s.refresh_us as f64 / 1e3,
+        s.kept,
         a.dir.len(),
         (u64::from(a.dir.len()) * PAGE) >> 20,
         a.chunks.len(),

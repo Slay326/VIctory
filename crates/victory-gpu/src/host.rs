@@ -1395,6 +1395,8 @@ impl Host {
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        // Ranges the BVH builder wrote that stay on the card (`crate::arena`).
+        let mut kept_on_card: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
         // With `VICTORY_BVH_GT`: G of the pages the named program's lists
         // wrote, before anything goes back.
         let gt_target = crate::bvh_gt::target();
@@ -1429,7 +1431,11 @@ impl Host {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
-                    let goes_back = !(missed && *memory) && !deferred.on_card.contains(&key);
+                    let on_card = deferred.on_card.contains(&key);
+                    if on_card {
+                        kept_on_card.insert(key);
+                    }
+                    let goes_back = !(missed && *memory) && !on_card;
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= goes_back,
                         None => {
@@ -1480,7 +1486,13 @@ impl Host {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::release_waited(shadow, address as u64, len as u64);
-                crate::memory::drop_withheld(address, len);
+                // The builder's writes with the arena stay in the copy
+                // (`crate::arena::keep_builder_writes`).
+                let builder_kept = kept_on_card.contains(&(std::sync::Arc::as_ptr(shadow) as usize, address, len))
+                    && crate::arena::keep_builder_writes();
+                if !builder_kept {
+                    crate::memory::drop_withheld(address, len);
+                }
             }
         }
         for list in runs {
