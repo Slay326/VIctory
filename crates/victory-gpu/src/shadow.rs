@@ -565,7 +565,12 @@ impl Shadow {
         if self.card.is_some() {
             crate::host::card_fetch(&[(self, from - start, to - start)]);
         }
+        let armed = crate::watch::net::armed(page / PAGE);
         if self.put_back(page, from, to, saved, false) == Put::Nothing {
+            // Read and so opened, with nothing to put back: closed again.
+            if armed {
+                crate::watch::net::arm(page / PAGE, crate::watch::net::Way::Computed);
+            }
             return 0;
         }
         // Our write is not the title's: the copy takes the page as it is.
@@ -573,7 +578,7 @@ impl Shadow {
             self.take_and_read(t, page, from, to);
             // The GPU wrote the page: whether the title's CPU code touches
             // it from here on is what `VICTORY_PAGENET=measure` counts.
-            crate::watch::net::arm(page / PAGE);
+            crate::watch::net::arm(page / PAGE, crate::watch::net::Way::Computed);
         }
         to - from
     }
@@ -975,6 +980,8 @@ impl Shadow {
                 for (address, n) in synced {
                     if (first..last).contains(&(address / PAGE)) {
                         self.take_and_read(t, address, address, address + n);
+                        // The GPU wrote the page (`copy_back_page`).
+                        crate::watch::net::arm(address / PAGE, crate::watch::net::Way::Declared);
                     }
                 }
             }
@@ -1026,6 +1033,7 @@ impl Shadow {
         // (armed before a copy in the GPU's memory fetched the page:
         // `copy_back_marks`).
         t.arm(from, to);
+        let armed = crate::watch::net::armed(page / PAGE);
         let put = self.put_back(page, from, to, saved, true);
         // Equal to title memory now: taken, unless it holds the page in part.
         // A page neither we nor the title wrote meanwhile (a title write
@@ -1040,8 +1048,16 @@ impl Shadow {
         if put == Put::Beside && retaken {
             crate::copystat::add(crate::copystat::C::BesideChanged, 1);
         }
-        if from == page && to == page + PAGE && (put == Put::Title || retaken) {
+        let whole = from == page && to == page + PAGE;
+        if whole && (put == Put::Title || retaken) {
             self.take_and_read(t, page, from, to);
+        }
+        // The GPU wrote the page (`copy_back_page`), whether its bytes went
+        // into title memory at the title's address or through our own view
+        // (the title's guard stayed all along: it is what gets armed). A
+        // page read with nothing to put back is closed again if it was.
+        if whole && (put != Put::Nothing || armed) {
+            crate::watch::net::arm(page / PAGE, crate::watch::net::Way::Marked);
         }
         if put != Put::Nothing { to - from } else { 0 }
     }

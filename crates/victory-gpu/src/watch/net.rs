@@ -5,6 +5,10 @@
 //! A page is armed (no access) when a copy-back has put the GPU's bytes
 //! into it and the copy has taken it again, so only a page under the write
 //! guard is ever armed, and opening it gives the guard's read-only back.
+//! Every way back arms ([`Way`]): pages written at computed addresses,
+//! whole pages of declared ranges, and marked pages, whether written at the
+//! title's address or through our own view of the section (the title's
+//! guard never opened; our view is another address and stays open).
 //! The first access faults into the write guard's handler, which asks here
 //! first ([`fault`]): the access is counted per 4 KiB block and the page is
 //! as it was before arming, so a write faults once more, into the guard.
@@ -117,6 +121,23 @@ static BESIDE: Mutex<Beside> = Mutex::new(Beside {
 /// Copy-backs whose page was not armed: not under the guard, or a page
 /// showing its memory elsewhere is not.
 static NOT_ARMED: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones whose own page was under the guard (a page showing
+/// its memory elsewhere was not).
+static NOT_ARMED_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+
+/// The way a page's bytes went back (`crate::shadow`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Way {
+    /// A page shaders wrote at an address they computed.
+    Computed,
+    /// A whole page of a range a list declared.
+    Declared,
+    /// A page marked through views.
+    Marked,
+}
+
+/// Copy-backs that armed their page, and those that did not, by [`Way`].
+static BY_WAY: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
 /// Faults counted in our module's code, and in any other.
 static IN_OURS: AtomicU64 = AtomicU64::new(0);
 static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
@@ -228,19 +249,25 @@ fn locked<R>(f: impl FnOnce(Option<&mut Guards>) -> R) -> R {
     f(Some(&mut g))
 }
 
-/// A copy-back put the GPU's bytes into page `page` (a page number) and
-/// the copy took the page again: armed, with the pages showing the same
-/// memory, if all of them are under the write guard.
-pub(crate) fn arm(page: usize) {
+/// A copy-back on `way` put the GPU's bytes into page `page` (a page
+/// number) and the copy has the page taken: armed, with the pages showing
+/// the same memory, if all of them are under the write guard.
+pub(crate) fn arm(page: usize, way: Way) {
     let Some(net) = net() else { return };
     locked(|g| {
         // Under the lock already: a copy-back does not run there.
         let Some(g) = g else { return };
         let others = g.alias_of.get(&page).cloned().unwrap_or_default();
-        if !g.protected.contains(&page) || others.iter().any(|p| !g.protected.contains(p)) {
+        let own = g.protected.contains(&page);
+        if !own || others.iter().any(|p| !g.protected.contains(p)) {
             NOT_ARMED.fetch_add(1, Relaxed);
+            if own {
+                NOT_ARMED_ELSEWHERE.fetch_add(1, Relaxed);
+            }
+            BY_WAY[way as usize][1].fetch_add(1, Relaxed);
             return;
         }
+        BY_WAY[way as usize][0].fetch_add(1, Relaxed);
         net.arm(page, Reason::AfterCopyBack);
         if others.is_empty() {
             return;
@@ -251,6 +278,14 @@ pub(crate) fn arm(page: usize) {
             beside.alias_of.insert(other, page);
         }
     });
+}
+
+/// Whether page `page` (a page number) is armed. A copy-back asks before it
+/// reads the page (which opens it, [`host_touch`]): finding nothing to put
+/// back, it arms the page again, or every copy-back that changes nothing
+/// would leave what the GPU wrote earlier open to uncounted reads.
+pub(crate) fn armed(page: usize) -> bool {
+    net().is_some_and(|net| net.any_armed() && net.state(page) == crate::pagenet::State::ArmedMeasure)
 }
 
 /// An access violation reading (or writing, `write`) `at`, taken by the
@@ -335,7 +370,9 @@ pub(crate) fn frame() {
     }
 }
 
-/// The counts so far: a summary line, then one tab-separated line per
+/// The counts so far: a summary line (after the first counts: copy-backs
+/// that armed their page and that did not, by way back, and how many of
+/// the latter had only another view of the page open), then one tab-separated line per
 /// armed page (`P`, address, times armed, the page it was armed with, title
 /// reads, title writes), per 4 KiB block with a fault (`B`, address, reads,
 /// writes) and per place of faulting code (`C`, `ours` or `other`, address
@@ -358,7 +395,9 @@ fn report(net: &PageNet<Win>, frame: u64) -> String {
         out,
         "pagenet frame={frame} pages_armed={} arms={} pages_read={read} pages_written_only={written_only} \
          pages_untouched={} read_faults={} write_faults={} host_opens={} overridden={} arm_refused={} \
-         copy_backs_not_armed={} faults_in_ours={} faults_elsewhere={}",
+         copy_backs_not_armed={} faults_in_ours={} faults_elsewhere={} \
+         armed_computed={} not_armed_computed={} armed_declared={} not_armed_declared={} \
+         armed_marked={} not_armed_marked={} not_armed_other_view_open={}",
         arms.len(),
         arms.values().sum::<u64>(),
         arms.len() - arms.keys().filter(|p| per_page.contains_key(p)).count(),
@@ -370,6 +409,13 @@ fn report(net: &PageNet<Win>, frame: u64) -> String {
         NOT_ARMED.load(Relaxed),
         IN_OURS.load(Relaxed),
         ELSEWHERE.load(Relaxed),
+        BY_WAY[Way::Computed as usize][0].load(Relaxed),
+        BY_WAY[Way::Computed as usize][1].load(Relaxed),
+        BY_WAY[Way::Declared as usize][0].load(Relaxed),
+        BY_WAY[Way::Declared as usize][1].load(Relaxed),
+        BY_WAY[Way::Marked as usize][0].load(Relaxed),
+        BY_WAY[Way::Marked as usize][1].load(Relaxed),
+        NOT_ARMED_ELSEWHERE.load(Relaxed),
     );
     for (&page, &n) in &arms {
         let with = beside.alias_of.get(&page).map_or(0, |p| p * PAGE);
@@ -402,6 +448,22 @@ pub(crate) mod tests {
     /// 4 KiB block of `at`, and whether the page of `at` is closed.
     pub(crate) fn seen(at: usize) -> ((u64, u64), bool) {
         (counts(at), protection(at / PAGE) == Some(PAGE_NOACCESS))
+    }
+
+    /// Copy-backs on `way` so far that armed their page, and that did not
+    /// (of every test running: only ever more).
+    pub(crate) fn by_way(way: Way) -> (u64, u64) {
+        let [armed, not] = &BY_WAY[way as usize];
+        (armed.load(Relaxed), not.load(Relaxed))
+    }
+
+    /// The report's summary line.
+    pub(crate) fn summary() -> String {
+        report(net().expect("on"), 0).lines().next().unwrap_or_default().to_owned()
+    }
+
+    fn arm(page: usize) {
+        super::arm(page, Way::Computed);
     }
 
     use super::super::tests::{free, pool};

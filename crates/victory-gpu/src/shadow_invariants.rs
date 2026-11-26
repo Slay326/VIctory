@@ -34,6 +34,9 @@ struct Fixture {
     p: usize,
     len: usize,
     copy: Option<Arc<Shadow>>,
+    /// Of a fixture over a section's views ([`Fixture::views`]): the
+    /// section, and the title's second view of the same pages.
+    section: Option<(usize, usize)>,
 }
 
 impl Fixture {
@@ -50,7 +53,26 @@ impl Fixture {
             unregister(p, p as u64);
             return None;
         };
-        Some(Fixture { p, len, copy: Some(copy) })
+        Some(Fixture { p, len, copy: Some(copy), section: None })
+    }
+
+    /// [`Fixture::new`] over the title's view of a section of physical
+    /// pages (we have a view of our own of it, `crate::watch`), which the
+    /// title has mapped a second time elsewhere.
+    fn views(pages: usize, pattern: impl Fn(usize) -> u8) -> Option<Fixture> {
+        let (section, p, second) = crate::watch::tests::reported_section(pages);
+        let len = pages * PAGE;
+        for at in 0..len {
+            // SAFETY: a byte of the view, not guarded yet.
+            unsafe { ((p + at) as *mut u8).write_volatile(pattern(at)) };
+        }
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::title_memory_section_gone(section);
+            return None;
+        };
+        Some(Fixture { p, len, copy: Some(copy), section: Some((section, second)) })
     }
 
     fn copy(&self) -> &Arc<Shadow> {
@@ -95,6 +117,9 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         drop(self.copy.take());
         unregister(self.p, self.p as u64);
+        if let Some((section, _)) = self.section {
+            crate::watch::title_memory_section_gone(section);
+        }
     }
 }
 
@@ -567,43 +592,60 @@ fn a_wrong_gpu_only_class_costs_speed_not_correctness() {
     todo!("stage 3: class the fixture GPU-only, run run_schedule over 64 seeds, assert Ok and the demotion count");
 }
 
-/// Three submissions writing pages 0 to 2 at computed addresses, with the
-/// title reading page 0, writing page 1 and leaving page 2 alone between
-/// them; returns title memory and the copy at the end, and what `probe`
-/// saw after the first submission.
-fn measured_sequence<T>(f: &Fixture, probe: impl Fn(&Fixture) -> T) -> (Vec<u8>, Vec<u8>, T) {
+/// Three submissions whose shaders write pages 0 to 2, going back on `way`,
+/// with the title reading page 0, writing page 1 and leaving page 2 alone
+/// between them (and writing page 3 while the GPU runs); returns title
+/// memory and the copy at the end, and what `probe` saw after the first
+/// submission.
+fn measured_sequence<T>(f: &Fixture, way: Back, probe: impl Fn(&Fixture) -> T) -> (Vec<u8>, Vec<u8>, T) {
     let gpu = |k: u8| [(10, 0xa0 + k), (PAGE + 5000, 0xb0 + k), (2 * PAGE + 9000, 0xc0 + k)];
-    submission(f, Back::Computed, 0, f.len, &gpu(1), &[(3 * PAGE + 7, 0x71)]);
+    submission(f, way, 0, f.len, &gpu(1), &[(3 * PAGE + 7, 0x71)]);
     let seen = probe(f);
     assert_eq!(f.title(10), 0xa1, "the title reads what the GPU wrote");
     f.title_write(PAGE + 5001, 0x51);
-    submission(f, Back::Computed, 0, f.len, &gpu(2), &[]);
+    submission(f, way, 0, f.len, &gpu(2), &[]);
     f.title_write(8200, 0x52);
     assert_eq!(f.title(2 * PAGE + 9000), 0xc2);
-    submission(f, Back::Computed, 0, f.len, &gpu(3), &[(3 * PAGE + 8, 0x72)]);
+    submission(f, way, 0, f.len, &gpu(3), &[(3 * PAGE + 8, 0x72)]);
     f.copy().update(f.p, f.len);
     (f.title_bytes(0, f.len), f.copy_bytes(0, f.len), seen)
 }
 
 /// Measuring the title's accesses (`VICTORY_PAGENET=measure`) changes no
-/// byte of title memory or of the copy over a run of copy-backs with title
-/// reads and writes between them, and it does measure: each page the GPU
-/// wrote is closed after its copy-back, the title's first read and write
-/// after it are counted at their 4 KiB blocks, the engine's own accesses
-/// (the next copy-back's) are not.
-#[test]
-fn measuring_the_titles_accesses_changes_no_byte() {
+/// byte of title memory or of the copy over a run of copy-backs on `way`
+/// with title reads and writes between them, and it does measure: each page
+/// the GPU wrote is closed after its copy-back, with the title's other view
+/// of it (`views`: memory of a section, else of a pool), the title's first
+/// read and write after it are counted at their 4 KiB blocks, the engine's
+/// own accesses (the next copy-back's) are not.
+fn measuring_changes_no_byte(way: Back, views: bool) {
     use crate::watch::net::{TEST_ON, tests::seen};
-    let Some(plain) = Fixture::new(4, pattern) else {
+    let fixture = || if views { Fixture::views(4, pattern) } else { Fixture::new(4, pattern) };
+    let Some(plain) = fixture() else {
         return; // no host GPU here
     };
-    let (title, copy, ()) = measured_sequence(&plain, |_| ());
-    let f = Fixture::new(4, pattern).expect("as above");
+    let (title, copy, ()) = measured_sequence(&plain, way, |_| ());
+    let f = fixture().expect("as above");
+    let net_way = match way {
+        Back::Declared => crate::watch::net::Way::Declared,
+        Back::Marked => crate::watch::net::Way::Marked,
+        Back::Computed => crate::watch::net::Way::Computed,
+    };
+    let armed_before = crate::watch::net::tests::by_way(net_way).0;
     TEST_ON.set(true);
-    let (title_measured, copy_measured, closed) =
-        measured_sequence(&f, |f| [0, 1, 2, 3].map(|page| seen(f.p + page * PAGE).1));
+    let (title_measured, copy_measured, (closed, second)) = measured_sequence(&f, way, |f| {
+        let closed = |p: usize| [0, 1, 2, 3].map(|page| seen(p + page * PAGE).1);
+        (closed(f.p), f.section.map(|(_, second)| closed(second)))
+    });
     TEST_ON.set(false);
     assert_eq!(closed, [true, true, true, false], "closed after their copy-backs; page 3 had none");
+    if let Some(second) = second {
+        assert_eq!(second, closed, "and the title's other view of the pages with them");
+    }
+    assert!(
+        crate::watch::net::tests::by_way(net_way).0 >= armed_before + 9,
+        "three pages armed by each of three copy-backs, counted for their way back"
+    );
     assert!(title == title_measured, "no byte of title memory differs");
     assert!(copy == copy_measured, "nor of the copy");
     TEST_ON.set(true);
@@ -611,5 +653,88 @@ fn measuring_the_titles_accesses_changes_no_byte() {
     assert_eq!(seen(f.p + PAGE + 5001).0, (0, 1), "its write to page 1");
     assert_eq!(seen(f.p + 8200).0, (0, 1), "and to page 0, after the second copy-back");
     assert_eq!(seen(f.p + 2 * PAGE + 9000).0, (1, 0), "page 2: only the read after the second");
+    let summary = crate::watch::net::tests::summary();
+    for key in ["armed_computed=", "armed_declared=", "armed_marked=", "not_armed_other_view_open="] {
+        assert!(summary.contains(key), "{key} in {summary}");
+    }
+    if let Some((_, second)) = f.section {
+        // Page 2 is closed again (the third copy-back); read through the
+        // title's other view, that is where the read is counted.
+        // SAFETY: a byte of the second view (closed: the handler opens it).
+        let read = unsafe { ((second + 2 * PAGE + 9000) as *const u8).read_volatile() };
+        assert_eq!(read, 0xc3, "what the GPU wrote, through the other view");
+        assert_eq!(seen(second + 2 * PAGE + 9000).0, (1, 0), "counted where it was read");
+    }
     TEST_ON.set(false);
+}
+
+/// A copy-back that finds nothing to put back (the shaders wrote the page
+/// what it held, or not at all) reads the page all the same, which opens
+/// it: a page that was closed is closed again after it, so the title's next
+/// read of what the GPU wrote earlier is still counted; a page the GPU
+/// never changed is not closed by it.
+#[test]
+fn a_copy_back_with_nothing_to_put_back_leaves_its_page_closed() {
+    use crate::watch::net::{TEST_ON, tests::seen};
+    for (way, views) in [(Back::Computed, false), (Back::Marked, false), (Back::Marked, true)] {
+        let fixture = if views { Fixture::views(2, pattern) } else { Fixture::new(2, pattern) };
+        let Some(f) = fixture else {
+            return; // no host GPU here
+        };
+        TEST_ON.set(true);
+        submission(&f, way, 0, f.len, &[(10, 0xa1)], &[]);
+        assert_eq!([seen(f.p).1, seen(f.p + PAGE).1], [true, false], "{way:?}: page 0 closed after its copy-back");
+        // A submission that changes neither page; both are looked at.
+        let copy = f.copy();
+        copy.update(f.p, f.len);
+        if way == Back::Marked {
+            copy.writing(f.p, f.len, true);
+        }
+        for page in [f.p, f.p + PAGE] {
+            let written = match way {
+                Back::Marked => copy.copy_back_marked(page),
+                _ => copy.copy_back_page(page),
+            };
+            assert_eq!(written, 0, "{way:?}: nothing to put back");
+        }
+        if way == Back::Marked {
+            copy.copy_back(f.p, f.len);
+        }
+        assert_eq!([seen(f.p).1, seen(f.p + PAGE).1], [true, false], "{way:?}: still closed; page 1 never was");
+        assert_eq!(f.title(10), 0xa1);
+        assert_eq!(seen(f.p + 10).0, (1, 0), "{way:?}: the title's read is counted");
+        TEST_ON.set(false);
+    }
+}
+
+/// [`measuring_changes_no_byte`] for pages written at computed addresses.
+#[test]
+fn measuring_the_titles_accesses_changes_no_byte() {
+    measuring_changes_no_byte(Back::Computed, false);
+}
+
+/// For declared ranges (compared with their snapshot), in pool memory.
+#[test]
+fn measuring_changes_no_byte_after_declared_copy_backs() {
+    measuring_changes_no_byte(Back::Declared, false);
+}
+
+/// For declared ranges in a section's views (written at the title's
+/// address, with the title's second view of the pages).
+#[test]
+fn measuring_changes_no_byte_after_declared_copy_backs_into_views() {
+    measuring_changes_no_byte(Back::Declared, true);
+}
+
+/// For marked pages of pool memory (written at the title's address).
+#[test]
+fn measuring_changes_no_byte_after_marked_copy_backs() {
+    measuring_changes_no_byte(Back::Marked, false);
+}
+
+/// For marked pages of a section's views: written through our own view,
+/// the title's guard never opened.
+#[test]
+fn measuring_changes_no_byte_after_marked_copy_backs_beside_the_guard() {
+    measuring_changes_no_byte(Back::Marked, true);
 }
