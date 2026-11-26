@@ -22,8 +22,6 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
-# Night 2 block 1: compiles the PageNet tests (src/pagenet_tests.rs).
-pagenet_tests = []
 
 [lints]
 workspace = true

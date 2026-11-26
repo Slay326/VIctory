@@ -1,17 +1,8 @@
-//! Night 2, block 1: tests t1-t6 for `PageNet` (read measurement and
-//! stage-3 safety net, Fable's sketch in `fable-night-plan.md`, section
-//! "Block-1-Skizze"), written before the module exists.
-//!
-//! Only test code: `PageNet` below is a STUB with the sketched interface
-//! (every method `todo!()`), so the tests compile and can be run, and fail.
-//! Fable writes the real module, deletes the stub section, imports the real
-//! types instead, and drops `#[ignore]` test by test (each shown red with
-//! the relevant part left out, green with it). Behind the crate feature
-//! `pagenet_tests`: `cargo test -p victory-gpu --features pagenet_tests
-//! pagenet -- --include-ignored`.
+//! Tests t1-t8 for [`crate::pagenet`] (read measurement and the memory
+//! model's safety net), against a model of the system and the engine.
 //!
 //! The test model ([`Mock`]) stands for the OS and the engine: per 64 KiB
-//! page a protection (`Off`'s baseline is the write guard of `crate::watch`:
+//! page a protection (the baseline is the write guard of `crate::watch`:
 //! read-only once taken), title memory, the host copy (what the GPU sees and
 //! writes), the existing write tracker's "changed since taken" set, a fence
 //! with GPU writes that land only when their submission completes, and an
@@ -19,151 +10,20 @@
 //! no access faults into `PageNet::on_fault`; a write to a read-only page is
 //! the existing guard (marks changed, opens, no `PageNet` call).
 //!
-//! Assumptions beyond the sketch (marked ANNAHME, Fable decides):
-//! - The backend trait carries the sync hooks too (`fence_wait`,
-//!   `copy_back_forced`) and the frame number for demotion records.
-//! - `state(page)` exists for tests; `host_thread(tid)` says which thread
-//!   ids are the host's (I8); a thread-local flag would do as well.
-//! - `Reason`/`DemoteReason` names.
-
-#![allow(dead_code)]
+//! What the model cannot show is the engine's side of the hooks: that
+//! `copy_back_forced` really keeps every GPU byte without opening the
+//! title's view, and that the fault reaches the net before the write guard's
+//! handler. Those are tested where they are implemented.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// The tracked and protected unit (as `crate::watch::PAGE`).
-const PAGE: usize = 64 << 10;
-/// The counted unit inside a page (false sharing shows here).
-const BLOCK: usize = 4 << 10;
-
-// ------------------------------------------------- interface (stub) ---
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Off,
-    Measure,
-    Net,
-}
-
-/// Page protection as the backend sets it (`VirtualProtect` on 64 KiB).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Prot {
-    ReadWrite,
-    /// The existing write guard (`crate::watch`): taken, unchanged.
-    ReadOnly,
-    NoAccess,
-}
-
-/// Why a page is armed (ANNAHME: names).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reason {
-    /// Measure: right after the page's copy-back.
-    AfterCopyBack,
-    /// Net: the page is classed GPU-only (armed before the take is released).
-    GpuOnly,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fault {
-    Handled,
-    NotOurs,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    Shared,
-    ArmedMeasure,
-    GpuOnlyArmed,
-    Syncing,
-    Demoted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DemoteReason {
-    CpuRead,
-    CpuWrite,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Demotion {
-    pub page: usize,
-    pub reason: DemoteReason,
-    pub frame: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Stats {
-    /// First title reads of armed pages, by (page number, 4 KiB block).
-    pub reads: BTreeMap<(usize, usize), u64>,
-    /// First title writes of armed pages, by (page number, 4 KiB block).
-    pub writes: BTreeMap<(usize, usize), u64>,
-    /// `arm` calls ignored because the page is demoted (I3).
-    pub arm_noops: u64,
-    /// Syncs done by the net (fence + forced copy-back).
-    pub syncs: u64,
-}
-
-/// What `PageNet` needs from the OS and the engine (test model: [`Mock`]).
-pub trait Protect: Send + Sync + 'static {
-    /// Sets the protection of the 64 KiB page `page` (page number).
-    fn set(&self, page: usize, prot: Prot) -> bool;
-    fn get(&self, page: usize) -> Prot;
-    /// Returns once every GPU write submitted so far has landed (I2).
-    fn fence_wait(&self);
-    /// The GPU's bytes of `page` into title memory, never discarding them
-    /// (`copy_back_page_forced`; correct by I1). ANNAHME: hook in the trait.
-    fn copy_back_forced(&self, page: usize);
-    /// The current frame, for demotion records.
-    fn frame(&self) -> u64;
-}
-
-/// STUB: Fable's module replaces this section.
-pub struct PageNet<B: Protect> {
-    backend: B,
-}
-
-impl<B: Protect> PageNet<B> {
-    pub fn new(mode: Mode, backend: B) -> Self {
-        let _ = mode;
-        let _ = &backend;
-        todo!("PageNet::new (Fable, block 1 c1)")
-    }
-    pub fn arm(&self, page: usize, reason: Reason) {
-        let _ = (page, reason, &self.backend);
-        todo!("PageNet::arm")
-    }
-    pub fn on_fault(&self, addr: usize, is_write: bool, tid: u32) -> Fault {
-        let _ = (addr, is_write, tid);
-        todo!("PageNet::on_fault")
-    }
-    pub fn is_gpu_only(&self, page: usize) -> bool {
-        let _ = page;
-        todo!("PageNet::is_gpu_only")
-    }
-    /// ANNAHME: test helper.
-    pub fn state(&self, page: usize) -> State {
-        let _ = page;
-        todo!("PageNet::state")
-    }
-    pub fn disarm_for_free(&self, page: usize) {
-        let _ = page;
-        todo!("PageNet::disarm_for_free")
-    }
-    pub fn stats(&self) -> Stats {
-        todo!("PageNet::stats")
-    }
-    pub fn drain_demotions(&self) -> Vec<Demotion> {
-        todo!("PageNet::drain_demotions")
-    }
-    /// ANNAHME: thread `tid` is the host's (submission, copy-back): its
-    /// faults never count as title accesses (I8).
-    pub fn host_thread(&self, tid: u32) {
-        let _ = tid;
-        todo!("PageNet::host_thread")
-    }
-}
+use crate::pagenet::{
+    BLOCK, DemoteReason, Demotion, Fault, Mode, Oddities, PAGE, PageNet, Prot, Protect, Reason,
+    State, Stats,
+};
 
 // -------------------------------------------------------- test model ---
 
@@ -225,7 +85,10 @@ impl Mock {
             s.title.insert(p, bytes.clone());
             s.copy.insert(p, bytes);
         }
-        Arc::new(Mock { s: Mutex::new(s), cv: Condvar::new() })
+        Arc::new(Mock {
+            s: Mutex::new(s),
+            cv: Condvar::new(),
+        })
     }
 
     fn st(&self) -> std::sync::MutexGuard<'_, MockState> {
@@ -332,20 +195,24 @@ impl Mock {
             if left.is_zero() {
                 return false;
             }
-            s = self.cv.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
+            s = self
+                .cv
+                .wait_timeout(s, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
         true
     }
 }
 
 impl Protect for Arc<Mock> {
-    fn set(&self, page: usize, prot: Prot) -> bool {
+    fn swap(&self, page: usize, from: Prot, to: Prot) -> bool {
         let mut s = self.st();
-        if !s.prot.contains_key(&page) {
+        if s.prot.get(&page) != Some(&from) {
             return false;
         }
-        s.prot.insert(page, prot);
-        s.log.push(Ev::Protect(page, prot));
+        s.prot.insert(page, to);
+        s.log.push(Ev::Protect(page, to));
         true
     }
 
@@ -391,7 +258,10 @@ fn access(net: &Net, mock: &Arc<Mock>, addr: usize, write: Option<u8>, tid: u32)
     for attempt in 0..2 {
         let prot = mock.prot(page);
         if prot == Prot::NoAccess {
-            assert!(attempt == 0, "{addr:#x} still no access after Handled: would fault forever");
+            assert!(
+                attempt == 0,
+                "{addr:#x} still no access after Handled: would fault forever"
+            );
             assert_eq!(
                 net.on_fault(addr, write.is_some(), tid),
                 Fault::Handled,
@@ -440,7 +310,6 @@ const HOST_TID: u32 = 7;
 /// is exactly `[Demotion { page: P, reason: CpuRead, frame: 1 }]`, a second
 /// drain is empty (one log entry).
 #[test]
-#[ignore = "block 1 c4: PageNet net fault path (Fable)"]
 fn t1_net_fault_syncs_before_resume() {
     const P: usize = 0x10;
     const X: u8 = 0xa5;
@@ -455,14 +324,21 @@ fn t1_net_fault_syncs_before_resume() {
 
     let (tx, rx) = mpsc::channel();
     let (n, m) = (net.clone(), mock.clone());
-    let reader = std::thread::spawn(move || tx.send(access(&n, &m, addr, None, TITLE_TID)).unwrap());
+    let reader =
+        std::thread::spawn(move || tx.send(access(&n, &m, addr, None, TITLE_TID)).unwrap());
     assert!(
         rx.recv_timeout(Duration::from_millis(100)).is_err(),
         "I2: the faulting thread waits for the submission in flight"
     );
-    assert_eq!(mock.count(&Ev::CopyStart(P)), 0, "I2: no copy before the fence");
+    assert_eq!(
+        mock.count(&Ev::CopyStart(P)),
+        0,
+        "I2: no copy before the fence"
+    );
     mock.complete();
-    let read = rx.recv_timeout(Duration::from_secs(2)).expect("the read returns after the fence");
+    let read = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the read returns after the fence");
     reader.join().unwrap();
 
     assert_eq!(read, X, "the CPU reads what the GPU wrote");
@@ -474,11 +350,22 @@ fn t1_net_fault_syncs_before_resume() {
         .position(|e| matches!(e, Ev::Protect(p, prot) if *p == P && *prot != Prot::NoAccess))
         .map(|i| i + armed_at)
         .expect("page opened");
-    assert!(fence < start && start < done && done < open, "Fence -> copy -> open: {:?}", mock.log());
+    assert!(
+        fence < start && start < done && done < open,
+        "Fence -> copy -> open: {:?}",
+        mock.log()
+    );
     assert_eq!(net.state(P), State::Demoted);
     assert!(!net.is_gpu_only(P));
     assert_eq!(net.stats().syncs, 1);
-    assert_eq!(net.drain_demotions(), vec![Demotion { page: P, reason: DemoteReason::CpuRead, frame: 1 }]);
+    assert_eq!(
+        net.drain_demotions(),
+        vec![Demotion {
+            page: P,
+            reason: DemoteReason::CpuRead,
+            frame: 1
+        }]
+    );
     assert!(net.drain_demotions().is_empty(), "one log entry");
 }
 
@@ -494,7 +381,6 @@ fn t1_net_fault_syncs_before_resume() {
 /// `on_fault` call: `access` would panic on a second NoAccess); exactly one
 /// demotion drained.
 #[test]
-#[ignore = "block 1 c1: PageNet state machine (Fable)"]
 fn t2_demoted_is_sticky() {
     const P: usize = 0x11;
     let mock = Mock::new(&[P]);
@@ -535,6 +421,10 @@ fn t2_demoted_is_sticky() {
 /// with reason CpuWrite; `stats().syncs == 1`; title bytes the GPU did not
 /// write are unchanged (pattern at block 0 byte 0x87, block 1 byte 1).
 ///
+/// This holds the net to the order (sync with the forced copy, then open to
+/// the write guard, so the write is dirty). That the engine's forced copy
+/// keeps the GPU's bytes is not shown here: the model's copy cannot discard.
+///
 /// Red against today: the same sequence through today's
 /// `Shadow::copy_back_page` (title write lands, page changed, nothing
 /// saved -> page kept as the title has it, GPU bytes dropped) is test
@@ -546,7 +436,6 @@ fn t2_demoted_is_sticky() {
 /// path; and watch's handler must not see the fault first (it would open
 /// the page and mark it changed, giving today's discard).
 #[test]
-#[ignore = "block 1 c3: copy_back_page_forced + net write fault (Fable)"]
 fn t3_write_fault_keeps_both() {
     const P: usize = 0x12;
     const X: u8 = 0x8e;
@@ -558,18 +447,45 @@ fn t3_write_fault_keeps_both() {
     mock.gpu_write(gpu_at, X);
     access(&net, &mock, cpu_at, Some(Y), TITLE_TID);
 
-    assert_eq!(mock.title(gpu_at), X, "the GPU's byte (block 0) is in title memory");
-    assert_eq!(mock.title(cpu_at), Y, "the title's byte (block 1) is in title memory");
-    assert_eq!(mock.title(at(P, 0, 0x87)), pattern(at(P, 0, 0x87)), "nothing else changed");
-    assert_eq!(mock.title(at(P, 1, 1)), pattern(at(P, 1, 1)), "nothing else changed");
-    assert!(mock.changed(P), "I4: the first CPU write after the demotion is dirty");
+    assert_eq!(
+        mock.title(gpu_at),
+        X,
+        "the GPU's byte (block 0) is in title memory"
+    );
+    assert_eq!(
+        mock.title(cpu_at),
+        Y,
+        "the title's byte (block 1) is in title memory"
+    );
+    assert_eq!(
+        mock.title(at(P, 0, 0x87)),
+        pattern(at(P, 0, 0x87)),
+        "nothing else changed"
+    );
+    assert_eq!(
+        mock.title(at(P, 1, 1)),
+        pattern(at(P, 1, 1)),
+        "nothing else changed"
+    );
+    assert!(
+        mock.changed(P),
+        "I4: the first CPU write after the demotion is dirty"
+    );
     mock.refresh();
-    assert_eq!(mock.copy(cpu_at), Y, "I4: the next GPU read sees the title's write");
+    assert_eq!(
+        mock.copy(cpu_at),
+        Y,
+        "I4: the next GPU read sees the title's write"
+    );
     assert_eq!(mock.copy(gpu_at), X, "and still the GPU's");
     assert_eq!(net.stats().syncs, 1);
     assert_eq!(
         net.drain_demotions(),
-        vec![Demotion { page: P, reason: DemoteReason::CpuWrite, frame: 1 }]
+        vec![Demotion {
+            page: P,
+            reason: DemoteReason::CpuWrite,
+            frame: 1
+        }]
     );
 }
 
@@ -589,7 +505,6 @@ fn t3_write_fault_keeps_both() {
 /// `on_fault(at(P,5,0), false, 102)` -> Handled, still one copy, still no
 /// second demotion.
 #[test]
-#[ignore = "block 1 c4: PageNet net fault path, concurrency (Fable)"]
 fn t4_concurrent_faults_single_sync() {
     const P: usize = 0x13;
     const X: u8 = 0x5a;
@@ -602,18 +517,35 @@ fn t4_concurrent_faults_single_sync() {
 
     let (tx_a, rx_a) = mpsc::channel();
     let (n, m) = (net.clone(), mock.clone());
-    let a = std::thread::spawn(move || tx_a.send(access(&n, &m, at(P, 0, 0), None, TITLE_TID)).unwrap());
+    let a = std::thread::spawn(move || {
+        tx_a.send(access(&n, &m, at(P, 0, 0), None, TITLE_TID))
+            .unwrap()
+    });
     assert!(mock.wait_for(&Ev::CopyStart(P)), "A is syncing");
     assert_eq!(net.state(P), State::Syncing);
 
     let (tx_b, rx_b) = mpsc::channel();
     let (n, m) = (net.clone(), mock.clone());
-    let b = std::thread::spawn(move || tx_b.send(access(&n, &m, at(P, 3, 0), Some(Z), TITLE_TID_2)).unwrap());
-    assert!(rx_b.recv_timeout(Duration::from_millis(100)).is_err(), "I5: B waits for A's sync");
+    let b = std::thread::spawn(move || {
+        tx_b.send(access(&n, &m, at(P, 3, 0), Some(Z), TITLE_TID_2))
+            .unwrap()
+    });
+    assert!(
+        rx_b.recv_timeout(Duration::from_millis(100)).is_err(),
+        "I5: B waits for A's sync"
+    );
     assert!(rx_a.try_recv().is_err(), "A is still in the sync");
     mock.open_gate();
-    assert_eq!(rx_a.recv_timeout(Duration::from_secs(2)).expect("A returns"), X);
-    assert_eq!(rx_b.recv_timeout(Duration::from_secs(2)).expect("B returns"), Z);
+    assert_eq!(
+        rx_a.recv_timeout(Duration::from_secs(2))
+            .expect("A returns"),
+        X
+    );
+    assert_eq!(
+        rx_b.recv_timeout(Duration::from_secs(2))
+            .expect("B returns"),
+        Z
+    );
     a.join().unwrap();
     b.join().unwrap();
 
@@ -624,9 +556,20 @@ fn t4_concurrent_faults_single_sync() {
     assert_eq!(net.state(P), State::Demoted);
     assert_eq!(net.stats().syncs, 1);
     let demotions = net.drain_demotions();
-    assert_eq!(demotions, vec![Demotion { page: P, reason: DemoteReason::CpuRead, frame: 1 }]);
+    assert_eq!(
+        demotions,
+        vec![Demotion {
+            page: P,
+            reason: DemoteReason::CpuRead,
+            frame: 1
+        }]
+    );
 
-    assert_eq!(net.on_fault(at(P, 5, 0), false, 102), Fault::Handled, "a late fault of the page is retried");
+    assert_eq!(
+        net.on_fault(at(P, 5, 0), false, 102),
+        Fault::Handled,
+        "a late fault of the page is retried"
+    );
     assert_eq!(mock.count(&Ev::CopyStart(P)), 1, "no second sync");
     assert!(net.drain_demotions().is_empty(), "no second demotion");
 }
@@ -634,6 +577,7 @@ fn t4_concurrent_faults_single_sync() {
 /// The t5 sequence on pages 0x20 (read), 0x21 (GPU write, copy-back, read)
 /// and 0x22 (write) in `mode`; returns title and copy bytes of all three,
 /// the changed set, the sync events (fence and copies) and the net.
+#[allow(clippy::type_complexity)]
 fn t5_sequence(mode: Mode) -> (Vec<u8>, Vec<u8>, BTreeSet<usize>, Vec<Ev>, Net, Arc<Mock>) {
     let pages = [0x20, 0x21, 0x22];
     let mock = Mock::new(&pages);
@@ -649,17 +593,27 @@ fn t5_sequence(mode: Mode) -> (Vec<u8>, Vec<u8>, BTreeSet<usize>, Vec<Ev>, Net, 
     mock.engine_copy_back(0x21);
     net.arm(0x21, Reason::AfterCopyBack);
     if mode == Mode::Measure {
-        assert_eq!(mock.prot(0x21), Prot::NoAccess, "armed again after the copy-back");
+        assert_eq!(
+            mock.prot(0x21),
+            Prot::NoAccess,
+            "armed again after the copy-back"
+        );
     }
     access(&net, &mock, at(0x21, 0, 0), None, TITLE_TID);
     mock.refresh();
     let s = mock.st();
-    let bytes = |m: &BTreeMap<usize, Vec<u8>>| pages.iter().flat_map(|p| m[p].clone()).collect::<Vec<u8>>();
+    let bytes =
+        |m: &BTreeMap<usize, Vec<u8>>| pages.iter().flat_map(|p| m[p].clone()).collect::<Vec<u8>>();
     let (title, copy) = (bytes(&s.title), bytes(&s.copy));
     let syncs: Vec<Ev> = s
         .log
         .iter()
-        .filter(|e| matches!(e, Ev::FenceWait | Ev::FenceDone | Ev::CopyStart(_) | Ev::CopyDone(_) | Ev::Refresh(_)))
+        .filter(|e| {
+            matches!(
+                e,
+                Ev::FenceWait | Ev::FenceDone | Ev::CopyStart(_) | Ev::CopyDone(_) | Ev::Refresh(_)
+            )
+        })
         .cloned()
         .collect();
     let changed = s.changed.clone();
@@ -679,7 +633,6 @@ fn t5_sequence(mode: Mode) -> (Vec<u8>, Vec<u8>, BTreeSet<usize>, Vec<Ev>, Net, 
 /// was armed again after its copy-back (asserted in the sequence); each
 /// measured page is no longer NoAccess at the end.
 #[test]
-#[ignore = "block 1 c2: PageNet measure mode (Fable)"]
 fn t5_measure_is_passive() {
     let (title_off, copy_off, changed_off, syncs_off, net_off, mock_off) = t5_sequence(Mode::Off);
     let (title_m, copy_m, changed_m, syncs_m, net_m, mock_m) = t5_sequence(Mode::Measure);
@@ -687,18 +640,35 @@ fn t5_measure_is_passive() {
     assert!(copy_off == copy_m, "I7: nor a copy byte");
     assert_eq!(changed_off, changed_m, "I7: nor what the tracker saw");
     assert_eq!(syncs_off, syncs_m, "I7: nor a sync decision");
-    assert!(changed_m.contains(&0x22) || syncs_m.contains(&Ev::Refresh(0x22)), "write tracking active after opening");
-    assert!(!mock_off.log().iter().any(|e| matches!(e, Ev::Protect(_, Prot::NoAccess))), "Off arms nothing");
+    assert!(
+        changed_m.contains(&0x22) || syncs_m.contains(&Ev::Refresh(0x22)),
+        "write tracking active after opening"
+    );
+    assert!(
+        !mock_off
+            .log()
+            .iter()
+            .any(|e| matches!(e, Ev::Protect(_, Prot::NoAccess))),
+        "Off arms nothing"
+    );
     assert_eq!(net_off.stats(), Stats::default());
     let stats = net_m.stats();
-    assert_eq!(stats.reads, BTreeMap::from([((0x20, 2), 1), ((0x21, 0), 1)]));
+    assert_eq!(
+        stats.reads,
+        BTreeMap::from([((0x20, 2), 1), ((0x21, 0), 1)])
+    );
     assert_eq!(stats.writes, BTreeMap::from([((0x22, 5), 1)]));
     assert_eq!(stats.syncs, 0);
     assert!(net_m.drain_demotions().is_empty());
     for p in [0x20, 0x21, 0x22] {
-        assert_ne!(mock_m.prot(p), Prot::NoAccess, "page {p:#x} opened after its fault");
+        assert_ne!(
+            mock_m.prot(p),
+            Prot::NoAccess,
+            "page {p:#x} opened after its fault"
+        );
         assert_eq!(net_m.state(p), State::Shared);
     }
+    assert_eq!(net_m.oddities(), Oddities::default());
 }
 
 /// t6 (I6, I8): foreign addresses and host accesses.
@@ -717,7 +687,6 @@ fn t5_measure_is_passive() {
 ///   which fails on a NoAccess page instead of faulting, so in the engine
 ///   I8 holds by construction but such reads return false.
 #[test]
-#[ignore = "block 1 c1/c2: PageNet NotOurs and host accesses (Fable)"]
 fn t6_foreign_and_host_access() {
     let mock = Mock::new(&[0x30, 0x31, 0x32]);
     let net = PageNet::new(Mode::Net, mock.clone());
@@ -726,8 +695,16 @@ fn t6_foreign_and_host_access() {
     net.disarm_for_free(0x32);
     assert_ne!(mock.prot(0x32), Prot::NoAccess, "disarmed for the free");
     let (log, stats) = (mock.log(), net.stats());
-    for (addr, write) in [(0x1000, false), (at(0x31, 1, 0), true), (at(0x32, 0, 0), false)] {
-        assert_eq!(net.on_fault(addr, write, TITLE_TID), Fault::NotOurs, "I6: {addr:#x} is not ours");
+    for (addr, write) in [
+        (0x1000, false),
+        (at(0x31, 1, 0), true),
+        (at(0x32, 0, 0), false),
+    ] {
+        assert_eq!(
+            net.on_fault(addr, write, TITLE_TID),
+            Fault::NotOurs,
+            "I6: {addr:#x} is not ours"
+        );
     }
     assert_eq!(mock.log(), log, "I6: no state change logged");
     assert_eq!(net.stats(), stats);
@@ -740,6 +717,120 @@ fn t6_foreign_and_host_access() {
     let net = PageNet::new(Mode::Measure, mock.clone());
     net.host_thread(HOST_TID);
     net.arm(0x33, Reason::AfterCopyBack);
-    assert_eq!(net.on_fault(at(0x33, 0, 0), false, HOST_TID), Fault::Handled, "the host runs on");
-    assert_eq!(net.stats(), Stats::default(), "I8: a host access is no title read");
+    assert_eq!(
+        net.on_fault(at(0x33, 0, 0), false, HOST_TID),
+        Fault::Handled,
+        "the host runs on"
+    );
+    assert_eq!(
+        net.stats(),
+        Stats::default(),
+        "I8: a host access is no title read"
+    );
+}
+
+/// t7 (I7): opening a measured page never undoes a guard set after arming.
+///
+/// Input: Measure; page A = 0x40 written by the title before (open, changed)
+/// and armed; page B = 0x41 armed from the guard (read-only).
+/// Run: the engine refreshes and takes A again (read-only: the arming is
+/// gone, as a `VirtualProtect` of the write guard replaces ours), then the
+/// title's write to A reaches the net first (handler order). The engine
+/// opens B itself (a kernel write), then a title read of B that faulted
+/// before that is dispatched.
+/// Expected: A's fault is NotOurs and A is still read-only (the net giving
+/// A back its old read-write protection would let the write through
+/// untracked: a stale GPU copy); B's fault is Handled (retried, the page is
+/// open) and B stays read-write; nothing counted, two overrides noted.
+#[test]
+fn t7_measure_never_undoes_a_later_guard() {
+    let (a, b) = (0x40, 0x41);
+    let mock = Mock::new(&[a, b]);
+    let net = PageNet::new(Mode::Measure, mock.clone());
+    access(&net, &mock, at(a, 0, 0), Some(1), TITLE_TID);
+    assert_eq!(mock.prot(a), Prot::ReadWrite);
+    net.arm(a, Reason::AfterCopyBack);
+    net.arm(b, Reason::AfterCopyBack);
+    assert_eq!(
+        (mock.prot(a), mock.prot(b)),
+        (Prot::NoAccess, Prot::NoAccess)
+    );
+
+    mock.refresh();
+    mock.engine_copy_back(a);
+    assert_eq!(
+        net.on_fault(at(a, 0, 1), true, TITLE_TID),
+        Fault::NotOurs,
+        "the write guard's fault"
+    );
+    assert_eq!(
+        mock.prot(a),
+        Prot::ReadOnly,
+        "I7: the guard set after arming stands"
+    );
+
+    mock.st().prot.insert(b, Prot::ReadWrite);
+    assert_eq!(
+        net.on_fault(at(b, 0, 0), false, TITLE_TID),
+        Fault::Handled,
+        "the page is open: retry"
+    );
+    assert_eq!(mock.prot(b), Prot::ReadWrite);
+
+    assert_eq!(
+        net.stats(),
+        Stats::default(),
+        "nothing measured: both armings were lost"
+    );
+    assert_eq!(
+        net.oddities(),
+        Oddities {
+            overridden: 2,
+            ..Oddities::default()
+        }
+    );
+    assert_eq!((net.state(a), net.state(b)), (State::Shared, State::Shared));
+}
+
+/// t8 (I8, I3): in net mode a host thread's fault syncs and demotes like
+/// the title's (the host must see the GPU's bytes too, and a page the host
+/// reads through the title's view is not GPU-only), but is not counted as a
+/// title access. An arm of a page that is closed already (not mapped, or
+/// closed by someone else) arms nothing.
+#[test]
+fn t8_net_host_fault_and_unmapped_arm() {
+    const P: usize = 0x50;
+    let mock = Mock::new(&[P]);
+    let net = PageNet::new(Mode::Net, mock.clone());
+    net.host_thread(HOST_TID);
+    net.arm(P, Reason::GpuOnly);
+    mock.gpu_write(at(P, 1, 0), 0x42);
+    assert_eq!(net.on_fault(at(P, 1, 0), false, HOST_TID), Fault::Handled);
+    assert_eq!(
+        mock.title(at(P, 1, 0)),
+        0x42,
+        "the host reads the GPU's byte"
+    );
+    assert_eq!(net.state(P), State::Demoted);
+    let stats = net.stats();
+    assert!(
+        stats.reads.is_empty() && stats.writes.is_empty(),
+        "I8: {stats:?}"
+    );
+    assert_eq!(stats.syncs, 1);
+    assert_eq!(net.oddities().host_faults, 1);
+    assert_eq!(net.drain_demotions().len(), 1);
+
+    net.arm(0x51, Reason::GpuOnly);
+    assert_eq!(net.state(0x51), State::Shared, "not mapped: nothing to arm");
+    assert!(!net.is_gpu_only(0x51));
+    let mock = Mock::new(&[0x52]);
+    mock.st().prot.insert(0x52, Prot::NoAccess);
+    let net = PageNet::new(Mode::Net, mock.clone());
+    net.arm(0x52, Reason::GpuOnly);
+    assert_eq!(net.state(0x52), State::Shared, "closed by someone else: not ours to open");
+    assert_eq!(
+        net.on_fault(at(0x52, 0, 0), false, TITLE_TID),
+        Fault::NotOurs
+    );
 }
