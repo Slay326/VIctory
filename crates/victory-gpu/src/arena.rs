@@ -135,7 +135,7 @@ pub(crate) fn learning_skips(name: &str) -> bool {
     BUILDER_SEEN.store(true, Relaxed);
     static LEARN: OnceLock<u64> = OnceLock::new();
     static SKIP: OnceLock<Vec<String>> = OnceLock::new();
-    let learn = *LEARN.get_or_init(|| number("VICTORY_BVH_ARENA_LEARN", 3));
+    let learn = *LEARN.get_or_init(|| number("VICTORY_BVH_ARENA_LEARN", 8));
     if BUILDER_FRAMES.load(Relaxed) >= learn {
         return false;
     }
@@ -285,6 +285,10 @@ struct Stats {
     asked: u64,
     /// Pages at committed addresses of the host's memory (not given).
     host: u64,
+    /// Missed addresses below 256 MiB (dropped), and missed pages not yet
+    /// missed in enough frames.
+    low: u64,
+    once: u64,
     /// Builder pools given whole before their first run, and their pages.
     around_runs: u64,
     around: u64,
@@ -325,6 +329,9 @@ struct Arena {
     capped: bool,
     /// Pages misses got this frame ([`faults_per_frame`]).
     faults: u64,
+    /// Missed pages without a slot: in how many frames, and the last one
+    /// ([`want_pages`]; old entries pruned in [`log_frame`]).
+    misses: std::collections::HashMap<u64, (u32, u64)>,
     /// A builder dispatch was recorded since the last [`provide`].
     builder_now: bool,
     /// Input scans so far, and when each input buffer was last scanned.
@@ -364,6 +371,7 @@ fn new_arena() -> Arena {
         reserved: false,
         capped: false,
         faults: 0,
+        misses: std::collections::HashMap::new(),
         builder_now: false,
         scans: 0,
         scanned_at: BTreeMap::new(),
@@ -444,10 +452,52 @@ pub(crate) fn want_pages(addresses: &[u64]) {
     if addresses.is_empty() {
         return;
     }
+    let frame = FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    let need = miss_frames();
     with(|a| {
         a.stats.asked += addresses.len() as u64;
-        a.wanted.extend(addresses.iter().map(|&at| at / PAGE));
+        for &at in addresses {
+            // Region 0 (below 256 MiB): addresses made from zeros.
+            if at < LOW {
+                a.stats.low += 1;
+                continue;
+            }
+            let page = at / PAGE;
+            if a.dir.get(page).is_some() {
+                continue;
+            }
+            // Only pages missed in `need` different frames: addresses
+            // computed from zeros change from frame to frame, the builder's
+            // memory does not (run 150500: 130,000-142,000 missed pages a
+            // submission against 32,768 of budget).
+            let e = a.misses.entry(page).or_insert((0, u64::MAX));
+            if e.1 != frame {
+                *e = (e.0 + 1, frame);
+            }
+            if e.0 >= need {
+                a.wanted.insert(page);
+            } else {
+                a.stats.once += 1;
+            }
+        }
     });
+}
+
+/// Frames presented while the arena is on (for [`want_pages`]).
+static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Addresses below this are taken for addresses made from zeros (region 0).
+const LOW: u64 = 1 << 28;
+
+/// The frames a page must be missed in before it gets a page
+/// (`VICTORY_BVH_ARENA_MISS_FRAMES`, 2; 1: at once).
+fn miss_frames() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    // (The synthetic test ends no frames between its submissions.)
+    if cfg!(test) {
+        return 1;
+    }
+    *N.get_or_init(|| number("VICTORY_BVH_ARENA_MISS_FRAMES", 2).max(1) as u32)
 }
 
 /// The BVH builder is recorded with a root descriptor at `address`, which
@@ -1092,6 +1142,13 @@ pub(crate) fn log_frame() {
     }
     {
         use std::sync::atomic::Ordering::Relaxed;
+        let frame = FRAME.fetch_add(1, Relaxed) + 1;
+        if frame.is_multiple_of(4) {
+            // Pages not missed in the last 16 frames are forgotten.
+            if let Some(a) = arena().as_mut() {
+                a.misses.retain(|_, e| frame.saturating_sub(e.1) < 16);
+            }
+        }
         if BUILDER_SEEN.swap(false, Relaxed) {
             let frames = BUILDER_FRAMES.fetch_add(1, Relaxed) + 1;
             let skipped = LEARN_SKIPPED.swap(0, Relaxed);
@@ -1113,7 +1170,7 @@ pub(crate) fn log_frame() {
         target: "victory_gpu::arena",
         "BVH arena this frame: input buffers scanned {} MB -> {} structure pages; prepared before the builder ran {} pages; builder root addresses {}, \
          builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
-         no memory there {}, host memory {}, \
+         no memory there {}, host memory {}, below 256 MiB {}, missed in too few frames {} (tracked {}), \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms); \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
         s.scanned >> 20,
@@ -1131,6 +1188,9 @@ pub(crate) fn log_frame() {
         a.stopped.as_deref().map(|w| format!(" (stopped: {w})")).unwrap_or_default(),
         s.nothing,
         s.host,
+        s.low,
+        s.once,
+        a.misses.len(),
         s.regions,
         s.writes,
         s.refreshed,
