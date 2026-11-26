@@ -16,7 +16,7 @@ Legende je Karte: **Ziel / Schritte / Abnahme / PC / Aufwärmen / Abhängig von 
 - Status: `offen` / `läuft (wer, seit)` / `fertig (Beleg)` / `blockiert (Grund)`.
 
 Summe der Dauern (Skript, Eingaben = die [S]-Dauern der Karten): Stufe-1-Karten Q1-Q8 640 min = 10,7 h,
-alle Opus-Karten 1.030 min = 17,2 h [C aus S]. Mit zwei PCs und CPU-Arbeit parallel reicht das für die Nacht.
+alle Opus-Karten 1.000 min = 16,7 h [C aus S]. Mit zwei PCs und CPU-Arbeit parallel reicht das für die Nacht.
 
 ---
 
@@ -143,7 +143,10 @@ alle Opus-Karten 1.030 min = 17,2 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
 - PC: PC 1 oder PC 2, CPU/RAM-lastig. Aufwärmen: nein. Abhängig von: nichts. Dauer: 1,5 h. Wer: Opus.
 
 ### R2 VRAM PC 1: play über Budget
-- Status: offen
+- Status: Analyse fertig (senior 45, JOURNAL ~20:00, unverified, for Fable): Schalter greifen; Karte +581 MB
+  gegenüber s32 kommt aus Host-Texturen aus Titelspeicher (+858 MB, 1.886 -> 2.605 verschiedene Texturen),
+  schon in r25 so (Inhalt durch main-Shader-Fixes, kein Leck); Budget 7.239 statt 7.417 nicht durch
+  Fremdprozesse. Offen nur noch Schritt 5 (unten). Schritte 1-4 entfallen.
 - Ziel: Erklären, warum die 3070 in play 8.046 von 7.239 MB belegt [M, Lauf 192359], obwohl dieselben
   Schalter (EVICT_UNWRITTEN + TEXTURE_HEAPS_LEAN + CARD_BUFFERS_MB=896, im meta.txt bestätigt) vorher
   7.477 von 7.417 MB ergaben [M, Lauf 20261126-161102].
@@ -152,8 +155,11 @@ alle Opus-Karten 1.030 min = 17,2 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
   (Host-Texturen 5.877 vs. ~5.000 [M]); (3) Unterschied r25/play vs. s32 im Texturpfad (Diff lesen);
   (4) nur wenn (1)-(3) nichts erklären: ein Lauf play mit denselben Schaltern bei geschlossenen
   GPU-Fremdprozessen.
+  (5) Fable entscheidet zwischen senior 45s Optionen: (a) Bisect r25 vs. s32 nur für den Textur-Zuwachs
+  (Aufwärmen je Schritt), (b) Deckel bzw. früheres Abgeben ungenutzter Titel-Texturen hinter Schalter,
+  (c) A-B play mit/ohne NVIDIA-Overlay zum Budget. Danach ggf. eine Karte für Opus.
 - Abnahme: Ursache mit Zahlen belegt oder als "unverified, for Fable" markiert; keine neue Design-Entscheidung.
-- PC: **PC 1** (Lauf nur Schritt 4). Aufwärmen: nein. Abhängig von: nichts. Dauer: 1 h. Wer: Opus.
+- PC: **PC 1** (nur für (c)). Aufwärmen: nein (außer (a)). Abhängig von: Fable. Dauer: 30 min. Wer: Opus.
 
 ### R3 RT: gezielter Refresh nicht überwachter Builder-Eingaben
 - Status: offen (Branch `test/bvh31-blimit`, nicht `play`)
@@ -209,7 +215,7 @@ alle Opus-Karten 1.030 min = 17,2 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
 | Zeit [S] | PC 1 (3070) | PC 2 (4070) | CPU (ohne GPU) |
 |---|---|---|---|
 | ab 23:00 | Q6 Tests (kurz GPU) | R3 RT-Refresh | Fable: F1; Opus: Q7, Q2-Skelett |
-| nach F1 | Q1 bauen, Q3 | R4 Haar-Dump | R2 Schritte 1-3 |
+| nach F1 | Q1 bauen, Q3 | R4 Haar-Dump | Q2 |
 | danach | Q4 A-B-A | R5 Schatten-Dump | Q2 fertig |
-| danach | R2 Schritt 4 (falls nötig) | Q5 BVH an/aus | Q8, F2 schreiben |
+| danach | R2 (c), falls Fable es will | Q5 BVH an/aus | Q8, F2 schreiben |
 | Pausen | R1 (wenn kein Lauf) | R1 (wenn kein Lauf) | - |
