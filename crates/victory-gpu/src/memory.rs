@@ -230,6 +230,19 @@ fn withheld_in(frame: u64, missed: u64) -> bool {
     missed != MISS_NEVER && frame <= missed.saturating_add(1)
 }
 
+/// Whether withheld writes stay in the copies until the frame's end even
+/// when a list of their submission missed (`VICTORY_BVH_RETAKE_LATE=1`,
+/// off by default, local test): taken back right after the submission, the
+/// ray tracing programs later in the frame never saw the builder's
+/// structures (run 165348: of the headers a builder submission wrote in
+/// copies, none was left when the readers ran). Nothing of it goes into
+/// title memory either way; the risk is the frame's own later GPU work
+/// reading results computed from zeros (run shards20).
+pub(crate) fn retake_late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_RETAKE_LATE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Title memory whose host copies hold what shaders wrote this frame and
 /// the frame withheld ([`withholding`]; ranges).
 static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -241,7 +254,7 @@ static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// garbage BVH nodes over meshlet buffers, run shards20), else from the
 /// frame's end ([`retake_dropped`]).
 pub(crate) fn drop_withheld(address: usize, len: usize) {
-    if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
+    if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) && !retake_late() {
         crate::watch::retake(address, len);
     } else {
         DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
