@@ -10,8 +10,10 @@
 //! an arena in the GPU's memory:
 //! * a directory over the title's address space in 64 KiB pages
 //!   ([`Directory`]) names each page's slot in the arena, chunks of
-//!   [`CHUNK_PAGES`] pages, made only as pages are asked for, within a
-//!   budget (`VICTORY_BVH_ARENA_MB`, 2048) and the card's own budget;
+//!   [`CHUNK_PAGES`] pages for a budget (`VICTORY_BVH_ARENA_MB`, 2048), all
+//!   made at the first submission before the title's textures fill the card
+//!   and kept resident with high priority ([`reserve`]); copies of title
+//!   buffers get less of the card meanwhile (`crate::shadow`, 512 MiB);
 //! * pages shaders reached with no copy (their bits in the lists' bitmaps)
 //!   are asked for after the submission and given before the next one
 //!   ([`provide`], at most `VICTORY_BVH_ARENA_STEP` (4096) new pages a
@@ -227,6 +229,8 @@ struct Arena {
     generation: u64,
     /// Why the arena stopped growing, if it did (logged once).
     stopped: Option<String>,
+    /// Whether its chunks were made up front ([`reserve`]).
+    reserved: bool,
     stage: Option<(ID3D12Resource, usize)>,
     stats: Stats,
 }
@@ -241,9 +245,8 @@ fn arena() -> std::sync::MutexGuard<'static, Option<Arena>> {
     ARENA.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn with<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    let mut a = arena();
-    f(a.get_or_insert_with(|| Arena {
+fn new_arena() -> Arena {
+    Arena {
         dir: Directory::new(most_pages()),
         chunks: Vec::new(),
         wanted: BTreeSet::new(),
@@ -252,9 +255,75 @@ fn with<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
         watched: BTreeMap::new(),
         generation: 0,
         stopped: None,
+        reserved: false,
         stage: None,
         stats: Stats::default(),
-    }))
+    }
+}
+
+fn with<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
+    let mut a = arena();
+    f(a.get_or_insert_with(new_arena))
+}
+
+/// Whether the arena's chunks are made at the first submission, before the
+/// title's textures fill the card (`VICTORY_BVH_ARENA_RESERVE`, on); off,
+/// they are made as pages are asked for, while the process uses less than
+/// 95 % of the card's budget.
+fn reserve_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_RESERVE").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Gives `resource` high residency priority: when the process uses more
+/// than the card's budget (the RTX 3070 does in the world, its textures
+/// alone ~5-7 GB), the video memory manager moves others to system memory
+/// before it. Only where it lives changes, not what it holds.
+fn keep_resident(host: &crate::host::Host, resource: &ID3D12Resource) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_RESIDENCY_PRIORITY_HIGH, ID3D12Device1, ID3D12Pageable};
+    use windows::core::Interface;
+    let (Ok(device), Ok(pageable)) = (host.device.cast::<ID3D12Device1>(), resource.cast::<ID3D12Pageable>()) else {
+        return false;
+    };
+    // SAFETY: one live object and its priority.
+    unsafe { device.SetResidencyPriority(1, &Some(pageable), &D3D12_RESIDENCY_PRIORITY_HIGH) }.is_ok()
+}
+
+/// Makes the arena's chunks for its whole budget now (the first submission,
+/// while the card has room), each kept resident ahead of other memory. A
+/// chunk that cannot be made ends it there and the budget shrinks to what
+/// was made; logged once, with who yields to whom.
+fn reserve(host: &crate::host::Host, a: &mut Arena) {
+    a.reserved = true;
+    let before = host.card_usage();
+    let wanted = a.dir.most.div_ceil(CHUNK_PAGES) as usize;
+    let mut resident = 0;
+    while a.chunks.len() < wanted {
+        let Some(chunk) = host.card_buffer(CHUNK_BYTES) else {
+            let why = format!("chunk {} of {wanted} could not be made", a.chunks.len());
+            tracing::warn!(target: "victory_gpu::arena", "BVH arena reserved less: {why}");
+            break;
+        };
+        crate::host::name(&chunk, || format!("BVH arena chunk {}", a.chunks.len()));
+        resident += usize::from(keep_resident(host, &chunk));
+        a.chunks.push(chunk);
+    }
+    a.dir.most = a.dir.most.min(a.chunks.len() as u32 * CHUNK_PAGES);
+    let mb = |b: u64| b >> 20;
+    let card = |u: Option<(u64, u64)>| u.map_or("unknown".to_owned(), |(budget, usage)| format!("{} of {} MB", mb(usage), mb(budget)));
+    let (copies, copies_was) = crate::shadow::card_cap();
+    tracing::info!(
+        target: "victory_gpu::arena",
+        "BVH arena reserved {} chunks = {} MB up front ({} of them with high residency priority: textures and other memory go to system memory before them \
+         when the card is full); card in use before {}, after {}; copies of title buffers in GPU memory capped at {} MB (without the arena {} MB)",
+        a.chunks.len(),
+        (a.chunks.len() as u64 * CHUNK_BYTES) >> 20,
+        resident,
+        card(before),
+        card(host.card_usage()),
+        mb(copies),
+        mb(copies_was),
+    );
 }
 
 /// A list using title memory reached `addresses` with no copy: their pages
@@ -373,7 +442,10 @@ pub(crate) fn provide() {
     }
     let Some(host) = crate::host::host() else { return };
     let mut guard = arena();
-    let Some(a) = guard.as_mut() else { return };
+    let a = guard.get_or_insert_with(new_arena);
+    if reserve_on() && !a.reserved {
+        reserve(host, a);
+    }
     for l1 in std::mem::take(&mut a.wanted_regions) {
         if !a.dir.has_region(l1) && region_has_memory(l1) && a.dir.add_region(l1) {
             a.stats.regions += 1;
@@ -424,7 +496,7 @@ pub(crate) fn provide() {
             continue;
         }
         let next = a.dir.next();
-        if next.chunk() >= a.chunks.len() {
+        if next.chunk() >= a.chunks.len() && !a.reserved {
             if let Some(why) = chunk_refused(host, a.chunks.len()) {
                 tracing::warn!(target: "victory_gpu::arena", pages = a.dir.len(), "BVH arena stops growing: {why}");
                 a.stopped = Some(why);
@@ -649,11 +721,12 @@ pub(crate) fn log_frame() {
     if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed == 0 {
         return;
     }
+    let (kept_out, kept_out_bytes) = crate::shadow::card_refused();
     tracing::info!(
         target: "victory_gpu::arena",
         "BVH arena this frame: pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, no memory there {}, \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms); \
-         total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting",
+         total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
         s.asked,
         s.filled + s.zero,
         s.filled,
@@ -672,6 +745,8 @@ pub(crate) fn log_frame() {
         (u64::from(a.dir.most) * PAGE) >> 20,
         a.dir.regions.len(),
         a.wanted.len(),
+        kept_out,
+        kept_out_bytes >> 20,
     );
 }
 
