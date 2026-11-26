@@ -262,6 +262,12 @@ pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
 }
 
+/// Whether the title pipeline is the acceleration-structure builder's.
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
+
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
 /// structure builder's pipelines are known by its image).
 #[cfg(windows)]

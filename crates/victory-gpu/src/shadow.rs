@@ -478,6 +478,39 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// The copy's bytes of the 64 KiB page at `page` (cut to the copy) as
+    /// shaders left them, and the title address they start at
+    /// (`crate::bvh_gt`, after a submission's fence). Of a copy in the
+    /// GPU's memory the page is fetched from there and the CPU side is left
+    /// as it was.
+    pub(crate) fn gpu_bytes(&self, page: usize) -> Option<(usize, Vec<u8>)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (page.max(start), (page + PAGE).min(end));
+        if from >= to {
+            return None;
+        }
+        let at = from - start;
+        // SAFETY: inside the mapping; only the submitting thread writes it,
+        // and the GPU is done with the submission.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), to - from) };
+        if self.card.is_none() {
+            return Some((from, host.to_vec()));
+        }
+        let before = host.to_vec();
+        crate::host::card_fetch(&[(self, at, at + (to - from))]);
+        // SAFETY: as above, after the fetch.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), to - from) };
+        let fetched = host.to_vec();
+        host.copy_from_slice(&before);
+        Some((from, fetched))
+    }
+
+    /// Whether the title wrote the page at `page` since the copy took it
+    /// (or it is to be taken again); None for memory not tracked.
+    pub(crate) fn title_changed(&self, page: usize) -> Option<bool> {
+        self.tracked.as_ref().map(|t| t.changed(page / PAGE))
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base

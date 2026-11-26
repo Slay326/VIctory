@@ -467,6 +467,42 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let data = data as usize;
+    // `VICTORY_BVH_GT`: the marked pages as `defer_after` below finds them,
+    // read before it clears the bitmap.
+    if crate::bvh_gt::target().is_some() {
+        list.defer_gt(move || {
+            let l = layout(key);
+            // SAFETY: the bitmap is mapped and the list's run is over.
+            let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+            let mut m = crate::bvh_gt::Marks::default();
+            for (w, &mark) in marks.iter().enumerate() {
+                let mut bits = mark;
+                while bits != 0 {
+                    let entry = w * 32 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (block, page) = (entry / BLOCK, entry % BLOCK);
+                    let Some(&l1) = l.blocks.get(block).filter(|_| block != 0) else {
+                        m.missed_regions += 1;
+                        if m.first_missed.len() < 3 {
+                            m.first_missed.push((entry as u64) << 28);
+                        }
+                        continue;
+                    };
+                    let at = l1 << 28 | page << 16;
+                    match l.owner.get(entry) {
+                        Some(Some(k)) => m.owned.push((l.copies[*k].clone(), at)),
+                        _ => {
+                            m.missed_pages += 1;
+                            if m.first_missed.len() < 3 {
+                                m.first_missed.push(at as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            m
+        });
+    }
     list.defer_missed(move || {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
@@ -895,5 +931,200 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// Mode 0: 64 threads each copy a dword from (`q_lo`, `q_hi`) to
+    /// (`p_lo`, `p_hi`) through the page table, as a builder stage reads its
+    /// inputs and writes a structure; with `missing_hi` non-zero thread 0
+    /// also reads (`missing_lo`, `missing_hi`). Mode 1: the 64 dwords at
+    /// (`p_lo`, `p_hi`) through the page table into `result`, as a ray
+    /// tracing program reads a structure. Misses read 0 and are marked.
+    const BUILD: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0, space=2), UAV(u1, space=2), RootConstants(num32BitConstants=7, b0)"
+RWByteAddressBuffer views[] : register(u0);
+ByteAddressBuffer table : register(t0, space2);
+RWByteAddressBuffer dirty : register(u0, space2);
+RWByteAddressBuffer result : register(u1, space2);
+cbuffer c : register(b0) { uint p_lo; uint p_hi; uint q_lo; uint q_hi; uint mode; uint missing_lo; uint missing_hi; }
+uint access(uint a, uint h, bool write, uint value) {
+    bool inside = h < 256;
+    uint l1 = inside ? (h << 4 | a >> 28) : 0;
+    uint block = inside ? table.Load(l1 * 4) : 0;
+    uint entry = block << 12 | (a >> 16 & 0xFFF);
+    uint2 e = table.Load2((4096 + 2 * entry) * 4);
+    bool miss = e.x == table.Load(4096 * 4);
+    uint n = miss && block == 0 ? l1 : entry;
+    if (write || miss) {
+        dirty.InterlockedOr(n >> 5 << 2, 1u << (n & 31));
+    }
+    if (miss) {
+        return 0;
+    }
+    if (write) {
+        views[NonUniformResourceIndex(e.x + 1)].Store(a - e.y, value);
+        return value;
+    }
+    return views[NonUniformResourceIndex(e.x + 1)].Load(a - e.y);
+}
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint o = id.x * 4;
+    if (mode == 0) {
+        access(p_lo + o, p_hi, true, access(q_lo + o, q_hi, false, 0));
+        if (id.x == 0 && missing_hi != 0) {
+            access(missing_lo, missing_hi, false, 0);
+        }
+    } else {
+        result.Store(o, access(p_lo + o, p_hi, false, 0));
+    }
+}
+"#;
+
+    /// bvh-test-plan (1), synthetic: only the way from a builder stage's
+    /// writes to the readers. A stage reads a small structure
+    /// (`crate::bvh_gt::mini_bvh`) from page Q and writes it into page P
+    /// (title memory with a copy, holding older bytes); readers read P
+    /// through the page table (i) in the same list, (ii) in the next
+    /// submission, (iii) after the frame's end, and the CPU reads P after
+    /// `Host::execute`. Three cases:
+    /// * V1: Q has a copy, nothing missed: everyone sees the structure.
+    /// * V3: Q has a copy, the submission also reads memory with no copy
+    ///   (case B of the plan): (i) sees the right structure, (ii), (iii)
+    ///   and the CPU the older bytes (`drop_withheld`, `watch::retake`).
+    /// * V2: Q is private memory with no copy (as the builder's pools):
+    ///   the stage reads zeros (case A1), (i) sees the zeros, the others
+    ///   the older bytes.
+    ///
+    /// Asserts what the current code does, after printing what each reader
+    /// saw. Fails without a GPU (no silent pass).
+    ///
+    /// Run alone, in an interactive session, with no other GPU work:
+    /// `cargo test --release -p victory-gpu --features diagnostics a_bvh_written_from_pages -- --ignored --test-threads=1 --nocapture`
+    #[test]
+    #[ignore = "needs a D3D12 GPU; run alone with --ignored --test-threads=1 --nocapture"]
+    fn a_bvh_written_from_pages_with_and_without_copies_reaches_its_readers() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const OLD: u32 = 0x1111_1111;
+        let host = crate::host::host().expect("no D3D12 device: this test must not pass without a GPU");
+        let views = heap().expect("no view heap for title memory");
+        let (root, pso) = pipeline(BUILD);
+        let (result, result_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let result_gpu = unsafe { result.GetGPUVirtualAddress() };
+        // A page below 2^40 from `from` on, write-watched as the title's
+        // memory, or plain private memory (`watched` false).
+        let page = |from: u64, watched: bool| -> usize {
+            let watch = if watched { crate::watch::tests::MEM_WRITE_WATCH } else { 0 };
+            (0..256u64)
+                .map(|k| from + (k << 28))
+                // SAFETY: a fresh allocation where nothing is mapped, or none.
+                .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE) } as usize)
+                .find(|&p| p != 0)
+                .expect("memory below 2^40")
+        };
+        let (p, q, bare) = (page(0x60_0000_0000, true), page(0x68_0000_0000, true), page(0x70_0000_0000, false));
+        let bvh = crate::bvh_gt::mini_bvh();
+        let (base, input, input_bare) = (p + 0x100, q + 0x100, bare + 0x100);
+        let write = |at: usize, words: &[u32]| {
+            for (k, &w) in words.iter().enumerate() {
+                // SAFETY: our pages (a guarded page faults into the handler).
+                unsafe { (at as *mut u32).add(k).write_volatile(w) };
+            }
+        };
+        // SAFETY: our page.
+        let title = || -> Vec<u32> { (0..64).map(|k| unsafe { (base as *const u32).add(k).read_volatile() }).collect() };
+        write(base, &[OLD; 64]);
+        write(input, &bvh);
+        write(input_bare, &bvh);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(q, q as u64, PAGE as u64);
+        let copies = (crate::shadow::find(p as u64, PAGE as u64).unwrap(), crate::shadow::find(q as u64, PAGE as u64).unwrap());
+        let list = host.new_list().unwrap();
+        // One submission: the stage reading `from` (and `missing`) if any,
+        // a UAV barrier, then the reader if `read`; the list open again
+        // after it. What the reader saw.
+        let submit = |from: Option<(usize, u64)>, read: bool| -> Vec<u32> {
+            let map = bind(&list, OURS).expect("a page table");
+            let constants = |mode: u32, q: usize, missing: u64| {
+                [base as u32, (base >> 32) as u32, q as u32, (q >> 32) as u32, mode, missing as u32, (missing >> 32) as u32]
+            };
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                list.list.SetComputeRootUnorderedAccessView(3, result_gpu);
+                list.list.SetPipelineState(&pso);
+            }
+            if let Some((q, missing)) = from {
+                let c = constants(0, q, missing);
+                // SAFETY: as above.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstants(4, c.len() as u32, c.as_ptr().cast(), 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+                crate::list::global_uav_barrier(&list);
+            }
+            if read {
+                let c = constants(1, 0, 0);
+                // SAFETY: as above.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstants(4, c.len() as u32, c.as_ptr().cast(), 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the mapped output, the GPU done with it.
+            (0..64).map(|k| unsafe { result_cpu.cast::<u32>().add(k).read_volatile() }).collect()
+        };
+        let what = |w: &[u32]| -> String {
+            let read = |at: u64| w.get(at.checked_sub(0x1000)? as usize / 4).copied();
+            if w == bvh {
+                format!("the structure (valid {})", crate::bvh_gt::check(&read, 0x1000).valid)
+            } else if w.iter().all(|&x| x == OLD) {
+                "the older bytes".into()
+            } else if w.iter().all(|&x| x == 0) {
+                format!("zeros (valid {})", crate::bvh_gt::check(&read, 0x1000).valid)
+            } else {
+                format!("something else: {:x?}", &w[..16])
+            }
+        };
+        // Missed memory, in a 256 MiB region with no block.
+        let elsewhere: u64 = 0xff_f000_0000;
+        let mut seen = Vec::new();
+        for (name, from, missing) in [
+            ("V1 Q with a copy", input, 0),
+            ("V3 Q with a copy, a miss elsewhere", input, elsewhere),
+            ("V2 Q with no copy", input_bare, 0),
+        ] {
+            // No miss of earlier submissions withholds this one.
+            log_frame();
+            log_frame();
+            write(base, &[OLD; 64]);
+            let i = submit(Some((from, missing)), true);
+            let cpu = title();
+            let ii = submit(None, true);
+            log_frame();
+            let iii = submit(None, true);
+            println!("{name}: (i) {}; CPU {}; (ii) {}; (iii) {}", what(&i), what(&cpu), what(&ii), what(&iii));
+            seen.push((i, cpu, ii, iii));
+        }
+        let old = vec![OLD; 64];
+        let (v1, v3, v2) = (&seen[0], &seen[1], &seen[2]);
+        assert!(v1.0 == bvh && v1.1 == bvh && v1.2 == bvh && v1.3 == bvh, "V1: every reader and the CPU see the structure");
+        assert!(v3.0 == bvh, "V3: a reader in the same list sees the right structure");
+        assert!(v3.1 == old && v3.2 == old && v3.3 == old, "V3: later readers and the CPU see the older bytes (case B)");
+        assert!(v2.0.iter().all(|&x| x == 0), "V2: the stage read zeros (case A1)");
+        assert!(v2.1 == old && v2.2 == old && v2.3 == old, "V2: later readers and the CPU see the older bytes");
+        for at in [p, q] {
+            crate::shadow::unregister(at, at as u64);
+        }
+        drop(copies);
     }
 }

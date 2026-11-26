@@ -553,6 +553,16 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// A global UAV barrier in `list` (`VICTORY_BVH_UAV_BARRIER`, `crate::bvh_gt`).
+#[cfg(windows)]
+pub(crate) fn global_uav_barrier(list: &crate::host::HostList) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    // SAFETY: the same layout; no resource named.
+    let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
