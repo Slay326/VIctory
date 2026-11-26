@@ -63,6 +63,13 @@ fn most_submissions() -> u64 {
     *N.get_or_init(|| number("VICTORY_BVH_GT_MAX", 200))
 }
 
+/// `VICTORY_BVH_GT_DUMPS` (3): invalid headers per submission whose raw
+/// dwords are logged.
+fn dumps() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_GT_DUMPS", 3) as usize)
+}
+
 /// Submissions compared so far.
 static COMPARED: AtomicU64 = AtomicU64::new(0);
 
@@ -265,6 +272,55 @@ impl Gt {
             .take(3)
             .map(|(at, c)| format!("{at:#x} {}", c.why.as_deref().unwrap_or("?")))
             .collect();
+        // Raw dwords of the first invalid headers, to check the validator's
+        // reading of the format against what the builder wrote: the header,
+        // the node the root pointer names, the node one before it, and the
+        // node at dword 10 (offset of the box nodes).
+        let g_pages: Vec<(usize, &[u8])> = self.pages.iter().map(|p| (p.from, &p.g[..])).collect();
+        let read = reader(&g_pages);
+        // Headers whose offsets (dwords 10, 13, 14) look like a structure's:
+        // 64-byte multiples of box nodes and elements inside the size.
+        let plausible = |at: u64| {
+            let w = |i: u64| read(at + 4 * i).unwrap_or(u32::MAX);
+            let bytes = u64::from(w(1)) * 64;
+            let (d10, d13) = (u64::from(w(10)), u64::from(w(13)));
+            d10 >= 64 && d10.is_multiple_of(64) && d10 <= bytes + 64 && d13.is_multiple_of(64) && d13 <= bytes + 64
+        };
+        let plausible_n = self.g.headers.iter().filter(|(at, _)| plausible(*at)).count();
+        let plausible_valid = self.g.headers.iter().filter(|(at, c)| c.valid && plausible(*at)).count();
+        let valid_past_header = self.g.headers.iter().filter(|(at, _)| check_with(&read, *at, 64).valid).count();
+        tracing::info!(
+            target: "victory_gpu::bvh_gt",
+            "BVH GT s{s} format: headers {} plausible (dwords 10/13 64-byte multiples inside the size) {plausible_n}, of them valid {plausible_valid}; valid if the size counts the nodes past the header {valid_past_header}",
+            self.g.headers.len(),
+        );
+        if self.g.headers.iter().any(|(_, c)| !c.valid) {
+            let words = |at: u64, n: u64| -> String {
+                (0..n)
+                    .map(|i| read(at + 4 * i).map_or_else(|| "-".to_string(), |w| format!("{w:08x}")))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            // Plausible ones first: the others are mostly other data that
+            // happens to start like a header.
+            let mut bad: Vec<&(u64, Check)> = self.g.headers.iter().filter(|(_, c)| !c.valid).collect();
+            bad.sort_by_key(|(at, _)| !plausible(*at));
+            for (at, _) in bad.into_iter().take(dumps()) {
+                let at = *at;
+                let root = read(at + 48).unwrap_or(0);
+                let node = u64::from(root & !7) << 3;
+                let d10 = u64::from(read(at + 40).unwrap_or(0));
+                tracing::info!(
+                    target: "victory_gpu::bvh_gt",
+                    "BVH GT s{s} raw {at:#x}: header [{}]; root {root:#x} at +{node:#x} [{}]; at +{:#x} [{}]; dword 10 +{d10:#x} [{}]",
+                    words(at, 16),
+                    words(at + node, 32),
+                    node.saturating_sub(64),
+                    words(at + node.saturating_sub(64), 16),
+                    words(at + d10, 16),
+                );
+            }
+        }
         let valid = self.g.headers.iter().filter(|(_, c)| c.valid).count();
         let (boxes, outside, missing, parents) = self.g.headers.iter().fold((0, 0, 0, (0, 0, 0)), |a, (_, c)| {
             (a.0 + c.boxes, a.1 + c.outside, a.2 + c.missing, (a.3.0 + c.parents.0, a.3.1 + c.parents.1, a.3.2 + c.parents.2))
@@ -422,10 +478,14 @@ fn half(h: u32) -> f32 {
     }
 }
 
-/// Whether `child` lies in `parent`, with room for f16 rounding.
+/// Whether `child` lies in `parent`, with room for f16 rounding: a box16
+/// bound is rounded outwards by up to an f16 step at its magnitude (2^-10
+/// of it), which far from the origin is much more than a share of a small
+/// parent's extent.
 fn inside(child: &Aabb, parent: &Aabb) -> bool {
     (0..3).all(|a| {
-        let tol = (parent.1[a] - parent.0[a]).abs() / 256.0 + 1e-3;
+        let magnitude = parent.0[a].abs().max(parent.1[a].abs());
+        let tol = (parent.1[a] - parent.0[a]).abs() / 256.0 + magnitude / 512.0 + 1e-3;
         child.0[a] >= parent.0[a] - tol && child.1[a] <= parent.1[a] + tol
     })
 }
@@ -443,6 +503,12 @@ fn empty(b: &Aabb) -> bool {
 /// a child, the root not empty while the header counts elements; the
 /// parent table (dword 14) is checked both ways and only counted.
 pub(crate) fn check(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> Check {
+    check_with(read, base, 0)
+}
+
+/// [`check`] with `extra` bytes added to the size dword 1 gives: 64 reads
+/// the size as the nodes past the header (an open question of the format).
+pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64) -> Check {
     let mut c = Check::default();
     let fail = |c: &mut Check, why: String| {
         if c.why.is_none() {
@@ -456,7 +522,7 @@ pub(crate) fn check(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> Check {
     if !is_header(h[0], h[1]) {
         fail(&mut c, format!("dword 0/1 {:#x}/{}", h[0], h[1]));
     }
-    let bytes = u64::from(h[1]) * 64;
+    let bytes = u64::from(h[1]) * 64 + extra;
     let root = h[12];
     let at = |p: u32| u64::from(p & !7) << 3;
     if root == u32::MAX || root & 7 == 7 || at(root) == 0 || at(root) >= bytes {
@@ -590,6 +656,17 @@ mod tests {
         let mut w = good;
         w[21] = 0x4400_0000;
         assert!(check(&read_of(&w, base), base).why.unwrap().contains("outside"));
+    }
+
+    #[test]
+    fn f16_rounding_far_from_the_origin_is_inside() {
+        // Parent x 4000..4001 (f32); the child's f16 max rounds up to 4002
+        // (f16 step 2 there): inside, not by a share of the 1 m extent.
+        let parent: Aabb = ([4000.0, 0.0, 0.0], [4001.0, 1.0, 1.0]);
+        let child: Aabb = ([half(0x6bd0), 0.0, 0.0], [half(0x6bd1), 1.0, 1.0]);
+        assert_eq!((child.0[0], child.1[0]), (4000.0, 4002.0));
+        assert!(inside(&child, &parent));
+        assert!(!inside(&([4000.0, 0.0, 0.0], [4100.0, 1.0, 1.0]), &parent));
     }
 
     #[test]
