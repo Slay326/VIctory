@@ -878,11 +878,28 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
     for p in c.pages_of(Stage::Post).cloned().collect::<Vec<_>>() {
         g.insert(p.address & !(PAGE - 1), l.bytes(&p)?);
     }
+    // The bitmaps of the runs the harness runs: those with the builder's
+    // dispatches (or all with `--all`).
+    let runs: BTreeSet<u32> = c
+        .dispatches
+        .iter()
+        .filter(|d| o.all || d.builder)
+        .map(|d| d.list)
+        .collect();
     let game_bits: BTreeSet<u32> = c
         .bitmaps
         .iter()
+        .filter(|(list, _)| runs.contains(list))
         .flat_map(|(_, s)| s.iter().copied())
         .collect();
+    println!(
+        "runs replayed {:?}; others in the capture: {}",
+        runs,
+        c.dispatches
+            .iter()
+            .filter(|d| !runs.contains(&d.list))
+            .count()
+    );
     let gv = validate(&g);
     println!("G (game, all marked pages): valid by kind {}", by_kind(&gv));
     // As the game's GT line counts: arena pages first (64), then copies.

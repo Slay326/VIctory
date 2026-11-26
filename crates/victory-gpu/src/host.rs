@@ -2421,6 +2421,14 @@ impl HostList {
         self.deferred().bvh.clone()
     }
 
+    /// Whether the dispatches recorded so far include the builder's, and
+    /// others.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bvh_kinds(&self) -> (bool, bool) {
+        let d = self.deferred();
+        (d.bvh.iter().any(|r| r.builder), d.bvh.iter().any(|r| !r.builder))
+    }
+
     /// What the bitmaps [`HostList::defer_bvh_bitmap`] named hold now.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn bvh_bitmaps(&self) -> Vec<(usize, Vec<u32>)> {

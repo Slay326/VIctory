@@ -220,6 +220,31 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
+/// `VICTORY_BVH_CAPTURE`: the BVH builder's dispatches get host lists of
+/// their own (a cut as at a wait, `wait`), so that a capture's pages are
+/// taken after the work recorded before the builder in the same title list
+/// (skinning and the like, whose results its stages read) and its bitmaps
+/// are the builder's alone (`crate::bvh_replay::capture`).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn cut_around_builder(this: This) {
+    if !crate::bvh_replay::capture::enabled() {
+        return;
+    }
+    let Some(current) = host_list(this) else { return };
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let builder = crate::pipeline::is_builder(list.state.lock().unwrap_or_else(|e| e.into_inner()).pipeline() as This);
+    let (has_builder, has_other) = current.bvh_kinds();
+    let cut = if builder { has_other || (!has_builder && !current.is_empty()) } else { has_builder };
+    if !cut {
+        return;
+    }
+    let Some(next) = next_segment(this) else { return };
+    CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    current.close();
+    list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1517,6 +1542,8 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        super::cut_around_builder(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1635,6 +1662,10 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            cut_around_builder(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
