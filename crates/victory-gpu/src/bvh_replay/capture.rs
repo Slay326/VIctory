@@ -412,6 +412,10 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
         }
     }
     touched.extend(views.iter().map(|a| a >> 28));
+    // The first 256 MiB block too: in all eight captures of 2026-11-26 the
+    // builder read 2-5 pages of it (0xb64...-0xb90... MiB) that no root
+    // view or constant names, and the harness refuses such a capture.
+    touched.insert(0);
     // Pages by source, then taken.
     let mut by_copy: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
     let mut arena_wanted: BTreeSet<u64> = BTreeSet::new();

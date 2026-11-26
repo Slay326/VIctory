@@ -666,6 +666,59 @@ impl Capture {
         self.pages.iter().filter(move |p| p.stage == stage)
     }
 
+    /// Pages the capture's budget left out; `None` when the capture does
+    /// not say (counts as incomplete).
+    pub fn left_out(&self) -> Option<u64> {
+        self.meta("pages left out (budget)")?.trim().parse().ok()
+    }
+
+    /// Pages the lists marked that have a source (a copy or an arena page:
+    /// G holds them) but were not taken before: the harness would run them
+    /// on poison or the null pair where the game had bytes.
+    pub fn marked_not_taken(&self) -> usize {
+        self.marked_not_taken_pages().len()
+    }
+
+    /// The pages [`Capture::marked_not_taken`] counts.
+    pub fn marked_not_taken_pages(&self) -> Vec<u64> {
+        let pre: std::collections::BTreeSet<u64> = self
+            .pages_of(Stage::Pre)
+            .map(|p| p.address & !(PAGE - 1))
+            .collect();
+        let post: std::collections::BTreeSet<u64> = self
+            .pages_of(Stage::Post)
+            .map(|p| p.address & !(PAGE - 1))
+            .collect();
+        post.difference(&pre).copied().collect()
+    }
+}
+
+/// Why a capture cannot stand for its submission; empty: complete. A
+/// capture with pages left out, marked pages with a source not taken
+/// before, or harness accesses outside the capture is refused: "valid in
+/// the harness" from such a capture would be a wrong conclusion.
+pub fn incomplete(left_out: Option<u64>, marked_not_taken: usize, outside: usize) -> Vec<String> {
+    let mut why = Vec::new();
+    match left_out {
+        None => why.push("pages left out by the budget unknown".to_string()),
+        Some(0) => {}
+        Some(n) => why.push(format!("{n} pages left out by the budget")),
+    }
+    if marked_not_taken > 0 {
+        why.push(format!("{marked_not_taken} marked pages with a source not taken before"));
+    }
+    if outside > 0 {
+        why.push(format!("{outside} accesses outside the capture"));
+    }
+    why
+}
+
+impl Capture {
+    /// [`incomplete`] for what the capture alone says (before a run).
+    pub fn incomplete_before_run(&self) -> Vec<String> {
+        incomplete(self.left_out(), self.marked_not_taken(), 0)
+    }
+
     /// A summary for `manifest.txt`.
     pub fn manifest(&self) -> String {
         use std::fmt::Write as _;
@@ -848,5 +901,47 @@ mod tests {
         assert_eq!(c.table.address_of(BLOCK + 4), Some(0xdd0040000));
         assert_eq!(c.table.entry_at(0xde0000000), None);
         assert_eq!(c.table.address_of(5), None);
+    }
+
+    #[test]
+    fn a_marked_page_with_a_source_not_taken_before_is_found() {
+        let mut c = sample();
+        // The arena page 0xdd0040000 is in G but not in the pre pages.
+        assert_eq!(c.marked_not_taken(), 1);
+        let mut pre = c.pages[1].clone();
+        pre.stage = Stage::Pre;
+        c.pages.push(pre);
+        assert_eq!(c.marked_not_taken(), 0);
+    }
+
+    #[test]
+    fn the_budget_count_comes_from_the_meta_and_unknown_is_incomplete() {
+        let mut c = sample();
+        assert_eq!(c.left_out(), None);
+        assert!(!c.incomplete_before_run().is_empty());
+        c.meta.push(("pages left out (budget)".into(), "0".into()));
+        assert_eq!(c.left_out(), Some(0));
+        c.meta.last_mut().unwrap().1 = "29000".into();
+        assert_eq!(c.left_out(), Some(29000));
+    }
+
+    #[test]
+    fn an_incomplete_capture_is_refused_for_each_reason() {
+        assert!(incomplete(Some(0), 0, 0).is_empty());
+        assert_eq!(incomplete(Some(5), 0, 0).len(), 1);
+        assert_eq!(incomplete(None, 0, 0).len(), 1);
+        assert_eq!(incomplete(Some(0), 3, 0).len(), 1);
+        assert_eq!(incomplete(Some(0), 0, 121).len(), 1);
+        assert_eq!(incomplete(Some(1), 1, 1).len(), 3);
+    }
+
+    #[test]
+    fn a_complete_capture_passes_before_the_run() {
+        let mut c = sample();
+        c.meta.push(("pages left out (budget)".into(), "0".into()));
+        let mut pre = c.pages[1].clone();
+        pre.stage = Stage::Pre;
+        c.pages.push(pre);
+        assert!(c.incomplete_before_run().is_empty());
     }
 }

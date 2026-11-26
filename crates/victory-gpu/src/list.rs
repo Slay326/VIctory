@@ -1737,6 +1737,12 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
             list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
         }
+        // `VICTORY_BVH_CAPTURE`: this global barrier orders the next
+        // dispatch too; the capture must replay it.
+        #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::capture::enabled() {
+            list.note_bvh_barrier();
+        }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.

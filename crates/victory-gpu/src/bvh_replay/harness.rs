@@ -56,6 +56,9 @@ pub struct Options {
     pub warp: bool,
     /// Where the harness's result pages go (`<dir>/run<k>.pages` + index).
     pub dump: Option<PathBuf>,
+    /// Run an incomplete capture anyway, for its output; the verdict stays
+    /// CAPTURE INVALID.
+    pub diagnose: bool,
 }
 
 impl Options {
@@ -68,6 +71,7 @@ impl Options {
             card_only: false,
             warp: false,
             dump: None,
+            diagnose: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -77,6 +81,7 @@ impl Options {
                 "--barriers" => o.barriers = true,
                 "--card" => o.card_only = true,
                 "--warp" => o.warp = true,
+                "--diagnose" => o.diagnose = true,
                 "--dump" => {
                     o.dump = Some(PathBuf::from(it.next().context("--dump needs a folder")?))
                 }
@@ -86,7 +91,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose]"
             );
         }
         Ok(o)
@@ -873,6 +878,25 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         c.cpu_dirty.len(),
         c.others.len()
     );
+    // Completeness is a hard gate (an incomplete capture's verdict is
+    // CAPTURE INVALID, never "valid in the harness").
+    let before = c.incomplete_before_run();
+    println!(
+        "completeness before the run: pages left out {}, marked pages with a source not taken before {} (first: {}){}",
+        c.left_out().map_or("unknown".to_string(), |n| n.to_string()),
+        c.marked_not_taken(),
+        c.marked_not_taken_pages()
+            .iter()
+            .take(8)
+            .map(|a| format!("{a:#x} {:?}", c.table.entry_at(*a).map(|(_, e)| e)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if before.is_empty() { String::new() } else { format!(" -> {}", before.join("; ")) }
+    );
+    if !before.is_empty() && !o.diagnose {
+        println!("RESULT: CAPTURE INVALID ({}); --diagnose runs it anyway", before.join("; "));
+        return Ok(2);
+    }
     // The game's G and bitmap.
     let mut g: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for p in c.pages_of(Stage::Post).cloned().collect::<Vec<_>>() {
@@ -1036,9 +1060,21 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         gi.intersection(&hi).count(),
         if same_invalid { "SAME" } else { "DIFFERENT" }
     );
-    // Bytes on stable pages.
+    // Bytes on stable pages, but those runs the harness does not replay
+    // also wrote (G holds their writes too).
+    let foreign: BTreeSet<u64> = c
+        .bitmaps
+        .iter()
+        .filter(|(list, _)| !runs.contains(list))
+        .flat_map(|(_, s)| s.iter().filter_map(|&e| c.table.address_of(e as usize)))
+        .collect();
     let (mut equal, mut differ) = (0, Vec::new());
+    let mut skipped = 0;
     for &at in &stable {
+        if foreign.contains(&at) {
+            skipped += 1;
+            continue;
+        }
         match (first.pages.get(&at), g.get(&at)) {
             (Some(h), Some(gb)) if h == gb => equal += 1,
             (Some(_), Some(_)) => differ.push(at),
@@ -1046,7 +1082,7 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         }
     }
     println!(
-        "bytes on stable pages against G: equal {equal}, different {} (first: {})",
+        "bytes on stable pages against G: equal {equal}, different {} (first: {}); left out, also written by runs not replayed: {skipped}",
         differ.len(),
         differ
             .iter()
@@ -1067,6 +1103,15 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
             std::fs::write(dir.join(format!("run{k}.index")), index)?;
             std::fs::write(dir.join(format!("run{k}.pages")), bytes)?;
         }
+    }
+    let invalid = incomplete(c.left_out(), c.marked_not_taken(), misses(&extra));
+    if !invalid.is_empty() {
+        println!(
+            "RESULT: CAPTURE INVALID ({}) ({:.1} s)",
+            invalid.join("; "),
+            started.elapsed().as_secs_f64()
+        );
+        return Ok(2);
     }
     let reproduced = self_ok && same_invalid && differ.is_empty();
     println!(
