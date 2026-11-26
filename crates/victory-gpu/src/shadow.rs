@@ -98,22 +98,43 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
-/// The smallest title buffer whose copy goes to the GPU's memory, and the
-/// most bytes of such copies if set, both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (unset:
-/// [`CARD_MOST`], and at most a quarter of the host GPU's memory budget).
+/// The smallest title buffer whose copy goes to the GPU's memory, in bytes
+/// (`VICTORY_CARD_BUFFERS_MIN_MB`, 1), and the cap on the bytes of such
+/// copies (`VICTORY_CARD_BUFFERS_MB`, [`CardCap`]).
 /// The world of Grand Theft Auto VI has eleven title buffers of 16 MiB or
 /// more, 583 MB, which hold what its skinning reads and writes; its hair
 /// simulation works in smaller ones.
-fn card_limits() -> (u64, Option<u64>) {
-    static LIMITS: std::sync::OnceLock<(u64, Option<u64>)> = std::sync::OnceLock::new();
+fn card_limits() -> (u64, CardCap) {
+    static LIMITS: std::sync::OnceLock<(u64, CardCap)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|n| n << 20);
         (
             mb("VICTORY_CARD_BUFFERS_MIN_MB").unwrap_or(1 << 20).max(1 << 20),
-            mb("VICTORY_CARD_BUFFERS_MB"),
+            card_cap_asked(std::env::var("VICTORY_CARD_BUFFERS_MB").ok().as_deref()),
         )
     })
+}
+
+/// What `VICTORY_CARD_BUFFERS_MB` asks of the cap on copies in the GPU's
+/// memory ([`card_cap_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardCap {
+    /// Unset (or not a number nor `auto`): [`CARD_MOST`], and at most a
+    /// quarter of the host GPU's memory budget.
+    Default,
+    /// `auto`: a share of the host GPU's memory budget ([`CARD_AUTO_SHARE`]).
+    Auto,
+    /// A number of MiB, in bytes: that, whatever the budget.
+    Bytes(u64),
+}
+
+/// [`CardCap`] from the value of `VICTORY_CARD_BUFFERS_MB`.
+fn card_cap_asked(value: Option<&str>) -> CardCap {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("auto") => CardCap::Auto,
+        Some(v) => v.parse::<u64>().ok().and_then(|n| n.checked_mul(1 << 20)).map_or(CardCap::Default, CardCap::Bytes),
+        None => CardCap::Default,
+    }
 }
 
 /// The most bytes of copies in the GPU's memory unless
@@ -121,9 +142,64 @@ fn card_limits() -> (u64, Option<u64>) {
 /// VI fills it on an 8 GB card).
 const CARD_MOST: u64 = 1 << 30;
 
-/// The most bytes of copies in the GPU's memory on `host` ([`card_limits`]).
+/// `VICTORY_CARD_BUFFERS_MB=auto`: the cap is the budget DXGI gives the
+/// process in the host GPU's own memory at the start
+/// (`Host::card_budget`, asked once) divided by this, in whole MiB, within
+/// [`CARD_AUTO_LEAST`] and [`CARD_AUTO_MOST`].
+///
+/// Where the 8 comes from (measured on an RTX 3070 with
+/// `VICTORY_EVICT_UNWRITTEN=1` and `VICTORY_TEXTURE_HEAPS_LEAN=1`, budget at
+/// the start 7,602,176,000 bytes = 7,250 MiB in every run): a cap of
+/// 1,024 MiB and one of 896 MiB cost no GPU time, 896 left the card 48 MB
+/// over its budget instead of 113; 768 MiB cost 79 ms of GPU time a frame
+/// and 512 MiB 114 ms, as the copies the title's compute shaders use most
+/// no longer fit. Of whole divisors only 8 puts that card's cap in the free
+/// window [896, 1024) MiB: 906 MiB (7 gives 1,035, 9 gives 805). On an RTX
+/// 4070 (budget 11,242 MiB) it gives 1,405 MiB, room for every copy the
+/// world makes with its acceleration structure builds (about 1,060 MB).
+/// The cap is not below 896 MiB on budgets of 7,168 MiB or more.
+const CARD_AUTO_SHARE: u64 = 8;
+
+/// The least cap `auto` gives (a card with a budget below 2 GiB, or a
+/// budget DXGI got wrong): copies past it stay in system memory, slower for
+/// the GPU, the same bytes.
+const CARD_AUTO_LEAST: u64 = 256 << 20;
+
+/// The most cap `auto` gives: more than every copy of the world on a 12 GB
+/// card, so a large card's budget does not reserve what no copy needs.
+const CARD_AUTO_MOST: u64 = 4 << 30;
+
+/// The cap on bytes of copies in the GPU's memory that `cap` asks for with
+/// the host GPU's memory budget `budget` (bytes, `None` where DXGI could
+/// not be asked) and `most` for an unset cap.
+fn card_cap_for(cap: CardCap, budget: Option<u64>, most: u64) -> u64 {
+    match cap {
+        CardCap::Bytes(bytes) => bytes,
+        CardCap::Default => most.min(budget.map_or(u64::MAX, |b| b / 4)),
+        CardCap::Auto => match budget {
+            Some(b) if b > 0 => ((b / CARD_AUTO_SHARE) & !((1 << 20) - 1)).clamp(CARD_AUTO_LEAST, CARD_AUTO_MOST),
+            // No budget to share: what an unset cap gives without one.
+            _ => most,
+        },
+    }
+}
+
+/// The most bytes of copies in the GPU's memory on `host` ([`card_limits`],
+/// [`card_cap_for`]), worked out and logged once.
 fn card_most(host: &crate::host::Host) -> u64 {
-    card_limits().1.unwrap_or_else(|| CARD_MOST.min(host.card_budget().map_or(u64::MAX, |b| b / 4)))
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let (cap, budget) = (card_limits().1, host.card_budget());
+        let most = card_cap_for(cap, budget, CARD_MOST);
+        let asked = match cap {
+            CardCap::Default => "unset".to_owned(),
+            CardCap::Auto => "auto".to_owned(),
+            CardCap::Bytes(b) => (b >> 20).to_string(),
+        };
+        let budget = budget.map_or("unknown".to_owned(), |b| (b >> 20).to_string());
+        tracing::info!("card buffers capped at {} MB (budget {budget} MB), VICTORY_CARD_BUFFERS_MB {asked}", most >> 20);
+        most
+    })
 }
 
 /// The smallest title buffer whose copy goes to the GPU's memory
@@ -2152,7 +2228,7 @@ pub(crate) mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        if card_limits().1.is_some() {
+        if card_limits().1 != CardCap::Default {
             return; // set by hand
         }
         let budget = host.card_budget();
@@ -2160,6 +2236,66 @@ pub(crate) mod tests {
         if let Some(budget) = budget {
             assert!(budget > 0 && card_most(host) <= budget / 4);
         }
+    }
+
+    /// Budgets DXGI gave at the start (bytes), measured: an RTX 3070
+    /// (8 GB) and an RTX 4070 (12 GB).
+    const BUDGET_8GB: u64 = 7_602_176_000;
+    const BUDGET_12GB: u64 = 11_788_091_392;
+    const MIB: u64 = 1 << 20;
+
+    /// `auto` on the 8 GB card: 906 MiB, inside the window measured free of
+    /// GPU time (896 MiB) and below the old 1 GiB.
+    #[test]
+    fn an_auto_cap_on_an_8_gb_card_lies_in_the_free_window() {
+        let cap = card_cap_for(card_cap_asked(Some("auto")), Some(BUDGET_8GB), CARD_MOST);
+        assert_eq!(cap, 906 * MIB);
+        assert!((896 * MIB..1024 * MIB).contains(&cap), "{}", cap / MIB);
+    }
+
+    /// `auto` on the 12 GB card: 1,405 MiB, more than the 1 GiB an unset cap
+    /// gives there.
+    #[test]
+    fn an_auto_cap_on_a_12_gb_card_is_larger() {
+        let cap = card_cap_for(card_cap_asked(Some("auto")), Some(BUDGET_12GB), CARD_MOST);
+        assert_eq!(cap, 1405 * MIB);
+        assert!(cap > card_cap_for(CardCap::Default, Some(BUDGET_12GB), CARD_MOST));
+    }
+
+    /// A number stays an override on any card; unset stays as it was.
+    #[test]
+    fn a_number_overrides_the_auto_cap_and_unset_stays() {
+        assert_eq!(card_cap_asked(Some("896")), CardCap::Bytes(896 * MIB));
+        assert_eq!(card_cap_asked(Some(" 0 ")), CardCap::Bytes(0));
+        for budget in [Some(BUDGET_8GB), Some(BUDGET_12GB), None] {
+            assert_eq!(card_cap_for(card_cap_asked(Some("896")), budget, CARD_MOST), 896 * MIB);
+            assert_eq!(card_cap_for(card_cap_asked(Some("0")), budget, CARD_MOST), 0);
+        }
+        assert_eq!(card_cap_for(card_cap_asked(None), Some(BUDGET_8GB), CARD_MOST), 1024 * MIB);
+        assert_eq!(card_cap_for(card_cap_asked(None), Some(BUDGET_12GB), CARD_MOST), 1024 * MIB);
+        assert_eq!(card_cap_for(card_cap_asked(None), Some(2 << 30), CARD_MOST), 512 * MIB);
+    }
+
+    /// The edges: `auto` in any case and with blanks, words and numbers too
+    /// large are unset, no budget (or 0) gives what unset gives without one,
+    /// tiny and huge budgets stay within the bounds, and the cap is whole
+    /// MiB.
+    #[test]
+    fn the_auto_cap_holds_at_its_edges() {
+        assert_eq!(card_cap_asked(Some(" AUTO ")), CardCap::Auto);
+        assert_eq!(card_cap_asked(Some("Auto")), CardCap::Auto);
+        assert_eq!(card_cap_asked(Some("lots")), CardCap::Default);
+        assert_eq!(card_cap_asked(Some("")), CardCap::Default);
+        assert_eq!(card_cap_asked(Some("18446744073709551615")), CardCap::Default, "overflows as bytes");
+        assert_eq!(card_cap_for(CardCap::Auto, None, CARD_MOST), CARD_MOST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(0), CARD_MOST), CARD_MOST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(1 << 30), CARD_MOST), CARD_AUTO_LEAST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(1), CARD_MOST), CARD_AUTO_LEAST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(64 << 30), CARD_MOST), CARD_AUTO_MOST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(u64::MAX), CARD_MOST), CARD_AUTO_MOST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(7168 * MIB), CARD_MOST), 896 * MIB, "not below 896 MiB from 7,168 MiB");
+        assert_eq!(card_cap_for(CardCap::Auto, Some(7168 * MIB - 1), CARD_MOST), 895 * MIB);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(BUDGET_8GB + 12345), CARD_MOST) % MIB, 0);
     }
 
     /// A copy in the GPU's memory: title memory reaches the GPU's side;

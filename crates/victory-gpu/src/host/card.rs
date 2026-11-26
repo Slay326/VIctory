@@ -132,8 +132,9 @@ impl Host {
 
     /// The video memory budget DXGI gives the process in the host GPU's
     /// own memory, asked once; `None` where it cannot be asked. Copies in
-    /// the GPU's memory take at most a quarter of it unless
-    /// `VICTORY_CARD_BUFFERS_MB` says otherwise (`crate::shadow`), so that
+    /// the GPU's memory take at most a quarter of it, an eighth with
+    /// `VICTORY_CARD_BUFFERS_MB=auto`, any with a number there
+    /// (`crate::shadow`), so that
     /// a card with less memory than the 8 GB they were measured on keeps
     /// room for the title's textures and targets.
     pub(crate) fn card_budget(&self) -> Option<u64> {
