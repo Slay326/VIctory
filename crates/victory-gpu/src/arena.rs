@@ -231,6 +231,8 @@ struct Stats {
     /// Builder pools given whole before their first run, and their pages.
     around_runs: u64,
     around: u64,
+    /// Addresses builder dispatches' root arguments named.
+    candidates: u64,
 }
 
 struct Arena {
@@ -377,6 +379,7 @@ pub(crate) fn want_around(address: u64) {
     }
     with(|a| {
         let page = address / PAGE;
+        a.stats.candidates += 1;
         if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
             a.around.insert(address);
         }
@@ -396,6 +399,7 @@ pub(crate) fn want_constants(values: &[u32]) {
         return;
     }
     with(|a| {
+        a.stats.candidates += candidates.len() as u64;
         for address in candidates {
             let page = address / PAGE;
             if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
@@ -897,10 +901,11 @@ pub(crate) fn log_frame() {
     let (kept_out, kept_out_bytes) = crate::shadow::card_refused();
     tracing::info!(
         target: "victory_gpu::arena",
-        "BVH arena this frame: builder pools given whole {} ({} pages); pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
+        "BVH arena this frame: builder root addresses {}, builder memory given up front {} runs ({} pages); pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
          no memory there {}, host memory {}, \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms); \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
+        s.candidates,
         s.around_runs,
         s.around,
         s.asked,
