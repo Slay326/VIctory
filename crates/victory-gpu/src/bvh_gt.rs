@@ -136,7 +136,30 @@ pub(crate) fn reader_check(submission: u64) {
         e.0 += 1;
         e.1 += u32::from(c.valid);
         if !c.valid && k == "bottom" && first.len() < 3 {
-            first.push(format!("{at:#x} {}", c.why.as_deref().unwrap_or("?")));
+            let why = c.why.as_deref().unwrap_or("?");
+            first.push(format!("{at:#x} {why}"));
+            // The first one raw: header, root node and the node the reason
+            // names last (its parent for a child box).
+            if first.len() == 1 {
+                let words = |a: u64, n: u64| -> String {
+                    (0..n).map(|i| read(a + 4 * i).map_or_else(|| "-".to_string(), |w| format!("{w:08x}"))).collect::<Vec<_>>().join(" ")
+                };
+                let node = |p: u32| u64::from(p & !7) << 3;
+                let root = read(at + 48).unwrap_or(0);
+                let named = why
+                    .rsplit("0x")
+                    .next()
+                    .and_then(|t| u32::from_str_radix(&t.chars().take_while(char::is_ascii_hexdigit).collect::<String>(), 16).ok())
+                    .unwrap_or(0);
+                tracing::info!(
+                    target: "victory_gpu::bvh_gt",
+                    "BVH GT reader s{submission} raw {at:#x}: header [{}]; root {root:#x} [{}]; named {named:#x} at +{:#x} [{}]",
+                    words(at, 16),
+                    words(at + node(root), 32),
+                    node(named),
+                    words(at + node(named), 32),
+                );
+            }
         }
     }
     let kinds: Vec<String> = by_kind.iter().map(|(k, (n, v))| format!("{k} {v}/{n}")).collect();
@@ -606,7 +629,11 @@ fn empty(b: &Aabb) -> bool {
 /// a child, the root not empty while the header counts elements; the
 /// parent table (dword 14) is checked both ways and only counted.
 pub(crate) fn check(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> Check {
-    check_with(read, base, 0)
+    // Built bottom levels put the root at exactly dword 1 x 64 with a box
+    // node there that fits the header's bounds (runs 164431, 171123: e.g.
+    // root 0x3064 at +0x18300, size 0x60c nodes): the size leaves out one
+    // node (the header's or the root's), so one more node counts as inside.
+    check_with(read, base, 64)
 }
 
 /// [`check`] with `extra` bytes added to the size dword 1 gives: 64 reads
