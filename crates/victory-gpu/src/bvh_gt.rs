@@ -122,6 +122,7 @@ pub(crate) fn reader_check(submission: u64) {
     let read = reader(&now);
     let mut by_kind: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
     let mut first = Vec::new();
+    let (mut outside, mut origin) = (0u32, 0u32);
     for &at in &last.headers {
         let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
         if !is_header(d0, d1) {
@@ -132,6 +133,10 @@ pub(crate) fn reader_check(submission: u64) {
         let start = (4..10).any(|i| read(at + 4 * i).is_some_and(|w| f32::from_bits(w).abs() == f32::MAX));
         let k = kind(d0, start);
         let c = check(&read, at);
+        if k == "bottom" {
+            outside += c.outside;
+            origin += c.origin;
+        }
         let e = by_kind.entry(k).or_default();
         e.0 += 1;
         e.1 += u32::from(c.valid);
@@ -165,7 +170,7 @@ pub(crate) fn reader_check(submission: u64) {
     let kinds: Vec<String> = by_kind.iter().map(|(k, (n, v))| format!("{k} {v}/{n}")).collect();
     tracing::info!(
         target: "victory_gpu::bvh_gt",
-        "BVH GT reader s{submission} (headers of builder s{}): valid by kind {}; first invalid bottom: {}",
+        "BVH GT reader s{submission} (headers of builder s{}): valid by kind {}; bottom child boxes outside {outside}, of them only by the origin {origin}; first invalid bottom: {}",
         last.submission,
         kinds.join(", "),
         first.join(", "),
@@ -582,6 +587,9 @@ pub(crate) struct Check {
     /// Child boxes outside their parent's box, children past the size, and
     /// empty boxes with a child.
     pub(crate) outside: u32,
+    /// Of those outside their parent's box, the ones inside it once the
+    /// parent's box takes in the origin.
+    pub(crate) origin: u32,
     /// Nodes not in what was read.
     pub(crate) missing: u32,
     /// Parent table: entries checked, matching as `table[node]` (forward)
@@ -705,6 +713,15 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
             }
             if !inside(&b, &bounds) {
                 c.outside += 1;
+                // Outside only because it reaches the origin: a box that took
+                // in a point read as zeros (runs 180153-182804).
+                let with_origin: Aabb = (
+                    [bounds.0[0].min(0.0), bounds.0[1].min(0.0), bounds.0[2].min(0.0)],
+                    [bounds.1[0].max(0.0), bounds.1[1].max(0.0), bounds.1[2].max(0.0)],
+                );
+                if inside(&b, &with_origin) {
+                    c.origin += 1;
+                }
                 fail(&mut c, format!("child box of {child:#x} outside {p:#x}'s"));
             }
             let index = i64::from(child & !7) >> 3;
