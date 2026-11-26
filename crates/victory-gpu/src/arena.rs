@@ -702,6 +702,27 @@ fn committed_around(address: u64) -> Option<(u64, u64)> {
     Some((start, end - start))
 }
 
+/// Whether misses at addresses holding no title memory are not counted as
+/// misses (`VICTORY_BVH_MISS_UNMAPPED=ignore`, off by default): no page can
+/// be given there (free memory, or the host's own), so such a miss never
+/// ends and keeps every later list's writes withheld (runs 152953-162826:
+/// 5-14 such pages a builder submission, e.g. 0x7b5d50000 in each). The
+/// console's GPU reads zeros there and drops stores, as the lists did.
+pub(crate) fn unmapped_misses_ignored() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_MISS_UNMAPPED").is_ok_and(|v| v.trim() == "ignore"))
+}
+
+/// Whether title memory can be at page address `address` (reserved or the
+/// title's committed memory); a 256 MiB region `region` with none at all.
+pub(crate) fn title_memory_at(address: u64) -> bool {
+    !matches!(memory_at(address), Memory::Free | Memory::Host)
+}
+
+pub(crate) fn title_memory_in_region(l1: usize) -> bool {
+    region_has_memory(l1)
+}
+
 /// Whether any memory (reserved or committed) lies in 256 MiB region `l1`.
 fn region_has_memory(l1: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
