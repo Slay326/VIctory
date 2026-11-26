@@ -182,6 +182,25 @@ impl Host {
         asked.ok().filter(|&(budget, _)| budget > 0)
     }
 
+    /// The process's video memory budgets and use, asked now: (local
+    /// budget, local use, shared budget, shared use) — the card's own memory
+    /// and the system memory it maps (`crate::arena`).
+    pub(crate) fn memory_usage(&self) -> Option<(u64, u64, u64, u64)> {
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries; the out pointers are live locals.
+        let asked = unsafe {
+            (|| -> windows::core::Result<(u64, u64, u64, u64)> {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+                let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(self.device.GetAdapterLuid())?;
+                let (mut local, mut shared) = (DXGI_QUERY_VIDEO_MEMORY_INFO::default(), DXGI_QUERY_VIDEO_MEMORY_INFO::default());
+                adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)?;
+                adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)?;
+                Ok((local.Budget, local.CurrentUsage, shared.Budget, shared.CurrentUsage))
+            })()
+        };
+        asked.ok().filter(|u| u.0 > 0)
+    }
+
     fn make_work(&self) -> windows::core::Result<Work> {
         let list = || -> windows::core::Result<OwnList> {
             // SAFETY: plain object creation; the list is closed until used.

@@ -97,13 +97,25 @@ fn step_pages() -> usize {
 }
 
 /// Whether reserved memory with nothing committed gets (zero) pages
-/// (`VICTORY_BVH_ARENA_RESERVED`, on). On PC 2 the builder's pools are such
-/// memory (run 132102: 134,297 missed pages from 0x730000000 on, its root
-/// descriptors there too); committed pages are given first.
+/// (`VICTORY_BVH_ARENA_RESERVED=1`; off: placeholders hold nothing to read,
+/// and on PC 2 more than 100,000 of their pages a submission were asked for,
+/// addresses computed from zeros, until the card's memory ran out, runs
+/// 135658/140104).
 fn reserved_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_RESERVED").is_ok_and(|v| v.trim() == "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_ARENA_RESERVED").is_ok_and(|v| v.trim() == "1"))
 }
+
+/// The most pages shaders' misses get a frame (`VICTORY_BVH_ARENA_FAULTS`,
+/// 512); pages prepared before the builder runs do not count.
+fn faults_per_frame() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_ARENA_FAULTS", 512))
+}
+
+/// Pages prepared after each address that looks like a structure's in the
+/// builder's input buffers (256 KiB).
+const PREPARED_PAGES: u64 = 4;
 
 /// Bytes around a builder address in reserved memory given up front (a
 /// 4 MiB window; the rest as shaders reach it).
@@ -233,6 +245,11 @@ struct Stats {
     around: u64,
     /// Addresses builder dispatches' root arguments named.
     candidates: u64,
+    /// The builder's input buffers scanned (bytes), structure addresses
+    /// found in them (pages), and pages prepared from those.
+    scanned: u64,
+    found: u64,
+    prepared: u64,
 }
 
 struct Arena {
@@ -256,8 +273,19 @@ struct Arena {
     generation: u64,
     /// Why the arena stopped growing, if it did (logged once).
     stopped: Option<String>,
+    /// Why the last chunk was not made (memory), for the frame line.
+    no_room: Option<String>,
     /// Whether its chunks were made up front ([`reserve`]).
     reserved: bool,
+    /// Whether its budget was cut to the card's ([`provide`], once).
+    capped: bool,
+    /// Pages misses got this frame ([`faults_per_frame`]).
+    faults: u64,
+    /// A builder dispatch was recorded since the last [`provide`].
+    builder_now: bool,
+    /// Title buffers (copies) the builder's root views point into: its
+    /// input lists, scanned for structure addresses before it runs.
+    inputs: BTreeSet<(u64, u64)>,
     stage: Option<(ID3D12Resource, usize)>,
     stats: Stats,
 }
@@ -285,7 +313,12 @@ fn new_arena() -> Arena {
         watched: BTreeMap::new(),
         generation: 0,
         stopped: None,
+        no_room: None,
         reserved: false,
+        capped: false,
+        faults: 0,
+        builder_now: false,
+        inputs: BTreeSet::new(),
         stage: None,
         stats: Stats::default(),
     }
@@ -296,13 +329,13 @@ fn with<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
     f(a.get_or_insert_with(new_arena))
 }
 
-/// Whether the arena's chunks are made at the first submission, before the
-/// title's textures fill the card (`VICTORY_BVH_ARENA_RESERVE`, on); off,
-/// they are made as pages are asked for, while the process uses less than
-/// 95 % of the card's budget.
+/// Whether the arena's chunks are made at the first submission
+/// (`VICTORY_BVH_ARENA_RESERVE=1`); by default they are made as pages are
+/// asked for, while the card's own and shared memory together have room
+/// ([`chunk_refused`]; up-front chunks ran PC 2 out of memory, run 135658).
 fn reserve_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_RESERVE").is_ok_and(|v| v.trim() == "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_ARENA_RESERVE").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Gives `resource` high residency priority: when the process uses more
@@ -380,6 +413,7 @@ pub(crate) fn want_around(address: u64) {
     with(|a| {
         let page = address / PAGE;
         a.stats.candidates += 1;
+        a.builder_now = true;
         if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
             a.around.insert(address);
         }
@@ -399,6 +433,7 @@ pub(crate) fn want_constants(values: &[u32]) {
         return;
     }
     with(|a| {
+        a.builder_now = true;
         a.stats.candidates += candidates.len() as u64;
         for address in candidates {
             let page = address / PAGE;
@@ -590,6 +625,16 @@ pub(crate) fn provide() {
     let Some(host) = crate::host::host() else { return };
     let mut guard = arena();
     let a = guard.get_or_insert_with(new_arena);
+    if !a.capped {
+        // At most an eighth of the card's own memory budget, below
+        // `VICTORY_BVH_ARENA_MB` (the world fills both the card and the
+        // shared memory on a 12 GB card, run 140104).
+        a.capped = true;
+        if let Some((local, ..)) = host.memory_usage() {
+            a.dir.most = a.dir.most.min((local / 8 / PAGE) as u32);
+        }
+        tracing::info!(target: "victory_gpu::arena", pages = a.dir.most, "BVH arena budget: {} MB", (u64::from(a.dir.most) * PAGE) >> 20);
+    }
     if reserve_on() && !a.reserved {
         reserve(host, a);
     }
@@ -610,8 +655,13 @@ pub(crate) fn provide() {
         if a.dir.get(address / PAGE).is_some() {
             continue;
         }
-        // A copy holds it (asked first: the walk below is not free).
-        let in_copy = crate::shadow::find(address, 1).is_some();
+        // A copy holds it (asked first: the walk below is not free): a title
+        // buffer the builder reads, scanned below.
+        let copy = crate::shadow::find(address, 1);
+        if let Some(c) = &copy {
+            a.inputs.insert(c.range());
+        }
+        let in_copy = copy.is_some();
         let Some((start, len)) = (!in_copy).then(|| committed_around(address)).flatten() else {
             a.not_title.insert(address / PAGE);
             continue;
@@ -625,6 +675,34 @@ pub(crate) fn provide() {
             if a.dir.get(page).is_none() {
                 wanted.remove(&page);
                 first.push((page, memory_at(page * PAGE)));
+            }
+        }
+    }
+    // Before the builder runs: structures its input buffers point at
+    // (256-byte aligned addresses below 2^40 in qwords), a few pages each,
+    // where committed title memory no copy holds lies. Its first run read
+    // zeros there and its stages looped for seconds (runs 131349-133206).
+    if std::mem::take(&mut a.builder_now) {
+        let found = scan_inputs(a);
+        for page in found {
+            for p in page..page + PREPARED_PAGES {
+                if a.dir.get(p).is_some() || a.nothing.contains(&p) || a.not_title.contains(&p) {
+                    break;
+                }
+                if crate::shadow::find(p * PAGE, 1).is_some() {
+                    a.not_title.insert(p);
+                    break;
+                }
+                match memory_at(p * PAGE) {
+                    m @ Memory::Committed(..) => {
+                        wanted.remove(&p);
+                        first.push((p, m));
+                    }
+                    _ => {
+                        a.nothing.insert(p);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -660,10 +738,10 @@ pub(crate) fn provide() {
     }
     let _ = looked;
     let around_pages = first.len();
-    let mut given = 0;
+    let (mut given, mut no_room_now) = (0, false);
     for (k, (page, memory)) in first.into_iter().chain(committed).chain(reserved).enumerate() {
-        if k >= around_pages && given >= step_pages() {
-            a.wanted.insert(page);
+        if k >= around_pages && (given >= step_pages() || a.faults >= faults_per_frame()) {
+            a.stats.refused += 1;
             continue;
         }
         if a.stopped.is_some() {
@@ -672,10 +750,15 @@ pub(crate) fn provide() {
         }
         let next = a.dir.next();
         if next.chunk() >= a.chunks.len() && !a.reserved {
-            if let Some(why) = chunk_refused(host, a.chunks.len()) {
-                tracing::warn!(target: "victory_gpu::arena", pages = a.dir.len(), "BVH arena stops growing: {why}");
-                a.stopped = Some(why);
+            if no_room_now {
                 a.stats.refused += 1;
+                continue;
+            }
+            if let Some(why) = chunk_refused(host, a.chunks.len()) {
+                no_room_now = true;
+                // Not for good: memory may free up (logged once per frame line).
+                a.stats.refused += 1;
+                a.no_room = Some(why);
                 continue;
             }
             let Some(chunk) = host.card_buffer(CHUNK_BYTES) else {
@@ -694,6 +777,7 @@ pub(crate) fn provide() {
                     a.stats.around += 1;
                 } else {
                     given += 1;
+                    a.faults += 1;
                 }
                 a.generation += 1;
                 if let Memory::Committed(base, watched) = memory {
@@ -734,10 +818,10 @@ pub(crate) fn provide() {
         a.stats.fill_us += started.elapsed().as_micros() as u64;
     }
     // Logged at once: a submission that hangs never reaches a frame line.
-    if a.stats.around_runs > around_runs {
+    if a.stats.around_runs > around_runs || around_pages > 0 {
         tracing::info!(
             target: "victory_gpu::arena",
-            "BVH arena: builder memory given before its run: {} runs of title memory, {} pages in this submission ({:.1} ms); arena {} of {} pages{}",
+            "BVH arena: builder memory prepared before its run: {} runs of title memory, {} pages wanted in this submission ({:.1} ms); arena {} of {} pages{}",
             a.stats.around_runs - around_runs,
             around_pages,
             around_started.elapsed().as_secs_f64() * 1e3,
@@ -753,17 +837,48 @@ pub(crate) fn provide() {
     }
 }
 
-/// Why chunk `k` is not to be made, if it is not: the card's own budget
-/// would be nearly used (95 %).
+/// Why chunk `k` is not to be made now, if it is not: the card's own and
+/// the shared memory together would be 90 % used (both ran full, run
+/// 140104: a list could not close).
 fn chunk_refused(host: &crate::host::Host, k: usize) -> Option<String> {
-    let (budget, usage) = host.card_usage()?;
-    (usage + CHUNK_BYTES > budget / 20 * 19).then(|| {
+    let (lb, lu, sb, su) = host.memory_usage()?;
+    (lu + su + CHUNK_BYTES > (lb + sb) / 10 * 9).then(|| {
         format!(
-            "chunk {k}: the process uses {} of {} MB of GPU memory",
-            usage >> 20,
-            budget >> 20
+            "chunk {k}: card {} of {} MB, shared {} of {} MB in use",
+            lu >> 20,
+            lb >> 20,
+            su >> 20,
+            sb >> 20
         )
     })
+}
+
+/// Pages that 256-byte aligned qwords (high dword 1-255) in the builder's
+/// input buffers point at, with no slot and not known to hold nothing; the
+/// bytes scanned count. At most 65,536 pages.
+fn scan_inputs(a: &mut Arena) -> BTreeSet<u64> {
+    let mut found = BTreeSet::new();
+    let mut buffer = vec![0u8; 4 << 20];
+    for &(start, len) in &a.inputs {
+        let mut at = start;
+        while at < start + len && found.len() < 1 << 16 {
+            let n = (start + len - at).min(buffer.len() as u64) as usize;
+            read_title(at, &mut buffer[..n]);
+            a.stats.scanned += n as u64;
+            for q in buffer[..n].as_chunks::<8>().0 {
+                let v = u64::from_le_bytes(*q);
+                if (1..256).contains(&(v >> 32)) && v & 0xff == 0 {
+                    let page = v / PAGE;
+                    if a.dir.get(page).is_none() && !a.nothing.contains(&page) && !a.not_title.contains(&page) {
+                        found.insert(page);
+                    }
+                }
+            }
+            at += n as u64;
+        }
+    }
+    a.stats.found += found.len() as u64;
+    found
 }
 
 fn reset_watch(at: u64, len: usize) {
@@ -910,19 +1025,25 @@ pub(crate) fn log_frame() {
     let mut guard = arena();
     let Some(a) = guard.as_mut() else { return };
     let s = std::mem::take(&mut a.stats);
-    if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs == 0 {
+    a.faults = 0;
+    let no_room = a.no_room.take();
+    if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs + s.scanned == 0 {
         return;
     }
     let (kept_out, kept_out_bytes) = crate::shadow::card_refused();
     tracing::info!(
         target: "victory_gpu::arena",
-        "BVH arena this frame: builder root addresses {}, builder memory given up front {} runs ({} pages); pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
+        "BVH arena this frame: input buffers scanned {} MB -> {} structure pages; prepared before the builder ran {} pages; builder root addresses {}, \
+         builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
          no memory there {}, host memory {}, \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms); \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
+        s.scanned >> 20,
+        s.found,
+        s.around,
         s.candidates,
         s.around_runs,
-        s.around,
+        no_room.as_deref().unwrap_or("no"),
         s.asked,
         s.filled + s.zero,
         s.filled,
