@@ -299,6 +299,13 @@ struct Stats {
     evicted: u64,
     /// Pages of unwatched title memory sent up again.
     unwatched_sent: u64,
+    /// Unwatched pages builder dispatches read: named (before the cap),
+    /// read and compared, sent up because their bytes changed, and the
+    /// time taken ([`refresh_builder_reads`]).
+    reads_named: u64,
+    reads_checked: u64,
+    reads_sent: u64,
+    reads_us: u64,
     nothing: u64,
     regions: u64,
     writes: u64,
@@ -365,6 +372,14 @@ struct Arena {
     /// and where the last refresh of them ended.
     unwatched: BTreeSet<u64>,
     unwatched_cursor: u64,
+    /// Addresses builder dispatches' root arguments named since the last
+    /// [`provide`], pages with a slot or not ([`refresh_builder_reads`]).
+    builder_reads: BTreeSet<u64>,
+    /// Structure pages each input list pointed at when last scanned.
+    input_pointers: BTreeMap<(u64, u64), Vec<u64>>,
+    /// Unwatched pages: the hash of the bytes last sent up, and the frame
+    /// they were last compared in.
+    sent: std::collections::HashMap<u64, (u64, u64)>,
     /// Missed pages without a slot: in how many frames, and the last one
     /// ([`want_pages`]; old entries pruned in [`log_frame`]).
     misses: std::collections::HashMap<u64, (u32, u64)>,
@@ -412,6 +427,9 @@ fn new_arena() -> Arena {
         evict_cursor: 0,
         unwatched: BTreeSet::new(),
         unwatched_cursor: 0,
+        builder_reads: BTreeSet::new(),
+        input_pointers: BTreeMap::new(),
+        sent: std::collections::HashMap::new(),
         misses: std::collections::HashMap::new(),
         builder_now: false,
         scans: 0,
@@ -554,6 +572,9 @@ pub(crate) fn want_around(address: u64) {
         let page = address / PAGE;
         a.stats.candidates += 1;
         a.builder_now = true;
+        if reads_most() > 0 {
+            a.builder_reads.insert(address);
+        }
         if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
             a.around.insert(address);
         }
@@ -576,6 +597,9 @@ pub(crate) fn want_constants(values: &[u32]) {
         a.builder_now = true;
         a.stats.candidates += candidates.len() as u64;
         for address in candidates {
+            if reads_most() > 0 {
+                a.builder_reads.insert(address);
+            }
             let page = address / PAGE;
             if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
                 a.around.insert(address);
@@ -862,7 +886,8 @@ pub(crate) fn provide() {
     // (256-byte aligned addresses below 2^40 in qwords), a few pages each,
     // where committed title memory no copy holds lies. Its first run read
     // zeros there and its stages looped for seconds (runs 131349-133206).
-    if std::mem::take(&mut a.builder_now) {
+    let builder = std::mem::take(&mut a.builder_now);
+    if builder {
         let found = scan_inputs(a);
         for page in found {
             for p in page..page + PREPARED_PAGES {
@@ -997,6 +1022,10 @@ pub(crate) fn provide() {
     }
     evict_for_persistent(a, evict_for, &mut fills);
     refresh_unwatched(a, &mut fills);
+    let reads = std::mem::take(&mut a.builder_reads);
+    if builder {
+        refresh_builder_reads(a, &reads, &mut fills);
+    }
     // Pages that took title memory go up: write tracking is reset first, so
     // a write while they are read goes up at the next refresh.
     let pieces: Vec<(Slot, u64, u64)> = fills
@@ -1098,6 +1127,7 @@ fn evict_for_persistent(a: &mut Arena, wanted: Vec<(u64, Memory)>, fills: &mut V
         a.dir.remove(old);
         a.watched.remove(&old);
         a.unwatched.remove(&old);
+        a.sent.remove(&old);
         let Ok((slot, _)) = a.dir.add(page) else { continue };
         a.generation += 1;
         a.stats.evicted += 1;
@@ -1140,6 +1170,123 @@ fn refresh_unwatched(a: &mut Arena, fills: &mut Vec<(Slot, u64)>) {
     }
 }
 
+/// Most unwatched pages a builder submission reads that are compared with
+/// title memory and sent up again if changed
+/// (`VICTORY_BVH_ARENA_REFRESH_READS=<pages>`, 0 = off; local test).
+fn reads_most() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_ARENA_REFRESH_READS", 0) as usize)
+}
+
+/// Pages a builder dispatch reads that hold unwatched title memory, each
+/// once and at most `most`: from each root address's page the
+/// [`AROUND_WINDOW`] after it (`windows`), from each structure page its
+/// input lists point at the [`PREPARED_PAGES`] after it (`pointed`); only
+/// those with a slot (`has_slot`), filled from unwatched memory and not
+/// written by shaders (those keep the builder's bytes).
+fn unwatched_reads(
+    windows: &[u64],
+    pointed: &[u64],
+    has_slot: impl Fn(u64) -> bool,
+    unwatched: &BTreeSet<u64>,
+    shader_pages: &HashSet<u64>,
+    most: usize,
+) -> Vec<u64> {
+    let spans = windows
+        .iter()
+        .map(|&p| (p, AROUND_WINDOW / PAGE))
+        .chain(pointed.iter().map(|&p| (p, PREPARED_PAGES)));
+    let mut seen = HashSet::new();
+    let mut pages = Vec::new();
+    for (first, n) in spans {
+        for p in first..first + n {
+            if pages.len() >= most {
+                return pages;
+            }
+            if unwatched.contains(&p) && !shader_pages.contains(&p) && has_slot(p) && seen.insert(p) {
+                pages.push(p);
+            }
+        }
+    }
+    pages
+}
+
+/// A 64-bit hash of a page's bytes (to tell whether they changed).
+fn page_hash(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for q in bytes.as_chunks::<8>().0 {
+        h = (h ^ u64::from_le_bytes(*q)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(29);
+    }
+    h
+}
+
+/// Whether `page`'s bytes differ from those last sent up (or none were
+/// recorded); records them as sent, compared in `frame`.
+fn changed_since_sent(sent: &mut std::collections::HashMap<u64, (u64, u64)>, page: u64, bytes: &[u8], frame: u64) -> bool {
+    let h = page_hash(bytes);
+    match sent.insert(page, (h, frame)) {
+        Some((old, _)) => old != h,
+        None => true,
+    }
+}
+
+/// Before a builder submission (`VICTORY_BVH_ARENA_REFRESH_READS`): the
+/// unwatched pages its dispatches read (root addresses and what its input
+/// lists point at, [`unwatched_reads`]) are read from title memory, and
+/// those whose bytes changed since they were last sent go up again. Such
+/// pages kept the bytes they had when they got their slot: with complete
+/// inputs the builder's bottom levels took in points at the origin (runs
+/// 184001-185839: 46-70 % of the child boxes outside their parent's were
+/// outside only by the origin), and sending every unwatched page again in
+/// turn cost too much (run 185839). Each page is compared once a frame.
+fn refresh_builder_reads(a: &mut Arena, reads: &BTreeSet<u64>, fills: &mut Vec<(Slot, u64)>) {
+    let most = reads_most();
+    if most == 0 || a.unwatched.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (mut windows, mut pointed) = (Vec::new(), Vec::new());
+    let mut lists = BTreeSet::new();
+    for &address in reads {
+        match crate::shadow::holding(address) {
+            Some(range) => {
+                lists.insert(range);
+            }
+            None => windows.push(address / PAGE),
+        }
+    }
+    for range in &lists {
+        if let Some(pages) = a.input_pointers.get(range) {
+            pointed.extend_from_slice(pages);
+        }
+    }
+    windows.dedup();
+    let filling: HashSet<u64> = fills.iter().map(|&(_, at)| at / PAGE).collect();
+    let dir = &a.dir;
+    let pages = unwatched_reads(&windows, &pointed, |p| dir.get(p).is_some(), &a.unwatched, &a.shader_pages, usize::MAX);
+    a.stats.reads_named += pages.len() as u64;
+    let frame = FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    let mut bytes = vec![0u8; PAGE as usize];
+    let mut checked = 0;
+    for p in pages {
+        if checked >= most {
+            break;
+        }
+        if filling.contains(&p) || a.sent.get(&p).is_some_and(|e| e.1 == frame) {
+            continue;
+        }
+        let Some(slot) = a.dir.get(p) else { continue };
+        checked += 1;
+        read_title(p * PAGE, &mut bytes);
+        if changed_since_sent(&mut a.sent, p, &bytes, frame) {
+            fills.push((slot, p * PAGE));
+            a.stats.reads_sent += 1;
+        }
+    }
+    a.stats.reads_checked += checked as u64;
+    a.stats.reads_us += started.elapsed().as_micros() as u64;
+}
+
 /// Why chunk `k` is not to be made now, if it is not: the card's own and
 /// the shared memory together would be 90 % used (both ran full, run
 /// 140104: a list could not close).
@@ -1176,7 +1323,9 @@ fn scan_inputs(a: &mut Arena) -> BTreeSet<u64> {
     for &range in &due {
         a.scanned_at.insert(range, scans);
     }
+    let keep = reads_most() > 0;
     for &(start, len) in &due {
+        let mut pointed = BTreeSet::new();
         let mut at = start;
         while at < start + len && found.len() < 1 << 16 {
             let n = (start + len - at).min(buffer.len() as u64) as usize;
@@ -1186,12 +1335,18 @@ fn scan_inputs(a: &mut Arena) -> BTreeSet<u64> {
                 let v = u64::from_le_bytes(*q);
                 if (1..256).contains(&(v >> 32)) && v & 0xff == 0 {
                     let page = v / PAGE;
+                    if keep && pointed.len() < 1 << 14 {
+                        pointed.insert(page);
+                    }
                     if a.dir.get(page).is_none() && !a.nothing.contains(&page) && !a.not_title.contains(&page) {
                         found.insert(page);
                     }
                 }
             }
             at += n as u64;
+        }
+        if keep {
+            a.input_pointers.insert((start, len), pointed.into_iter().collect());
         }
     }
     a.stats.found += found.len() as u64;
@@ -1375,7 +1530,7 @@ pub(crate) fn log_frame() {
         target: "victory_gpu::arena",
         "BVH arena this frame: input buffers scanned {} MB -> {} structure pages; prepared before the builder ran {} pages; builder root addresses {}, \
          builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, slots taken back for pages missed in many frames {}, unwatched pages sent again {} (of {}), \
-         no memory there {}, host memory {}, below 256 MiB {}, missed in too few frames {} (tracked {}), \
+         unwatched pages builders read {} -> compared {} -> changed and sent {} ({:.1} ms), no memory there {}, host memory {}, below 256 MiB {}, missed in too few frames {} (tracked {}), \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms), not sent (page written by shaders) {}; \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
         s.scanned >> 20,
@@ -1394,6 +1549,10 @@ pub(crate) fn log_frame() {
         s.evicted,
         s.unwatched_sent,
         a.unwatched.len(),
+        s.reads_named,
+        s.reads_checked,
+        s.reads_sent,
+        s.reads_us as f64 / 1e3,
         s.nothing,
         s.host,
         s.low,
@@ -1468,6 +1627,37 @@ pub(crate) mod tests {
         assert!(found.contains(&(0x0d72_27a4u64 << 8)), "{found:x?}");
         assert!(!found.iter().any(|&a| a == 5768 << 8 || a < 1 << 32), "small values are no addresses: {found:x?}");
         assert!(constant_addresses(&[1, 0x300, 0x400]).is_empty());
+    }
+
+    #[test]
+    fn a_builders_unwatched_pages_go_up_again_when_title_memory_changed() {
+        // Pages 0x100-0x10f: a root address's window; 0x200-0x203: a
+        // structure its input list points at; 0x300: read by nobody.
+        let mut d = Directory::new(64);
+        for p in [0x100, 0x105, 0x10f, 0x110, 0x202, 0x204, 0x300, 0x101] {
+            d.add(p).unwrap();
+        }
+        let unwatched: BTreeSet<u64> = [0x100, 0x105, 0x10f, 0x110, 0x202, 0x204, 0x300].into();
+        let shader_pages: HashSet<u64> = [0x105].into();
+        let has = |p| d.get(p).is_some();
+        let pages = unwatched_reads(&[0x100, 0x100], &[0x200], has, &unwatched, &shader_pages, usize::MAX);
+        // 0x101 is watched (its writes go up anyway), 0x105 written by
+        // shaders, 0x110 past the window, 0x204 past the structure's pages,
+        // 0x300 not read; 0x100 once although named twice.
+        assert_eq!(pages, [0x100, 0x10f, 0x202]);
+        assert_eq!(unwatched_reads(&[0x100], &[0x200], has, &unwatched, &shader_pages, 1), [0x100], "at most `most`");
+        // A page goes up the first time, not again while title memory keeps
+        // its bytes, and again once the title wrote to it.
+        let mut sent = std::collections::HashMap::new();
+        let mut bytes = vec![0u8; PAGE as usize];
+        assert!(changed_since_sent(&mut sent, 0x100, &bytes, 1));
+        assert!(!changed_since_sent(&mut sent, 0x100, &bytes, 2));
+        bytes[0x8000] = 1;
+        assert!(changed_since_sent(&mut sent, 0x100, &bytes, 3), "a write to the page");
+        bytes[0x8000] = 0;
+        bytes[PAGE as usize - 1] = 7;
+        assert!(changed_since_sent(&mut sent, 0x100, &bytes, 4), "a write to its last byte");
+        assert_eq!(sent[&0x100].1, 4, "compared in frame 4");
     }
 
     #[test]
