@@ -40,6 +40,9 @@
 //!   classified region are counted, not replayed. Views of one section are
 //!   not aliased (each range its own pool). `REGION` and `remap` records are
 //!   counted only.
+//! - `gpu_w_copy` (copy steps, texture read-backs) writes title memory
+//!   directly, as the engine does, and marks the page changed; the copy
+//!   gets the bytes too; it is not copied back ([`Replay::gpu_copy`]).
 //! - Bytes are sampled: a write record (CPU, or GPU: `gpu_w_back`,
 //!   `gpu_w_copy`) writes its first and last byte and one at each 4 KiB
 //!   boundary in it; the byte before and after it are checked as guards.
@@ -954,7 +957,8 @@ impl<M: MemModel> Replay<M> {
                             self.gpu_read(r, from, to)
                         }
                         f::GPU_W_DECL => self.gpu_decl(r, from, to),
-                        f::GPU_W_BACK | f::GPU_W_COPY => self.gpu_write(r, from, to),
+                        f::GPU_W_BACK => self.gpu_write(r, from, to),
+                        f::GPU_W_COPY => self.gpu_copy(r, from, to),
                         _ => {
                             self.regions[r].counts.other += 1;
                             if flag & (f::GPU_W_MARK | f::GPU_W_KEPT) != 0
@@ -1208,6 +1212,38 @@ impl<M: MemModel> Replay<M> {
                 .expect("replayed")
                 .write_host(at, &[v]);
             self.sub_gpu.insert((r, off), v);
+        }
+        self.watch_guards(r, from, to);
+    }
+
+    /// A copy step or texture read-back into title memory (`gpu_w_copy`):
+    /// the engine writes title memory itself (`host::copy_mapped`,
+    /// `host::write_mapped` under `watch::writing`), never through a
+    /// copy-back, and the page counts as changed, so the copy takes it again
+    /// at its next refresh. Here the copy gets the bytes as well (as at that
+    /// refresh), so that a model refreshing no GPU-only page still has them
+    /// (unverified, for Fable: today's engine writes title memory only, a
+    /// stage 3 model that skips the refresh needs the copy step to write
+    /// the copy too). Not a CPU touch: the model is not asked.
+    /// (Replayed as a GPU write into the copy, these bytes went back through
+    /// `copy_back_page`, whose "title wrote the page" branch dropped them:
+    /// H-02's red replay.)
+    fn gpu_copy(&mut self, r: usize, from: u64, to: u64) {
+        let reg = &mut self.regions[r];
+        reg.counts.gpu_write += 1;
+        if reg.class.class == Class::CpuOnly {
+            reg.counts.contradictions += 1;
+        }
+        let at = self.regions[r].p + from as usize;
+        let _writing = crate::watch::writing(at, (to - from) as usize);
+        for off in self.samples(from, to) {
+            let v = self.next_value(self.truth(r, off));
+            // SAFETY: a byte of the region's pool, opened by `_writing`.
+            unsafe { ((self.regions[r].p + off as usize) as *mut u8).write_volatile(v) };
+            let pool = self.regions[r].p as u64 + off;
+            self.regions[r].copy.as_ref().expect("replayed").write_host(pool, &[v]);
+            self.regions[r].truth.insert(off, v);
+            self.sub_gpu.remove(&(r, off));
         }
         self.watch_guards(r, from, to);
     }

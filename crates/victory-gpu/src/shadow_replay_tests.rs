@@ -763,3 +763,41 @@ fn streams_failing_the_self_check_are_invalid() {
     let early = self_check(&read_stream(&w.end()).unwrap());
     assert!(early.iter().any(|b| b.contains("not begun")), "{early:?}");
 }
+
+/// H-02: a copy step into a page of S the title wrote elsewhere since the
+/// take (the PC 1 capture's first root: SYNC up, `cpu_w_title` at another
+/// offset, then `gpu_w_copy`, nothing declared).
+fn a_copy_into_a_page_the_title_wrote() -> Vec<u8> {
+    let mut w = W::new();
+    w.submit(1);
+    w.access(f::GPU_R_REFRESH, S, P);
+    w.sync(0, S, P);
+    w.point(0);
+    w.point(1);
+    w.point(2);
+    w.access(f::CPU_W_TITLE, S + 0xf940, 1);
+    w.frame();
+    w.submit(1);
+    w.access(f::GPU_W_COPY, S + 0xc088, 0x88);
+    w.access(f::GPU_R_REFRESH, S, P);
+    w.sync(0, S, P);
+    w.point(0);
+    w.point(1);
+    w.point(2);
+    w.access(f::CPU_W_TITLE, S + 0xc088, 1);
+    w.frame();
+    w.end()
+}
+
+/// The engine writes a copy step's bytes into title memory itself; the
+/// replay must too (as a GPU write into the copy they went back through
+/// `copy_back_page`, which kept the title's bytes: red, H-02).
+#[test]
+fn a_copy_step_reaches_title_memory_beside_a_title_write() {
+    let Some(r) = replay(&classes(Class::Shared), Today, &a_copy_into_a_page_the_title_wrote()) else {
+        return; // no host GPU here
+    };
+    let report = r.report();
+    assert_eq!(r.violations(), [0; 3], "{report}");
+    assert!(r.checks()[0] > 0 && r.checks()[1] > 0, "{report}");
+}
