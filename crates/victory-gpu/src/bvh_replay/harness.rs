@@ -59,6 +59,44 @@ pub struct Options {
     /// Run an incomplete capture anyway, for its output; the verdict stays
     /// CAPTURE INVALID.
     pub diagnose: bool,
+    /// T2 (inputs): pre pages to replace, by title page address: their
+    /// bytes by zeros (the CPU side is known to be zero), or their page
+    /// table entry by the null pair (reads give 0 and mark the page, so the
+    /// run shows which of them the dispatches touch).
+    pub replace: BTreeMap<u64, Replace>,
+}
+
+/// How [`Options::replace`] replaces a pre page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replace {
+    Zero,
+    Null,
+}
+
+/// Parses a `--replace` file: a line per page, `<address> zero|null`
+/// (address in hex with `0x`, cut to its 64 KiB page); `#` starts a comment.
+pub fn parse_replace(text: &str) -> anyhow::Result<BTreeMap<u64, Replace>> {
+    let mut m = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        let at = f.next().unwrap_or("");
+        let at = u64::from_str_radix(
+            at.strip_prefix("0x").with_context(|| format!("line {}: address needs 0x", n + 1))?,
+            16,
+        )
+        .with_context(|| format!("line {}: bad address", n + 1))?;
+        let how = match f.next() {
+            Some("zero") => Replace::Zero,
+            Some("null") => Replace::Null,
+            w => bail!("line {}: zero or null, not {w:?}", n + 1),
+        };
+        m.insert(at & !(PAGE - 1), how);
+    }
+    Ok(m)
 }
 
 impl Options {
@@ -72,6 +110,7 @@ impl Options {
             warp: false,
             dump: None,
             diagnose: false,
+            replace: BTreeMap::new(),
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -82,6 +121,12 @@ impl Options {
                 "--card" => o.card_only = true,
                 "--warp" => o.warp = true,
                 "--diagnose" => o.diagnose = true,
+                "--replace" => {
+                    let f = it.next().context("--replace needs a file")?;
+                    o.replace = parse_replace(
+                        &std::fs::read_to_string(f).with_context(|| f.to_string())?,
+                    )?;
+                }
                 "--dump" => {
                     o.dump = Some(PathBuf::from(it.next().context("--dump needs a folder")?))
                 }
@@ -91,7 +136,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--replace <file>]"
             );
         }
         Ok(o)
@@ -339,7 +384,9 @@ pub struct RunResult {
 fn run_once(gpu: &mut Gpu, l: &mut Loaded, o: &Options) -> anyhow::Result<RunResult> {
     let c = l.capture.clone();
     let pre: Vec<PageRec> = c.pages_of(Stage::Pre).cloned().collect();
-    let captured: BTreeSet<u64> = pre.iter().map(|p| p.address & !(PAGE - 1)).collect();
+    let mut captured: BTreeSet<u64> = pre.iter().map(|p| p.address & !(PAGE - 1)).collect();
+    // T2: nulled pages get the null pair (as if not captured).
+    captured.retain(|a| o.replace.get(a) != Some(&Replace::Null));
     // Segments to make: those with captured pages, root views, indirect arguments.
     let mut wanted: BTreeSet<u32> = pre.iter().map(|p| p.seg).collect();
     let seg_of = |at: u64| -> Option<u32> {
@@ -514,7 +561,10 @@ fn run_once(gpu: &mut Gpu, l: &mut Loaded, o: &Options) -> anyhow::Result<RunRes
         if !segs.contains_key(&p.seg) {
             continue;
         }
-        let bytes = l.bytes(p)?;
+        let mut bytes = l.bytes(p)?;
+        if o.replace.get(&(p.address & !(PAGE - 1))) == Some(&Replace::Zero) {
+            bytes.fill(0);
+        }
         if used + PAGE > STAGE {
             flush(gpu, &mut batch)?;
             used = 0;
@@ -1020,6 +1070,36 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         union.len(),
         common.len()
     );
+    // T2: which replaced pages the runs touched (a nulled page marks its
+    // entry when read or written).
+    if !o.replace.is_empty() {
+        let zero = o.replace.values().filter(|&&r| r == Replace::Zero).count();
+        println!(
+            "replace: {} pages zeroed, {} nulled",
+            zero,
+            o.replace.len() - zero
+        );
+        let mut touched_union = BTreeSet::new();
+        for (k, r) in results.iter().enumerate() {
+            let touched: BTreeSet<u64> = r
+                .bitmap
+                .iter()
+                .filter_map(|&e| c.table.address_of(e as usize))
+                .filter(|a| o.replace.get(a) == Some(&Replace::Null))
+                .collect();
+            println!(
+                "run {k}: nulled pages touched {}: {}",
+                touched.len(),
+                touched.iter().take(32).map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ")
+            );
+            touched_union.extend(touched);
+        }
+        println!(
+            "nulled pages touched over {} runs (all): {}",
+            results.len(),
+            touched_union.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ")
+        );
+    }
     // Determinism.
     let all_pages: BTreeSet<u64> = results
         .iter()
@@ -1143,4 +1223,23 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         started.elapsed().as_secs_f64()
     );
     Ok(if reproduced { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::*;
+
+    #[test]
+    fn a_replace_file_names_pages_and_how() {
+        let m = parse_replace("# T2
+0xd7b797000 zero
+
+0x100b790010 null # x
+").unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&0xd7b790000), Some(&Replace::Zero));
+        assert_eq!(m.get(&0x100b790000), Some(&Replace::Null));
+        assert!(parse_replace("0x10000 poison").is_err());
+        assert!(parse_replace("10000 zero").is_err());
+    }
 }
