@@ -313,6 +313,7 @@ impl Drop for Heap {
         // inside the heaps' lock (`memory::bind`), never the other way
         // round, so it is taken here after the heaps' lock is let go.
         drop(heaps);
+        VIEW_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(_, _, h)| h != at);
         crate::memory::release(at);
     }
 }
@@ -449,9 +450,13 @@ pub(crate) enum View {
 /// generation, so descriptors (and host slots made from them) naming the
 /// old one go stale instead of naming whatever is made at the same address
 /// next.
-/// shortcut: views without a resource object (constant buffers, memory
-/// views, samplers) are kept for the run; they are bounded by the title's
-/// memory and sampler states.
+/// Views without a resource object (constant buffers, memory views,
+/// samplers) have no release to end them: kept for the run, unless
+/// `VICTORY_VIEW_RECLAIM` sweeps the view heaps for the records still in
+/// them ([`sweep`]). Grand Theft Auto VI makes new memory views every
+/// frame (buffer views into its rings at ever new offsets): kept, their
+/// list doubled to 1088 MB and the heap grew ~2.3 GB in 8 minutes (run
+/// 20261126-124332, `descriptor::record` from `create_placed_srv`).
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -459,6 +464,8 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// The frame each entry was last made or looked up in.
+    touched: Vec<u32>,
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
@@ -466,7 +473,138 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    touched: Vec::new(),
 });
+
+/// Every view heap (shader-visible or not): start, end, heap. The records
+/// in them are what keeps resource-less views alive ([`sweep`]).
+static VIEW_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The frame stamp for `Views::touched`.
+fn frame_now() -> u32 {
+    crate::queue::presented() as u32
+}
+
+impl Views {
+    fn touch(&mut self, i: u32, now: u32) {
+        if let Some(t) = self.touched.get_mut(i as usize) {
+            *t = now;
+        }
+    }
+}
+
+/// Whether a view lives until no record names it: no resource object
+/// whose release ends it (samplers stay: few, and in sampler heaps).
+fn reclaimable(view: &View) -> bool {
+    matches!(view, View::Placed(..) | View::Constant(..))
+}
+
+/// Entries named by current records in view heap memory `heaps` (start,
+/// end), as a bit set over the entries of generations `generations` (a
+/// stale record keeps nothing).
+fn mark(heaps: &[(u64, u64)], generations: &[u32]) -> Vec<u64> {
+    let len = generations.len();
+    let mut live = vec![0u64; len.div_ceil(64)];
+    for &(start, end) in heaps {
+        let mut at = start;
+        while at + 32 <= end {
+            // SAFETY: a live view heap's descriptor slot (32 bytes).
+            let [tag, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG && generations.get(i as usize) == Some(&generation) {
+                live[i as usize / 64] |= 1 << (i % 64);
+            }
+            at += 32;
+        }
+    }
+    live
+}
+
+/// Frees the reclaimable entries among the first `live.len() * 64` that no
+/// record named (`live`) and nothing made or looked up within `grace`
+/// frames of `now`: under a new generation, so a record copied away unseen
+/// goes stale (a null view) instead of naming the next view made there.
+/// Returns how many it freed.
+fn reclaim(views: &mut Views, live: &[u64], now: u32, grace: u32) -> usize {
+    let mut freed = 0;
+    let len = views.list.len().min(live.len() * 64);
+    for i in 0..len {
+        if live[i / 64] >> (i % 64) & 1 != 0 || now.wrapping_sub(views.touched[i]) <= grace {
+            continue;
+        }
+        let view = &views.list[i].0;
+        if !reclaimable(view) || views.index.get(view) != Some(&(i as u32)) {
+            continue;
+        }
+        let view = view.clone();
+        views.index.remove(&view);
+        views.list[i].1 = views.list[i].1.wrapping_add(1).max(1);
+        views.free.push(i as u32);
+        freed += 1;
+    }
+    freed
+}
+
+/// Entries the sweeps freed, the last sweep's duration in microseconds,
+/// and the entries it found named.
+pub(crate) static RECLAIMED: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Frames between sweeps (`VICTORY_VIEW_RECLAIM`; 0, the default: never).
+fn sweep_period() -> u64 {
+    static PERIOD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        std::env::var("VICTORY_VIEW_RECLAIM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// At a presented frame: every `VICTORY_VIEW_RECLAIM` frames, frees the
+/// resource-less views no view heap names any more, on a thread of its
+/// own (the world's heaps take milliseconds to scan). Entries made or
+/// looked up since the sweep before stay (a record on its way between
+/// heaps).
+pub(crate) fn sweep() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    let period = sweep_period();
+    if period == 0 || crate::queue::presented() % period != 0 || RUNNING.swap(true, Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("view sweep".into()).spawn(move || {
+        let started = std::time::Instant::now();
+        let begun = frame_now();
+        let generations: Vec<u32> =
+            VIEWS.lock().unwrap_or_else(|e| e.into_inner()).list.iter().map(|&(_, g)| g).collect();
+        // Heaps stay alive while registered, and they stay registered while
+        // the lock is held (`Heap::drop`).
+        let live = {
+            let heaps = VIEW_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let ranges: Vec<(u64, u64)> = heaps.iter().map(|&(s, e, _)| (s, e)).collect();
+            mark(&ranges, &generations)
+        };
+        let named: u64 = live.iter().map(|w| u64::from(w.count_ones())).sum();
+        let freed = {
+            let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let now = frame_now();
+            // Since the scan began, plus a period.
+            let grace = now.wrapping_sub(begun).saturating_add(period as u32);
+            reclaim(&mut views, &live, now, grace)
+        };
+        RECLAIMED[0].fetch_add(freed as u64, Relaxed);
+        RECLAIMED[1].store(started.elapsed().as_micros() as u64, Relaxed);
+        RECLAIMED[2].store(named, Relaxed);
+        RUNNING.store(false, Relaxed);
+    });
+    if spawned.is_err() {
+        RUNNING.store(false, Relaxed);
+    }
+}
+
+/// Entries in the view list, free among them, and freed by sweeps so far.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn view_counts() -> (usize, usize, u64) {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    (views.list.len(), views.free.len(), RECLAIMED[0].load(std::sync::atomic::Ordering::Relaxed))
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -495,6 +633,7 @@ fn record(handle: u64, view: View) {
                 }
                 None => {
                     views.list.push((view.clone(), 1));
+                    views.touched.push(0);
                     views.list.len() as u32 - 1
                 }
             };
@@ -506,6 +645,7 @@ fn record(handle: u64, view: View) {
         }
     };
     let generation = views.list[i as usize].1;
+    views.touch(i, frame_now());
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -537,19 +677,29 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    let found = (*current == generation).then(|| view.clone());
+    if found.is_some() {
+        views.touch(i, frame_now());
+    }
+    found
 }
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = frame_now();
     records
         .iter()
         .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            let current =
+                tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation);
+            if current {
+                views.touch(i, now);
+            }
+            current
         })
         .collect()
 }
@@ -561,9 +711,13 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    let found = (tag == VIEW_TAG && *current == generation).then(|| view.clone());
+    if found.is_some() {
+        views.touch(i, frame_now());
+    }
+    found
 }
 
 /// A description of `N` words, if the title passes one.
@@ -793,6 +947,12 @@ pub(crate) extern "system" fn create_heap(
     }
     #[cfg(not(windows))]
     let _ = visible;
+    // Removed again in `Heap::drop` (Windows only, as the sweep).
+    #[cfg(windows)]
+    if desc.kind == VIEWS_KIND {
+        let at = std::ptr::from_ref::<Heap>(&heap) as usize;
+        VIEW_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push((start, start + size, at));
+    }
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
@@ -847,6 +1007,74 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    fn placed(n: u32) -> View {
+        View::Placed(false, [1; 14], [n; 16])
+    }
+
+    fn views_of(list: Vec<View>, touched: u32) -> Views {
+        let mut views = Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            touched: Vec::new(),
+        };
+        for (i, v) in list.into_iter().enumerate() {
+            views.index.insert(v.clone(), i as u32);
+            views.list.push((v, 1));
+            views.touched.push(touched);
+        }
+        views
+    }
+
+    /// Memory views no view heap names any more are freed under a new
+    /// generation; named ones, recently used ones and views of resources
+    /// stay (the world's new ring views each frame doubled the list to
+    /// 1088 MB, run 20261126-124332).
+    #[test]
+    fn memory_views_no_heap_names_are_reclaimed() {
+        let mut views = views_of(
+            vec![placed(0), placed(1), View::Shader(0x7777_0000, None), View::Constant(0x1000, 256), placed(4)],
+            10,
+        );
+        views.touched[4] = 95;
+        // A heap of 4 slots naming entry 1, a stale record of entry 3 and
+        // garbage that is no record.
+        let mut heap = [[0u32; 8]; 4];
+        heap[2][..3].copy_from_slice(&[VIEW_TAG, 1, 1]);
+        heap[3][..3].copy_from_slice(&[0x1234, 0, 1]);
+        heap[1][..3].copy_from_slice(&[VIEW_TAG, 3, 7]);
+        let start = heap.as_ptr() as u64;
+        let generations: Vec<u32> = views.list.iter().map(|&(_, g)| g).collect();
+        let live = mark(&[(start, start + 4 * 32)], &generations);
+        assert_eq!(live, [0b10]);
+        let freed = reclaim(&mut views, &live, 100, 20);
+        assert_eq!(freed, 2, "entries 0 and 3: unnamed memory views, idle");
+        assert_eq!(views.free, [0, 3]);
+        assert_eq!(views.list[0].1, 2, "a new generation: old records go stale");
+        assert_eq!(views.list[1].1, 1, "named by a heap");
+        assert_eq!(views.list[2].1, 1, "a resource's view ends with the resource");
+        assert_eq!(views.list[4].1, 1, "used within the grace");
+        assert_eq!(views.index.get(&placed(0)), None);
+        assert_eq!(views.index.get(&placed(1)), Some(&1));
+        // Swept again: nothing more, freed entries are not freed twice.
+        assert_eq!(reclaim(&mut views, &live, 200, 20), 1, "entry 4 idle by now");
+        assert_eq!(reclaim(&mut views, &live, 300, 20), 0);
+        assert_eq!(views.free, [0, 3, 4]);
+    }
+
+    /// A list grown since the scan keeps its new entries.
+    #[test]
+    fn entries_made_after_the_scan_stay() {
+        let mut views = views_of(vec![placed(0), placed(1), placed(2)], 0);
+        let live = mark(&[], &[1]);
+        assert_eq!(live.len(), 1);
+        // 64 entries covered by the bit set; the list holds 3, all unnamed.
+        views.touched[2] = 50;
+        assert_eq!(reclaim(&mut views, &live, 50, 10), 2);
+        assert_eq!(views.free, [0, 1]);
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
