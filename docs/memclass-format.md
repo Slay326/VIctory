@@ -39,13 +39,15 @@ The same bits are used in the log (`ever=0x....`) and in the stream (`flag`).
 | 2 | `cpu_r_after_gpu` | reserved, hook `memclass::cpu_read` not called | F1 question 3 open; never set in v1 |
 | 3 | `gpu_w_mark` | `copy_back_marks`: pages shaders marked (also marked pages withheld) | 64 KiB |
 | 4 | `gpu_w_decl` | `Shadow::writing`: range a submission declares shaders write | may over-cover |
-| 5 | `gpu_w_back` | `write_runs_by`: spans a copy-back writes into title memory | bytes that really go back |
+| 5 | `gpu_w_back` | `write_runs_by`: spans a copy-back writes into title memory | only if every span landed (a copy-back that did not reach title memory counts neither as GPU write nor as traffic); one ACCESS and one SYNC back per span, the time shared by bytes |
 | 6 | `gpu_w_copy` | copy steps into title memory, texture read-backs (`list.rs`) | |
 | 7 | `gpu_r_refresh` | `Step::Refresh`: range a list asked to be brought up to date | one record per step = copystat `Refreshes` |
 | 8 | `gpu_r_heap` | `Step::Heap`: ranges a heap's views reach, at submission | |
 | 9 | `gpu_r_table` | `memory::prepare`: table/log: every copy the memory page table names (written or not); stream: only the copies the table hands to the refresh (not clean ones: ~4,700 copies per list would dominate the stream) | per list using the table |
 | 10 | `gpu_w_kept` | `memory::drop_withheld`: GPU results dropped from the copies | |
 | 11 | `remap` | `title_memory_remapped` | |
+| 12 | `copied_up` | a refresh copied the unit (SYNC up); units only, no ACCESS record | |
+| 13 | `cpu_w_dirty` | derived at the frame end, units only: `copied_up` in this frame, the unit was copied before, and none of `gpu_w_mark`, `gpu_w_back`, `gpu_w_copy`, `gpu_w_kept`, `cpu_w_runtime`, `remap` in this frame or the one before | the title's CPU wrote it although no fault was seen (a page left open after its first write faults no more; Fable P2 A3). A replayer derives it the same way from SYNC up records |
 
 GPU-read proxies are bits 7-9; the reader picks which count (F1 question 2).
 
@@ -59,11 +61,12 @@ All `key=value`, space separated.
   - `memclass region id=I kind=K at=A len=B f_<flag>=frames ... sync_up_bytes sync_up_us sync_back_bytes sync_back_us`
     - kind: `virtual` (write-watched `XMemVirtualAlloc`), `virtual_unwatched`, `section` (physical pages; `at` = section handle; all views of it count here at the section offset), `unnamed` (per 4 GiB window, nothing named it).
     - `f_<flag>` = frames in which any unit of the region had the flag.
+    - sync bytes/us: a range over several regions is cut at region borders, each piece's time by its bytes.
   - `memclass units region=I ever=0xHHHH units=N bytes=B`: units whose flags over the run are exactly `ever`.
 
 Class rule (applied by the reader; default = proposal in night-queue Q2):
-CPU = `cpu_w_title|cpu_r_after_gpu` (optionally `cpu_w_runtime`), GPU = all `gpu_*` (or a subset).
-CPU and GPU = shared; CPU only = CPU-only; GPU only = GPU-only **if** the region kind is `virtual` or `section`, else unknown; nothing = unknown.
+CPU = `cpu_w_title|cpu_w_dirty|cpu_r_after_gpu` (optionally `cpu_w_runtime`), GPU = all `gpu_*` (or a subset).
+CPU and GPU = shared; CPU only = CPU-only; GPU only = **GPU-only candidate** (no CPU write seen; CPU read after GPU write is not measured in v1, so not proven GPU-only; `gpu_r_table` is an upper bound of GPU reads) **if** the region kind is `virtual` or `section`, else unknown; nothing = unknown.
 
 ## Event stream (binary)
 

@@ -278,6 +278,73 @@ fn the_table_lists_flag_combinations() {
     assert_eq!(table.last().map(String::as_str), Some("memclass table end frame=1"));
 }
 
+/// A refresh copying a unit again that was copied before, with nothing of
+/// ours writing it in this frame or the one before, is a CPU write the
+/// guards may not have seen; the first copy is none, and neither is a copy
+/// after our own copy-back.
+#[test]
+fn a_page_copied_again_is_a_cpu_write() {
+    let c = classifier(16);
+    let a = 0x10_0000_0000;
+    c.allocated(a, 4 * K64, true);
+    // Frame 1: units 0 and 1 copied for the first time, unit 1 also marked.
+    c.sync(Sync::Up, a, 2 * K64, 1);
+    c.tag(f::GPU_W_MARK, a + K64, K64);
+    frame(&c);
+    assert!(units(&c).iter().all(|(_, u)| u.ever & f::CPU_W_DIRTY == 0), "a first copy is no CPU write");
+    // Frame 2: unit 1's copy-back; both copied again.
+    c.copied_back(a, &[(K64, K64 + 64)], true, 1);
+    c.sync(Sync::Up, a, 2 * K64, 1);
+    frame(&c);
+    let u = units(&c);
+    assert_ne!(u[0].1.ever & f::CPU_W_DIRTY, 0, "copied again, nothing of ours: the title wrote it");
+    assert_eq!(u[1].1.ever & f::CPU_W_DIRTY, 0, "copied again after our copy-back: not the CPU");
+    // Frame 4 (frame 3 untouched): unit 1 copied again, our write is two frames old.
+    frame(&c);
+    c.sync(Sync::Up, a + K64, K64, 1);
+    frame(&c);
+    assert_ne!(units(&c)[1].1.ever & f::CPU_W_DIRTY, 0);
+    // The proposed rule counts it as CPU access.
+    assert_eq!(c.classes(Rule::PROPOSED).get(&Class::Shared), Some(&(K64 as u64)));
+    assert_eq!(c.classes(Rule::PROPOSED).get(&Class::CpuOnly), Some(&(K64 as u64)));
+}
+
+/// A copy-back whose spans did not land writes nothing and moves nothing;
+/// one that landed counts each span, with the time by bytes.
+#[test]
+fn only_copy_backs_that_landed_count() {
+    let c = classifier(16);
+    let (a, b) = (0x11_0000_0000, 0x11_0001_0000);
+    c.allocated(a, K64, true);
+    c.allocated(b, K64, true);
+    c.copied_back(a, &[(0, 100)], false, 50);
+    frame(&c);
+    assert!(units(&c).is_empty());
+    assert_eq!(stats(&c, 0).sync[Sync::Back as usize], (0, 0));
+    // Spans in two regions: 100 bytes in a, 300 in b, 40 microseconds.
+    c.copied_back(a, &[(0, 100), (K64, K64 + 300)], true, 40);
+    frame(&c);
+    assert_eq!(units(&c).len(), 2);
+    assert_eq!(stats(&c, 0).sync[Sync::Back as usize], (100, 10));
+    assert_eq!(stats(&c, 1).sync[Sync::Back as usize], (300, 30));
+}
+
+/// Sync traffic over several regions goes to each by its bytes.
+#[test]
+fn sync_over_regions_is_shared_by_bytes() {
+    let c = classifier(16);
+    let a = 0x12_0000_0000;
+    c.allocated(a, K64, true);
+    c.allocated(a + K64, K64, true);
+    // Half in each region, then a quarter past both (nothing names it).
+    c.sync(Sync::Up, a + K64 / 2, K64 + K64 / 2, 30);
+    frame(&c);
+    assert_eq!(stats(&c, 0).sync[Sync::Up as usize], ((K64 / 2) as u64, 10));
+    assert_eq!(stats(&c, 1).sync[Sync::Up as usize], (K64 as u64, 20));
+    // Nothing past the regions here (the range ends at their end).
+    assert_eq!(c.state.lock().unwrap().stats.len(), 2);
+}
+
 /// A record of the stream, decoded (`docs/memclass-format.md`).
 #[derive(Debug, PartialEq, Eq)]
 enum Record {

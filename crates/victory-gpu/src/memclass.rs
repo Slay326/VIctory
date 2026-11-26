@@ -76,10 +76,19 @@ pub(crate) mod f {
     pub(crate) const GPU_W_KEPT: u16 = 1 << 10;
     /// The runtime mapped or unmapped the memory.
     pub(crate) const REMAP: u16 = 1 << 11;
+    /// A refresh copied the unit into a host copy (sync up).
+    pub(crate) const COPIED_UP: u16 = 1 << 12;
+    /// Derived at the frame's end: a refresh copied the unit again although
+    /// it had been copied before and nothing of ours wrote it in this frame
+    /// or the one before: the title's CPU wrote it, seen or not by a fault
+    /// (a page left open after its first write faults no more).
+    pub(crate) const CPU_W_DIRTY: u16 = 1 << 13;
+    /// Our own writes that make a refresh copy a unit again (not the CPU's).
+    pub(crate) const OURS: u16 = GPU_W_MARK | GPU_W_BACK | GPU_W_COPY | GPU_W_KEPT | CPU_W_RUNTIME | REMAP;
 }
 
 /// Names of the flags, by bit (logs, the stream's documentation).
-pub(crate) const FLAG_NAMES: [&str; 12] = [
+pub(crate) const FLAG_NAMES: [&str; 14] = [
     "cpu_w_title",
     "cpu_w_runtime",
     "cpu_r_after_gpu",
@@ -92,6 +101,8 @@ pub(crate) const FLAG_NAMES: [&str; 12] = [
     "gpu_r_table",
     "gpu_w_kept",
     "remap",
+    "copied_up",
+    "cpu_w_dirty",
 ];
 
 /// Traffic that keeps the copies and title memory in step.
@@ -238,6 +249,13 @@ pub(crate) fn cpu_read(at: usize, len: usize) {
 pub(crate) fn sync(kind: Sync, at: usize, len: usize, us: u64) {
     if let Some(c) = global() {
         c.sync(kind, at, len, us);
+    }
+}
+
+/// Hook: a copy-back's spans (see [`Classifier::copied_back`]).
+pub(crate) fn copied_back(at: usize, spans: &[(usize, usize)], landed: bool, us: u64) {
+    if let Some(c) = global() {
+        c.copied_back(at, spans, landed, us);
     }
 }
 
@@ -422,6 +440,32 @@ impl Regions {
         r
     }
 
+    /// `[at, at + len)` cut where regions change: region and bytes.
+    fn split(&mut self, at: usize, len: usize) -> Vec<(u32, usize)> {
+        let end = at.saturating_add(len);
+        let mut out: Vec<(u32, usize)> = Vec::new();
+        let mut pos = at;
+        while pos < end {
+            let (r, _) = self.place(pos);
+            // Where the run holding `pos` ends: its span's end, else the
+            // next span's start or the window's end.
+            let run_end = match self.spans.range(..=pos).next_back() {
+                Some((_, &(e, _, _))) if pos < e => e,
+                _ => {
+                    let window_end = ((pos >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT;
+                    self.spans.range(pos + 1..).next().map_or(window_end, |(&s, _)| s.min(window_end))
+                }
+            };
+            let next = run_end.min(end).max(pos + 1);
+            match out.last_mut() {
+                Some((last, bytes)) if *last == r => *bytes += next - pos,
+                _ => out.push((r, next - pos)),
+            }
+            pos = next;
+        }
+        out
+    }
+
     /// The region and offset in it of address `at`.
     fn place(&mut self, at: usize) -> (u32, usize) {
         if let Some((&s, &(e, r, o))) = self.spans.range(..=at).next_back()
@@ -449,6 +493,8 @@ pub(crate) struct Unit {
     pub(crate) frames: u32,
     pub(crate) first: u32,
     pub(crate) last: u32,
+    /// Flags of the unit's last frame.
+    pub(crate) prev: u16,
 }
 
 /// A region over the run.
@@ -493,7 +539,7 @@ impl Rule {
     /// The proposal in the night queue (Q2): runtime writes apart, every
     /// GPU-read proxy counts.
     pub(crate) const PROPOSED: Rule = Rule {
-        cpu: f::CPU_W_TITLE | f::CPU_R_AFTER_GPU,
+        cpu: f::CPU_W_TITLE | f::CPU_W_DIRTY | f::CPU_R_AFTER_GPU,
         gpu: f::GPU_W_MARK
             | f::GPU_W_DECL
             | f::GPU_W_BACK
@@ -653,7 +699,27 @@ impl Classifier {
         if let Some(s) = &self.stream {
             s.sync(kind, at, len, us);
         }
+        if kind == Sync::Up {
+            self.units(f::COPIED_UP, at, len);
+        }
         self.syncs.lock().unwrap_or_else(|e| e.into_inner()).push((kind, at, len, us));
+    }
+
+    /// A copy-back's spans `[at + start, at + end)` took `us`; `landed`:
+    /// they reached title memory. Only bytes that landed are GPU writes and
+    /// traffic; the time goes to the spans by bytes.
+    pub(crate) fn copied_back(&self, at: usize, spans: &[(usize, usize)], landed: bool, us: u64) {
+        if !landed {
+            return;
+        }
+        let bytes: usize = spans.iter().map(|&(s, e)| e - s).sum();
+        let mut given = 0;
+        for (k, &(start, end)) in spans.iter().enumerate() {
+            self.tag(f::GPU_W_BACK, at + start, end - start);
+            let part = if k + 1 == spans.len() { us - given } else { us * (end - start) as u64 / bytes.max(1) as u64 };
+            given += part;
+            self.sync(Sync::Back, at + start, end - start, part);
+        }
     }
 
     pub(crate) fn submit(&self, lists: usize) -> Submission<'_> {
@@ -749,9 +815,15 @@ impl Classifier {
         let mut or: HashMap<u32, u16> = HashMap::new();
         for (&(r, u), &flags) in &this {
             let unit = st.units.entry((r, u)).or_insert(Unit { first: frame, ..Unit::default() });
+            let before = if unit.last + 1 == frame { unit.prev } else { 0 };
+            let mut flags = flags;
+            if flags & f::COPIED_UP != 0 && unit.ever & f::COPIED_UP != 0 && (flags | before) & f::OURS == 0 {
+                flags |= f::CPU_W_DIRTY;
+            }
             unit.ever |= flags;
             unit.frames += 1;
             unit.last = frame;
+            unit.prev = flags;
             *or.entry(r).or_default() |= flags;
             let stats = st.stats.entry(r).or_default();
             for bit in 0..16 {
@@ -774,10 +846,16 @@ impl Classifier {
             }
         }
         for (kind, at, len, us) in syncs {
-            let (r, _) = regions.place(at);
-            let s = &mut st.stats.entry(r).or_default().sync[kind as usize];
-            s.0 += len as u64;
-            s.1 += us;
+            // Each region its bytes, and the time by bytes.
+            let pieces = regions.split(at, len);
+            let mut given = 0;
+            for (k, &(r, bytes)) in pieces.iter().enumerate() {
+                let part = if k + 1 == pieces.len() { us - given } else { us * bytes as u64 / len.max(1) as u64 };
+                given += part;
+                let s = &mut st.stats.entry(r).or_default().sync[kind as usize];
+                s.0 += bytes as u64;
+                s.1 += part;
+            }
             let i = &mut st.interval.2[kind as usize];
             i.0 += len as u64;
             i.1 += us;

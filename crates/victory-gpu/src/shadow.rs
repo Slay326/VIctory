@@ -389,21 +389,14 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
 }
 
 /// Stage 1 classification (`crate::memclass`): a copy-back's spans at an
-/// address and when it began, counted as GPU writes and sync traffic when
-/// dropped (the write done).
-struct Classified<'a>(usize, &'a [(usize, usize)], std::time::Instant);
+/// address, when it began and whether every span landed, counted as GPU
+/// writes and sync traffic when dropped (the write done) if they landed.
+struct Classified<'a>(usize, &'a [(usize, usize)], std::time::Instant, std::cell::Cell<bool>);
 
 impl Drop for Classified<'_> {
     fn drop(&mut self) {
         let us = self.2.elapsed().as_micros() as u64;
-        let mut bytes = 0;
-        for &(start, end) in self.1 {
-            crate::memclass::tag(crate::memclass::f::GPU_W_BACK, self.0 + start, end - start);
-            bytes += end - start;
-        }
-        if let Some(&(first, _)) = self.1.first() {
-            crate::memclass::sync(crate::memclass::Sync::Back, self.0 + first, bytes, us);
-        }
+        crate::memclass::copied_back(self.0, self.1, self.3.get(), us);
     }
 }
 
@@ -434,7 +427,8 @@ fn write_runs_by(at: usize, merged: &[u8], runs: &[(usize, usize)], tracked: Opt
         }
     }
     // Stage 1 classification: the bytes shaders wrote that go back.
-    let _classified = crate::memclass::on().then(|| Classified(at, &spans, std::time::Instant::now()));
+    let classified = crate::memclass::on()
+        .then(|| Classified(at, &spans, std::time::Instant::now(), std::cell::Cell::new(false)));
     // True if every span landed.
     let put = |delta: usize| {
         let mut all = true;
@@ -444,6 +438,9 @@ fn write_runs_by(at: usize, merged: &[u8], runs: &[(usize, usize)], tracked: Opt
                 merged[start..].as_ptr(),
                 end - start,
             );
+        }
+        if let Some(c) = &classified {
+            c.3.set(all);
         }
         all
     };
