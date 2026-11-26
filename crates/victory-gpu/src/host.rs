@@ -1405,6 +1405,11 @@ impl Host {
             let marks = lists.iter().flat_map(|l| l.deferred().gt.iter().map(|f| f()).collect::<Vec<_>>()).collect();
             crate::bvh_gt::Gt::take(*submitted, lists.len(), marks)
         });
+        if let Some(hash) = crate::bvh_gt::reader_target()
+            && runs.iter().any(|l| l.uses_pipeline(hash))
+        {
+            crate::bvh_gt::reader_check(*submitted);
+        }
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
         // title's own data (runs c1, c4), and so does what every program
