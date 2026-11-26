@@ -385,8 +385,27 @@ const SPAN_GAP: usize = 256;
 /// must stay. (Putting back the whole page undid those writes.) True if a
 /// run was written.
 fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
+    write_runs_by(at, merged, runs, None) != Put::Nothing
+}
+
+/// What a copy-back's write did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Put {
+    Nothing,
+    /// Written at the title's address, its guard opened and the page
+    /// marked changed (the caller takes it).
+    Title,
+    /// Written through our own view of the section (`crate::watch`'s
+    /// `write_beside`): the title's guard stayed, the page is taken unless
+    /// the title wrote it meanwhile.
+    Beside,
+}
+
+/// [`write_runs`]; with a tracker (a marked page's copy-back), through our
+/// own view of the memory's section where there is one.
+fn write_runs_by(at: usize, merged: &[u8], runs: &[(usize, usize)], tracked: Option<&crate::watch::Tracked>) -> Put {
     if runs.is_empty() {
-        return false;
+        return Put::Nothing;
     }
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
     for &(start, end) in runs {
@@ -395,11 +414,23 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
             _ => spans.push((start, end)),
         }
     }
-    let _writing = crate::watch::writing(at, merged.len());
-    for (start, end) in spans {
-        crate::host::write_mapped((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
+    let put = |delta: usize| {
+        for &(start, end) in &spans {
+            crate::host::write_mapped((at + start).wrapping_add(delta) as *mut u8, merged[start..].as_ptr(), end - start);
+        }
+    };
+    if let Some(t) = tracked {
+        if t.write_beside(at, merged.len(), put).is_some() {
+            return Put::Beside;
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::watch::own_view_on() {
+            crate::copystat::add(crate::copystat::C::BesideNone, 1);
+        }
     }
-    true
+    let _writing = crate::watch::writing(at, merged.len());
+    put(0);
+    Put::Title
 }
 
 /// Outside `runs`, the copy takes title memory's bytes (`title`, read at the
@@ -527,7 +558,7 @@ impl Shadow {
         if self.card.is_some() {
             crate::host::card_fetch(&[(self, from - start, to - start)]);
         }
-        if !self.put_back(page, from, to, saved) {
+        if self.put_back(page, from, to, saved, false) == Put::Nothing {
             return 0;
         }
         // Our write is not the title's: the copy takes the page as it is.
@@ -577,8 +608,11 @@ impl Shadow {
     /// submission: `saved`, or what the page held when a title write landed
     /// while it was read (saved by the guard while the page is armed), else
     /// title memory. True if bytes were written.
-    fn put_back(&self, page: usize, from: usize, to: usize, saved: Option<Box<[u8]>>) -> bool {
-        TITLE.with(|title| self.put_back_with(page, from, to, saved, &mut title.borrow_mut()))
+    ///
+    /// With `beside`, through our own view of the memory where there is one
+    /// ([`Put::Beside`]).
+    fn put_back(&self, page: usize, from: usize, to: usize, saved: Option<Box<[u8]>>, beside: bool) -> Put {
+        TITLE.with(|title| self.put_back_with(page, from, to, saved, beside, &mut title.borrow_mut()))
     }
 
     fn put_back_with(
@@ -587,8 +621,9 @@ impl Shadow {
         from: usize,
         to: usize,
         saved: Option<Box<[u8]>>,
+        beside: bool,
         title: &mut [u8],
-    ) -> bool {
+    ) -> Put {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host =
@@ -606,7 +641,7 @@ impl Shadow {
             None => saved,
         };
         if !read {
-            return false;
+            return Put::Nothing;
         }
         let runs = match &saved {
             None => differing_rows(host, title),
@@ -624,7 +659,7 @@ impl Shadow {
             let at = from - self.start as usize;
             self.card_changed(at, at + n);
         }
-        write_runs(from, host, &runs)
+        write_runs_by(from, host, &runs, if beside { self.tracked.as_ref() } else { None })
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -964,16 +999,24 @@ impl Shadow {
         // (armed before a copy in the GPU's memory fetched the page:
         // `copy_back_marks`).
         t.arm(from, to);
-        let written = self.put_back(page, from, to, saved);
+        let put = self.put_back(page, from, to, saved, true);
         // Equal to title memory now: taken, unless it holds the page in part.
         // A page neither we nor the title wrote meanwhile (a title write
         // marks it changed) is still taken and guarded, and the copy has
         // title memory's bytes: nothing to read again. (A third of the
-        // world's marked pages hold no changed byte.)
-        if from == page && to == page + PAGE && (written || t.changed(page / PAGE)) {
+        // world's marked pages hold no changed byte.) So is a page written
+        // through our own view that the title did not write meanwhile: its
+        // guard stayed, and the copy holds what went back and, around it,
+        // title memory as read (unchanged since, or the guard had faulted).
+        let retaken = t.changed(page / PAGE);
+        #[cfg(feature = "diagnostics")]
+        if put == Put::Beside && retaken {
+            crate::copystat::add(crate::copystat::C::BesideRetaken, 1);
+        }
+        if from == page && to == page + PAGE && (put == Put::Title || retaken) {
             self.take_and_read(t, page, from, to);
         }
-        if written { to - from } else { 0 }
+        if put != Put::Nothing { to - from } else { 0 }
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -2657,6 +2700,43 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A marked page's copy-back into view memory goes through our own view
+    /// of the section: the lines go back, the title's other bytes stay (one
+    /// it writes after the copy-back read the page too), the guard stays
+    /// without being opened, and the writer's tracker needs no take; into
+    /// private memory it goes as before.
+    #[test]
+    fn marked_copy_backs_into_view_memory_go_beside_the_guard() {
+        let (_, a, _) = crate::watch::tests::reported_section(1);
+        let t = crate::watch::track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        let read_title = vec![0u8; PAGE];
+        let mut host = read_title.clone();
+        host[100] = 0xaa;
+        host[5000] = 0xab;
+        let runs = differing_rows(&host, &read_title);
+        // SAFETY: the title's view, guarded: the handler opens it.
+        unsafe { ((a + 2000) as *mut u8).write_volatile(0x13) };
+        // The page is changed now (the title wrote it): taken again first,
+        // as a copy-back finds it after a refresh.
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(write_runs_by(a, &host, &runs, Some(&t)), Put::Beside);
+        // SAFETY: bytes of the view.
+        let read = |at: usize| unsafe { ((a + at) as *const u8).read_volatile() };
+        assert_eq!((read(100), read(5000), read(2000), read(101)), (0xaa, 0xab, 0x13, 0));
+        assert!(t.guarded(a / PAGE) && t.clean(), "guarded all along, nothing to take");
+        // Private memory: as before.
+        let p = crate::watch::tests::pool(1);
+        let v = crate::watch::track(p, PAGE, true).expect("pool memory is tracked");
+        assert_eq!(v.take(p, p + PAGE), [(p, p + PAGE)]);
+        assert_eq!(write_runs_by(p, &host, &runs, Some(&v)), Put::Title);
+        // SAFETY: bytes of the pool.
+        assert_eq!(unsafe { ((p + 5000) as *const u8).read_volatile() }, 0xab);
+        assert!(v.changed(p / PAGE) && !v.guarded(p / PAGE), "opened and changed: the caller takes it");
+        drop(v);
+        crate::watch::tests::free(p);
     }
 
     /// A copy-back with no bytes saved puts back whole 32-byte lines: title

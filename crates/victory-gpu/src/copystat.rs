@@ -104,8 +104,15 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Marked pages written back through our own view of their section
+    /// (`VICTORY_BACK_OWN_VIEW`); of those, pages the title wrote meanwhile
+    /// (taken and guarded again as before); marked pages of memory with no
+    /// such view (private memory: written as before).
+    BesidePages,
+    BesideRetaken,
+    BesideNone,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -310,6 +317,14 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    if crate::watch::own_view_on() {
+        tracing::info!(
+            "  own view: {:.0} marked pages written beside the guards ({:.0} of them taken again: the title wrote them meanwhile), {:.0} in memory with no view of ours (as before)",
+            c[C::BesidePages as usize],
+            c[C::BesideRetaken as usize],
+            c[C::BesideNone as usize],
+        );
+    }
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
