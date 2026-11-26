@@ -1293,6 +1293,8 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Stage 1 classification: the submission's points in its stream.
+        let _memclass = crate::memclass::submission(runs.len());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1418,6 +1420,7 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            crate::memclass::point(crate::memclass::Point::Executed);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1577,6 +1580,7 @@ impl Host {
         if marks_sent {
             crate::shadow::marks_fetched(&card_marks);
         }
+        crate::memclass::point(crate::memclass::Point::GpuDone);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2562,6 +2566,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::memclass::tag(crate::memclass::f::GPU_W_COPY, dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2580,6 +2585,7 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    crate::memclass::tag(crate::memclass::f::GPU_R_REFRESH, *address, *len);
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -2607,11 +2613,18 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    crate::bindless::refresh(viewed, |s, a, l| {
+                        crate::memclass::tag(crate::memclass::f::GPU_R_HEAP, a, l);
+                        batch.add(s, a, l)
+                    });
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    crate::memory::prepare(heap, |s, a, l| {
+                        // The stream's `gpu_r_table`: copies the table refreshes.
+                        crate::memclass::record(crate::memclass::f::GPU_R_TABLE, a, l);
+                        batch.add(s, a, l)
+                    });
                     continue;
                 }
             };
@@ -2689,6 +2702,7 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            crate::memclass::refresh_copied(copied);
             total += copied;
             // Kept: the union with what was current if they touch, else
             // the larger.
@@ -3292,6 +3306,7 @@ impl Meter {
         crate::descriptor::sweep();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
+        crate::memclass::frame_done();
         self.report_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {

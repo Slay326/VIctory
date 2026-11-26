@@ -200,6 +200,32 @@ alle Opus-Karten 1.000 min = 16,7 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
   Übersetzer-Änderung verlangt.
 - PC: **PC 2**. Aufwärmen: nein (Dump). Abhängig von: nichts. Dauer: 1 h. Wer: Opus.
 
+### R6 RT: upstream #2098 (Adresse der Acceleration-Structure-View) auf rt/play testen
+- Status: offen (Prüfung senior 49; Kandidaten-Rangliste im JOURNAL unter "senior 49")
+- Ziel: Der RT-Leser f607780a nimmt die BVH-Adresse aus den View-Adressen (Dwords 0-1). Für eine
+  SRV der Dimension 11 (Acceleration Structure, ohne Ressource) schreibt `write_address` heute 0
+  [C, descriptor/host.rs auf rt/play 2e852e6; Diag-Log: dim 11, location 0xd5d3ef800, eingetragen 0x0, JOURNAL Z. 210].
+  Der Leser läuft also über Adresse 0 statt über das TLAS. #2098 trägt die Location (Dwords 4-5) ein.
+  Erklärt NICHT die stillen Nullen im Builder (der bindet keine Dim-11-View [M, Lauf 20261124-230706:
+  nur f607780a]), betrifft aber direkt das RT-Bild.
+- Schritte: Branch `test/rtplay-2098` = `fork/rt/play` (2e852e6) + `git cherry-pick -x 543d868`
+  (Autor moe-miau bleibt; Commit-Nachricht nennt "upstream PR #2098, 543d868"); Konflikte: keine
+  [C, merge-tree]. Nur victory-gpu -> SOURCE_HASH gleich, KEIN Aufwärmen (Cache von rt/play).
+  Test `descriptor::host::tests::an_acceleration_structures_view_address_is_its_location` rot ohne /
+  grün mit Fix zeigen, dann `cargo test --workspace`. Push fork `test/rtplay-2098`, PC 2 zieht.
+- Messung (PC 2, 180 s, gleiche Einstellung und Capture-Frames wie rt/play-Kontrolle, A-B-A):
+  (1) Bild: RT-Schatten/Irradiance auf den festen Capture-Frames gegen Kontrolle (Bett-Maske, Luminanz);
+  (2) Kontrolle Builder-Seite: "BVH GT reader" gültige Bottom-Level 10-20 % und Ursprungs-Anteil 46-70 %
+  sollten GLEICH bleiben (sonst Befund melden); (3) Arena-Zeile "pages asked/refused" (der Leser liest
+  jetzt die TLAS-Seiten 0xd...); (4) GPU-Zeit von f607780a und Device-Removed (Risiko: Durchlauf über
+  echte, teils ungültige BVHs bis 65.535 Schritte je Wave).
+- Abnahme: sichtbarer Unterschied im RT-Bild mit Captures belegt ODER "keine Wirkung" mit Zahlen;
+  kein neuer Device-Removed in 180 s; Builder-Metriken unverändert dokumentiert.
+- PC: **PC 2**. Aufwärmen: nein (Host-Code). Abhängig von: nichts. Dauer: 45 min. Wer: Opus.
+- Nicht testen (senior 49, ohne erwartete Wirkung): #2467 (Root-Pfad; f607780a nimmt den Roh-Pfad,
+  der die hohen Bits schon hält; #2501 an denselben Zeilen gab byte-gleiche Pipelines [M, 04:25]),
+  #1794, #3316 (alle 64 Leser übersetzen schon), #1903 (ULP), #2853 (Konflikt, CI rot), #1885 (Proton).
+
 ---
 
 ## Nur Fable (Opus bereitet höchstens Tests/Daten vor)

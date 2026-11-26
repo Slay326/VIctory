@@ -182,6 +182,11 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // Stage 1 classification of title memory (`VICTORY_MEMCLASS`): a region,
+    // whose title writes the guards see where it is write-watched.
+    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        victory_gpu::memclass_allocated(at as usize, size, kind & MEM_WRITE_WATCH != 0);
+    }
     at
 }
 
