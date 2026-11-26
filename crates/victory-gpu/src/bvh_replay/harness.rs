@@ -59,6 +59,57 @@ pub struct Options {
     /// Run an incomplete capture anyway, for its output; the verdict stays
     /// CAPTURE INVALID.
     pub diagnose: bool,
+    /// Stage dumps (T4): replay only the first k builder dispatches for
+    /// each cut k and check the structures after it.
+    pub cuts: Option<Cuts>,
+}
+
+/// Where the stage dumps cut the builder's dispatches.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cuts {
+    /// After the last dispatch of every run of one pipeline.
+    Stages,
+    /// After every dispatch.
+    Each,
+    /// After these many dispatches.
+    List(Vec<usize>),
+}
+
+impl Cuts {
+    fn parse(s: &str) -> anyhow::Result<Cuts> {
+        Ok(match s {
+            "stages" => Cuts::Stages,
+            "each" => Cuts::Each,
+            l => Cuts::List(
+                l.split(',')
+                    .map(|n| {
+                        n.trim()
+                            .parse::<usize>()
+                            .context("--cuts: stages, each or k,k,...")
+                    })
+                    .collect::<anyhow::Result<_>>()?,
+            ),
+        })
+    }
+
+    /// The cuts for these pipelines (in dispatch order): numbers of
+    /// dispatches run, ascending, the last one all of them.
+    pub fn points(&self, pipelines: &[u32]) -> Vec<usize> {
+        let n = pipelines.len();
+        let mut v: Vec<usize> = match self {
+            Cuts::Stages => (1..=n)
+                .filter(|&k| k == n || pipelines[k] != pipelines[k - 1])
+                .collect(),
+            Cuts::Each => (1..=n).collect(),
+            Cuts::List(l) => l.iter().map(|&k| k.clamp(1, n.max(1))).collect(),
+        };
+        if n > 0 && v.last() != Some(&n) {
+            v.push(n);
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
 }
 
 impl Options {
@@ -72,6 +123,7 @@ impl Options {
             warp: false,
             dump: None,
             diagnose: false,
+            cuts: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -82,6 +134,11 @@ impl Options {
                 "--card" => o.card_only = true,
                 "--warp" => o.warp = true,
                 "--diagnose" => o.diagnose = true,
+                "--cuts" => {
+                    o.cuts = Some(Cuts::parse(
+                        it.next().context("--cuts needs stages, each or a list")?,
+                    )?)
+                }
                 "--dump" => {
                     o.dump = Some(PathBuf::from(it.next().context("--dump needs a folder")?))
                 }
@@ -91,7 +148,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..]"
             );
         }
         Ok(o)
@@ -337,6 +394,18 @@ pub struct RunResult {
 
 /// Runs the capture once on `gpu`.
 fn run_once(gpu: &mut Gpu, l: &mut Loaded, o: &Options) -> anyhow::Result<RunResult> {
+    run_prefix(gpu, l, o, usize::MAX, &BTreeSet::new())
+}
+
+/// Runs the first `upto` dispatches of the capture once on `gpu` and reads
+/// back the marked pages and the captured ones of `also`.
+fn run_prefix(
+    gpu: &mut Gpu,
+    l: &mut Loaded,
+    o: &Options,
+    upto: usize,
+    also: &BTreeSet<u64>,
+) -> anyhow::Result<RunResult> {
     let c = l.capture.clone();
     let pre: Vec<PageRec> = c.pages_of(Stage::Pre).cloned().collect();
     let captured: BTreeSet<u64> = pre.iter().map(|p| p.address & !(PAGE - 1)).collect();
@@ -659,7 +728,12 @@ fn run_once(gpu: &mut Gpu, l: &mut Loaded, o: &Options) -> anyhow::Result<RunRes
         // SAFETY: an open list; every object lives until the run is waited for.
         unsafe {
             list.SetDescriptorHeaps(&[Some(heap.clone()), Some(samplers.clone())]);
-            for d in c.dispatches.iter().filter(|d| o.all || d.builder) {
+            for d in c
+                .dispatches
+                .iter()
+                .filter(|d| o.all || d.builder)
+                .take(upto)
+            {
                 let (root, pso) = &psos[&d.pipeline];
                 list.SetComputeRootSignature(root);
                 list.SetPipelineState(pso);
@@ -770,7 +844,10 @@ fn run_once(gpu: &mut Gpu, l: &mut Loaded, o: &Options) -> anyhow::Result<RunRes
     let marked: Vec<u64> = set
         .iter()
         .filter_map(|&e| c.table.address_of(e as usize))
+        .chain(also.iter().copied())
         .filter(|a| captured.contains(a))
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
         .collect();
     let mut pages = BTreeMap::new();
     for chunk in marked.chunks((STAGE / PAGE) as usize) {
@@ -863,6 +940,25 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
     );
     let mut gpu = Gpu::new(o.warp)?;
     println!("harness gpu: {}", super::adapter_text(&gpu.device));
+    {
+        // T4: the wave sizes the device runs (a pipeline that asks for
+        // WaveSize(32) outside them is refused with E_INVALIDARG).
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a plain feature query into a struct of its size.
+        let ok = unsafe {
+            gpu.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&mut o1 as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS1).cast(),
+                std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+            )
+        };
+        println!(
+            "harness gpu wave lanes: {} to {} (query {})",
+            o1.WaveLaneCountMin,
+            o1.WaveLaneCountMax,
+            if ok.is_ok() { "ok" } else { "failed" }
+        );
+    }
     println!("capture gpu: {}", c.meta("gpu").unwrap_or("?"));
     let why = unsupported(&c, o.all);
     if !why.is_empty() {
@@ -883,7 +979,8 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
     let before = c.incomplete_before_run();
     println!(
         "completeness before the run: pages left out {}, marked pages with a source not taken before {} (first: {}){}",
-        c.left_out().map_or("unknown".to_string(), |n| n.to_string()),
+        c.left_out()
+            .map_or("unknown".to_string(), |n| n.to_string()),
         c.marked_not_taken(),
         c.marked_not_taken_pages()
             .iter()
@@ -891,10 +988,17 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
             .map(|a| format!("{a:#x} {:?}", c.table.entry_at(*a).map(|(_, e)| e)))
             .collect::<Vec<_>>()
             .join(", "),
-        if before.is_empty() { String::new() } else { format!(" -> {}", before.join("; ")) }
+        if before.is_empty() {
+            String::new()
+        } else {
+            format!(" -> {}", before.join("; "))
+        }
     );
     if !before.is_empty() && !o.diagnose {
-        println!("RESULT: CAPTURE INVALID ({}); --diagnose runs it anyway", before.join("; "));
+        println!(
+            "RESULT: CAPTURE INVALID ({}); --diagnose runs it anyway",
+            before.join("; ")
+        );
         return Ok(2);
     }
     // The game's G and bitmap.
@@ -950,6 +1054,9 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         by_kind(&validate(&g64)),
         c.meta("submission").unwrap_or("?")
     );
+    if let Some(cuts) = &o.cuts {
+        return stages(&mut gpu, &mut l, &o, cuts, &g, &gv, &game_bits);
+    }
     let mut results = Vec::new();
     for k in 0..o.runs.max(1) {
         let r = run_once(&mut gpu, &mut l, &o)?;
@@ -1004,7 +1111,11 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         println!(
             "run {k}: outside the capture {}: {}",
             o.len(),
-            o.iter().take(64).map(|&a| outside_text(a)).collect::<Vec<_>>().join(" ")
+            o.iter()
+                .take(64)
+                .map(|&a| outside_text(a))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
     let union: BTreeSet<u64> = outs.iter().flatten().copied().collect();
@@ -1016,7 +1127,11 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
     println!(
         "outside the capture over {} runs: {} (union {}, in every run {})",
         outs.len(),
-        if outs.iter().all(|o| *o == outs[0]) { "IDENTICAL" } else { "VARYING" },
+        if outs.iter().all(|o| *o == outs[0]) {
+            "IDENTICAL"
+        } else {
+            "VARYING"
+        },
         union.len(),
         common.len()
     );
@@ -1143,4 +1258,178 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         started.elapsed().as_secs_f64()
     );
     Ok(if reproduced { 0 } else { 1 })
+}
+
+/// What one structure's check says, with each invariant on its own (T4):
+/// version 6 header, root at +48, bounds, the walk (children in their
+/// parent's box and inside the size), the parent table.
+pub fn invariants(read: &dyn Fn(u64) -> Option<u32>, at: u64) -> String {
+    let Some(h) = (0..16)
+        .map(|i| read(at + 4 * i))
+        .collect::<Option<Vec<u32>>>()
+    else {
+        return "header not read".into();
+    };
+    let c = crate::bvh_gt::check(read, at);
+    let v6 = crate::bvh_gt::is_header(h[0], h[1]);
+    let bytes = u64::from(h[1]) * 64 + 64;
+    let root = h[12];
+    let rat = u64::from(root & !7) << 3;
+    let root_ok = !(root == u32::MAX || root & 7 == 7 || rat == 0 || rat >= bytes);
+    let f = |i: usize| f32::from_bits(h[i]);
+    let bounds_ok = (4..10).all(|i| f(i).is_finite() && f(i).abs() != f32::MAX)
+        && (0..3).all(|a| f(4 + a) <= f(7 + a));
+    let mark = |b: bool| if b { "ok" } else { "BAD" };
+    format!(
+        "{} v6 {} root {} ({root:#x}) bounds {} boxes {} outside {} missing {} parents {}/{}/{} hdr [{:08x} {:08x} {:08x}] root children [{}] why: {}",
+        if c.valid { "VALID" } else { "INVALID" },
+        mark(v6),
+        mark(root_ok),
+        mark(bounds_ok),
+        c.boxes,
+        c.outside,
+        c.missing,
+        c.parents.0,
+        c.parents.1,
+        c.parents.2,
+        h[0],
+        h[1],
+        h[3],
+        (0..4)
+            .map(|i| read(at + rat + 4 * i).map_or("-".to_string(), |w| format!("{w:08x}")))
+            .collect::<Vec<_>>()
+            .join(" "),
+        c.why.as_deref().unwrap_or("-"),
+    )
+}
+
+/// Stage dumps (T4): for each cut, `runs` replays of the first k builder
+/// dispatches; the structures G has (and any new header) checked after it,
+/// invariant by invariant, the pages that changed against the cut before,
+/// and the pages that differ across the runs.
+fn stages(
+    gpu: &mut Gpu,
+    l: &mut Loaded,
+    o: &Options,
+    cuts: &Cuts,
+    g: &BTreeMap<u64, Vec<u8>>,
+    gv: &BTreeMap<u64, (&'static str, bool, String)>,
+    game_bits: &BTreeSet<u32>,
+) -> anyhow::Result<i32> {
+    let c = l.capture.clone();
+    let order: Vec<&Dispatch> = c.dispatches.iter().filter(|d| o.all || d.builder).collect();
+    let pipes: Vec<u32> = order.iter().map(|d| d.pipeline).collect();
+    let hash = |p: u32| {
+        c.pipelines
+            .get(p as usize)
+            .map_or("?".to_string(), |p| p.hash.chars().take(8).collect())
+    };
+    let points = cuts.points(&pipes);
+    // Pages read back at every cut: those the game marked (G's pages).
+    let also: BTreeSet<u64> = game_bits
+        .iter()
+        .filter_map(|&e| c.table.address_of(e as usize))
+        .collect();
+    let targets: Vec<u64> = gv.keys().copied().collect();
+    println!(
+        "stages: {} builder dispatches, cuts {}, runs per cut {}, barriers {}; G structures: {}",
+        order.len(),
+        points.len(),
+        o.runs.max(1),
+        o.barriers,
+        gv.iter()
+            .map(|(a, (k, ok, w))| format!(
+                "{a:#x} {k} {} {w}",
+                if *ok { "valid" } else { "invalid" }
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    {
+        let list: Vec<(usize, &[u8])> = g.iter().map(|(&a, b)| (a as usize, &b[..])).collect();
+        let read = crate::bvh_gt::reader(&list);
+        for &t in &targets {
+            println!("G {t:#x}: {}", invariants(&read, t));
+        }
+    }
+    let mut before: BTreeMap<u64, u64> = BTreeMap::new();
+    for (i, &k) in points.iter().enumerate() {
+        let d = order[k - 1];
+        let mut results = Vec::new();
+        for _ in 0..o.runs.max(1) {
+            results.push(run_prefix(gpu, l, o, k, &also)?);
+        }
+        let first = &results[0];
+        let now: BTreeMap<u64, u64> = first.pages.iter().map(|(a, b)| (*a, hash8(b))).collect();
+        let changed: Vec<u64> = now
+            .iter()
+            .filter(|(a, h)| before.get(a) != Some(h))
+            .map(|(a, _)| *a)
+            .collect();
+        let unstable: Vec<u64> = now
+            .keys()
+            .copied()
+            .filter(|a| {
+                results
+                    .iter()
+                    .map(|r| r.pages.get(a).map(|b| hash8(b)))
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    > 1
+            })
+            .collect();
+        let hexes = |v: &[u64]| {
+            v.iter()
+                .take(6)
+                .map(|a| format!("{a:#x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!(
+            "cut {i}: after dispatch {} of {} ({}, groups {:?}), bitmap bits {}, pages changed {} ({}), unstable over runs {} ({})",
+            k,
+            order.len(),
+            hash(d.pipeline),
+            d.groups,
+            first.bitmap.len(),
+            changed.len(),
+            hexes(&changed),
+            unstable.len(),
+            hexes(&unstable),
+        );
+        let mut heads: BTreeSet<u64> = targets.iter().copied().collect();
+        let lists: Vec<Vec<(usize, &[u8])>> = results
+            .iter()
+            .map(|res| {
+                res.pages
+                    .iter()
+                    .map(|(&a, b)| (a as usize, &b[..]))
+                    .collect()
+            })
+            .collect();
+        for list in &lists {
+            heads.extend(crate::bvh_gt::scan(list).headers.iter().map(|(a, _)| *a));
+        }
+        for (r, list) in lists.iter().enumerate() {
+            let read = crate::bvh_gt::reader(list);
+            for &t in &heads {
+                println!("  run {r} {t:#x}: {}", invariants(&read, t));
+            }
+        }
+        before = now;
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cuts;
+
+    #[test]
+    fn stage_cuts_end_every_run_of_one_pipeline_and_the_last_cut_runs_all() {
+        let p = [7, 7, 3, 3, 3, 7, 9];
+        assert_eq!(Cuts::Stages.points(&p), vec![2, 5, 6, 7]);
+        assert_eq!(Cuts::Each.points(&p), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(Cuts::List(vec![4, 0, 99, 4]).points(&p), vec![1, 4, 7]);
+    }
 }
