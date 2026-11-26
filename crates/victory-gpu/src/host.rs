@@ -389,6 +389,9 @@ fn log_vram_by_kind(gpu: [f64; 3], title: [f64; 3]) {
     let card_copies = crate::shadow::card_copies().1 as f64 / 1e6;
     let copies = crate::shadow::all().iter().map(|s| s.range().1).sum::<u64>() as f64 / 1e6;
     let given = crate::resource::EVICTIONS.each_ref().map(|c| c.swap(0, Relaxed));
+    let moved = crate::resource::MOVES.each_ref().map(|c| c.swap(0, Relaxed));
+    let (draining, drained) = crate::placement::draining();
+    let (heaps, _, _) = crate::placement::stats();
     let unwritten_given = crate::resource::UNWRITTEN_GIVEN_UP.each_ref().map(|c| c.swap(0, Relaxed));
     tracing::info!(
         "VRAM by kind (MB): card {local:.0} of {budget:.0} ({:+.0} over): host textures {textures:.0} \
@@ -396,7 +399,8 @@ fn log_vram_by_kind(gpu: [f64; 3], title: [f64; 3]) {
          never written {unwritten:.0}; from title memory {:.0}), free in heaps of textures {heap_free:.0}, \
          title buffer copies on the card {card_copies:.0}, rest {:.0}; system memory {system:.0}: \
          host copies of title memory {copies:.0}, rest {:.0}; given up since the last line {} ({:.0} MB; \
-         never written {} {:.0} MB), made again {} ({} within 10 frames), evict unwritten {}",
+         never written {} {:.0} MB), made again {} ({} within 10 frames), evict unwritten {}; \
+         heaps of textures {heaps} (lean {}): moved off a heap being emptied {} ({:.0} MB), emptying {}, emptied so far {drained}",
         local - budget,
         gpu[0],
         title.iter().sum::<f64>(),
@@ -409,6 +413,10 @@ fn log_vram_by_kind(gpu: [f64; 3], title: [f64; 3]) {
         given[2],
         given[3],
         if crate::resource::evict_unwritten() { "on" } else { "off" },
+        if crate::placement::lean() { "on" } else { "off" },
+        moved[0],
+        moved[1] as f64 / 1e6,
+        draining.map_or("none".to_owned(), |d| format!("heap {d}")),
     );
 }
 
@@ -655,6 +663,41 @@ pub(crate) mod tests {
         copy.stamp();
         let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
         assert_eq!(crate::texture::uploads(object), 1, "read in the last pass: brought up");
+    }
+
+    /// A texture moved off a heap being emptied (`VICTORY_TEXTURE_HEAPS_LEAN`):
+    /// its title texture holds a new host texture in a heap of textures, the
+    /// memory's map names the new one (a new use shares it), lists keep the
+    /// old one, and the next submission's upload list brings the new one up
+    /// in full from title memory before anything reads it, even unread
+    /// lately.
+    #[test]
+    fn a_texture_moved_off_a_heap_is_uploaded_before_it_is_read() {
+        let Some(host) = host() else { return };
+        let address = crate::watch::tests::pool(1) as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut object = std::ptr::null();
+        let null = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(null, address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut object), 0);
+        let old = crate::resource::host_copy(object).expect("a host texture");
+        assert!(crate::resource::placed_in_heap(&old).is_some(), "in a heap of textures");
+        // No submission uploads meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        assert!(crate::texture::staging(object, &old.texture).is_some(), "uploaded before");
+        let _ = crate::resource::take_moved();
+        let new = crate::resource::move_now(object).expect("moved");
+        assert!(!std::sync::Arc::ptr_eq(&old, &new), "made again");
+        assert!(std::sync::Arc::ptr_eq(&crate::resource::host_copy(object).unwrap(), &new), "the title texture holds the new one");
+        assert!(crate::resource::placed_in_heap(&new).is_some());
+        assert!(crate::resource::moves_pending());
+        new.unstamp();
+        let _ = crate::bindless::uploads(&[], &[]);
+        assert!(!crate::resource::moves_pending());
+        assert_eq!(crate::texture::uploads(object), 1, "brought up in full, unread lately or not");
+        drop(old);
     }
 
     /// Heap textures brought up in one submission are refreshed side by
@@ -1273,7 +1316,7 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
+        let uploads = (!heaps.is_empty() || !textures.is_empty() || crate::resource::moves_pending())
             .then(|| crate::bindless::uploads(&heaps, &textures))
             .flatten();
         #[cfg(feature = "diagnostics")]

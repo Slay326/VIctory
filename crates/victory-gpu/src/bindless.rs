@@ -231,6 +231,13 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
+    // Host textures made again off a heap being emptied: in full, before
+    // anything reads them (`crate::resource::compact`).
+    for (staging, copy) in crate::resource::take_moved() {
+        if staged.insert(Arc::as_ptr(&staging)) {
+            work.push((staging, copy));
+        }
+    }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
