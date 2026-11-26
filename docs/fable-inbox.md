@@ -103,3 +103,22 @@ Aus anderen Läufen (nicht play):
 | Regionen | victory-hle modules/xmem.rs:87 `XMemVirtualAlloc` (:136 MEM_WRITE_WATCH), :477 `XMemAllocatePhysicalPages`, :808 `map` (MapViewOfFile3, Aliase :850); shadow.rs:685 `Shadow::new_at` | – |
 | Einheit | watch.rs:41-44: 64 KiB, "finer units made the checks of the world's big buffers cost more than the copies they saved" | – |
 | Ungeschützt | watch.rs:14-17: C-Heap u. Ä. wird ganz kopiert (heute 0,0 MB/Frame [M]) | -> unknown |
+
+---
+
+## F2a (Review, nicht blockierend): Annahmen der Invarianten-Tests Q6 (`shadow_invariants.rs`)
+
+Status: offen. Blockiert: nichts (Tests ändern keinen Produktivcode). Bitte nur die Annahmen prüfen:
+1. GPU-Writes werden simuliert (`write_host` in die Host-Kopie), ohne echte Submission; nur
+   `a_title_write_reaches_the_gpu_side_of_a_copy_in_gpu_memory` läuft wirklich auf der GPU (Kartenkopie).
+2. Markierte Seiten gehen über `copy_back_marked` je Seite zurück (wie `copy_back_marks` es aufruft), nicht über
+   die globale Bitmap (sonst Wettlauf mit parallelen Tests).
+3. Für markierte Writes wird wie in draw.rs/bindless.rs der auf Seiten erweiterte Bereich aufgefrischt
+   (`page_range`). Ohne das fielen 10 von 64 Abläufen durch: Teilseiten bleiben "changed", `copy_back_marked`
+   verwirft dann die GPU-Bytes (dokumentierter shortcut). **unverified, for Fable:** gibt es Aufrufer, die markierte
+   Writes deklarieren, ohne den Seitenbereich aufzufrischen?
+4. Seiten, die Shader an berechneten Adressen schreiben (`copy_back_page`), sind nicht armiert: schreibt der Titel
+   dieselbe Seite während die GPU läuft, gehen die GPU-Bytes verloren (dokumentierter shortcut, einmal geloggt).
+   Test (b) schreibt für diesen Weg deshalb eine andere Seite. **unverified, for Fable:** für Stufe 3 relevant?
+5. Gerüste (d) für Z2: Erwartungen stehen in den Doc-Kommentaren; bitte bei der Umsetzung anpassen.
+

@@ -93,7 +93,12 @@ alle Opus-Karten 1.000 min = 16,7 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
 - PC: **PC 2**. Aufwärmen: nein. Abhängig von: Q1, Q2. Dauer: 40 min. Wer: Opus.
 
 ### Q6 Tests der Invarianten (Night-2-Regeln, "Tests")
-- Status: offen (kann sofort starten, keine Abhängigkeit)
+- Status: fertig (senior 47, 26.11. ~20:45). Beleg: `crates/victory-gpu/src/shadow_invariants.rs` (7 Tests
+  (a)-(c), 3 `#[ignore]`-Gerüste (d) für Z2), einziger Eingriff außerhalb: 6 Zeilen `#[cfg(test)] mod invariants;`
+  in shadow.rs. Rot-Beleg: 7 absichtliche Fehler in shadow.rs (lokal, nicht committet), jeder der 7 Tests mindestens
+  einmal rot, Original grün (JOURNAL "senior 47"). `cargo test --workspace` (--no-fail-fast, --skip
+  heap_direct_texture_reads_mark_their_heap_index): 935 ok, 2 rot (beide vorbestehend: xtask-Policy lower.rs,
+  descriptor::host view_addresses_cover_tables_made_afresh), 14 ignoriert. Fable-Review der Testannahmen: Inbox F2a.
 - Ziel: Synthetische Tests auf dem heutigen Code, die später den Umbau absichern:
   (a) eine von der CPU geschriebene Seite ist vor jedem GPU-Lesen synchronisiert (Refresh nach Guard-Fault);
   (b) eine von der GPU geschriebene Seite ist am Sync-Punkt für die CPU sichtbar (Copy-back markierter Seiten
@@ -108,7 +113,10 @@ alle Opus-Karten 1.000 min = 16,7 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
   Aufwärmen: nein. Abhängig von: nichts. Dauer: 2 h. Wer: Opus (Review Fable).
 
 ### Q7 Test für das Lauf-Skript (Env-Leck, Timeouts, Parsing)
-- Status: offen (sofort möglich)
+- Status: fertig (senior 47, 26.11. ~20:45). Beleg lokal (nicht im Repo): Agenten-Ordner `scripts/tests/`
+  (`test_runscripts.py`, Fixture aus Lauf 192359, Attrappe `stub/`, `redproof.py` -> `redproof.txt`). 10 Tests,
+  9 grün + 1 erwarteter Fehlschlag = Befund: n1run.ps1 wartet im finally per Prozessname (`Get-Process victory`)
+  und ohne Limit auf jede victory.exe (Entscheidung des Nutzers offen, JOURNAL "senior 47").
 - Ziel: Die lokalen Lauf-Skripte (`seq-pc1.ps1`, `n1run.ps1`, `pc1eval.py`, `memrep.py`, PC-2-Pendants)
   sind getestet: (a) kein VICTORY_* sickert in den Folgelauf (Vorfall 150437, JOURNAL 16:40); (b) harter
   Timeout greift (8 min + Rand) und beendet nach ExecutablePath, nicht nach Prozessname; (c) Parser liefert
