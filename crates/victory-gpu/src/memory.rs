@@ -679,6 +679,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let l = layout(key);
         let Layout { copies, blocks, owner, .. } = &*l;
         let arena = crate::arena::enabled();
+        // Only the builder's misses ask the arena for pages: other programs'
+        // took its whole budget in the loading screens before the builder
+        // first ran (run 144238: budget used, then its first submission read
+        // zeros and the device hung).
+        let asks = arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
@@ -695,7 +700,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
-                    if arena {
+                    if asks {
                         crate::arena::want_region(entry);
                     }
                     continue;
@@ -712,7 +717,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     _ => {
                         pages += 1;
                         missed.push(at);
-                        if arena {
+                        if asks {
                             wanted.push(at);
                         }
                     }
