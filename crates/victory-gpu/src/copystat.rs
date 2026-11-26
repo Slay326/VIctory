@@ -379,27 +379,110 @@ pub(crate) static HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
 /// power-of-two size class (who holds the big blocks of our heap).
 const LARGE: usize = 32 << 20;
 
+/// Allocations of at least this many bytes name their caller every time
+/// (a container doubling past it: the world's heap grows by one block of
+/// 34, 136, 544, 1088 MB over a run, 17 * 2^k MB, first-of-class logging
+/// hides every second step, run 20261126-115211).
+const HUGE: usize = 256 << 20;
+
+/// Whether an allocation of `size` bytes is logged, given the size classes
+/// `seen` so far (updated).
+fn worth_noting(size: usize, seen: &mut u64) -> bool {
+    let class = 1u64 << size.ilog2().min(63);
+    let first = *seen & class == 0;
+    *seen |= class;
+    first || size >= HUGE
+}
+
 /// Logs the stack of a large allocation of `size` bytes, the first of its
-/// size class.
+/// size class or any of [`HUGE`] bytes: the symbolized frames naming us,
+/// and the raw return addresses as `module+offset` (symbolized offline
+/// with the build's PDB when the running exe's PDB does not match, as in
+/// the run folders' copies).
 fn note_large(size: usize) {
     static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
     std::thread_local!(static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
-    let class = 1u64 << size.ilog2().min(63);
     if INSIDE.with(|i| i.replace(true)) {
         return;
     }
-    let first = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let first = *seen & class == 0;
-        *seen |= class;
-        first
-    };
-    if first {
+    let noted = worth_noting(size, &mut SEEN.lock().unwrap_or_else(|e| e.into_inner()));
+    if noted {
         let trace = std::backtrace::Backtrace::force_capture().to_string();
         let frames: Vec<&str> = trace.lines().filter(|l| l.contains("victory")).take(24).collect();
-        tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
+        tracing::info!(
+            mb = size >> 20,
+            heap_mb = HEAP_BYTES.load(Relaxed) >> 20,
+            "a large heap allocation: {} | raw {}",
+            frames.join(" | "),
+            raw_frames()
+        );
     }
     INSIDE.with(|i| i.set(false));
+}
+
+/// The current thread's return addresses as `module+offset`, space-separated
+/// (`exe+` for the executable).
+#[inline(never)]
+fn raw_frames() -> String {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW,
+            GetModuleHandleW,
+        };
+        let mut frames = [std::ptr::null_mut(); 40];
+        // SAFETY: room for `frames.len()` frames; skips this function.
+        let n = unsafe { RtlCaptureStackBackTrace(1, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) };
+        // SAFETY: the executable's own handle, no reference taken.
+        let exe = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+        let mut out = Vec::with_capacity(usize::from(n));
+        for &frame in &frames[..usize::from(n)] {
+            let mut module = std::ptr::null_mut();
+            // SAFETY: looks up the module holding the address, no reference.
+            let found = unsafe {
+                GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    frame as *const u16,
+                    &mut module,
+                )
+            } != 0;
+            out.push(module_offset(frame as usize, found.then_some(module as usize), exe));
+        }
+        out.join(" ")
+    }
+    #[cfg(not(windows))]
+    String::new()
+}
+
+/// `address` as an offset into the module at `module` (`exe+` if that is
+/// the executable at `exe`), or bare if no module holds it.
+fn module_offset(address: usize, module: Option<usize>, exe: usize) -> String {
+    match module {
+        Some(m) if m == exe => format!("exe+{:#x}", address - m),
+        Some(m) => format!("{m:#x}+{:#x}", address - m),
+        None => format!("{address:#x}"),
+    }
+}
+
+/// The Rust heap at the last [`heap_growth_per_frame`] call.
+static HEAP_AT_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// KB the Rust heap grew per frame over the `frames` frames since the last
+/// call (negative if it shrank).
+pub(crate) fn heap_growth_per_frame(frames: u64) -> f64 {
+    let now = HEAP_BYTES.load(Relaxed);
+    let before = HEAP_AT_LAST.swap(now, Relaxed);
+    growth_per_frame(before, now, frames)
+}
+
+/// KB per frame from `before` to `now` bytes over `frames` frames (none
+/// before the first measurement or without frames).
+fn growth_per_frame(before: u64, now: u64, frames: u64) -> f64 {
+    if before == 0 || frames == 0 {
+        return 0.0;
+    }
+    (now as f64 - before as f64) / 1e3 / frames as f64
 }
 
 // SAFETY: every call goes to the system allocator unchanged; only counted.
@@ -445,5 +528,39 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
             }
         }
         q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_doubling_container_is_noted_at_every_huge_step() {
+        // The world run's blocks: 114 and 401 MB at the title, then one
+        // container doubling 34, 68, 136, 272, 544, 1088 MB.
+        let mut seen = 0;
+        let noted: Vec<usize> = [114, 401, 34, 68, 136, 272, 544, 1088, 1088]
+            .into_iter()
+            .filter(|&mb| worth_noting(mb << 20, &mut seen))
+            .collect();
+        // 68 and 272 share a class with 114 and 401 and stay under HUGE;
+        // 1088 again is huge, so it shows again.
+        assert_eq!(noted, [114, 401, 34, 136, 272, 544, 1088, 1088]);
+    }
+
+    #[test]
+    fn heap_growth_is_per_frame_and_none_before_a_first_measurement() {
+        assert_eq!(growth_per_frame(0, 5_000_000, 10), 0.0);
+        assert_eq!(growth_per_frame(1_000_000, 2_000_000, 0), 0.0);
+        assert_eq!(growth_per_frame(1_000_000, 3_000_000, 100), 20.0);
+        assert_eq!(growth_per_frame(3_000_000, 1_000_000, 100), -20.0);
+    }
+
+    #[test]
+    fn frames_name_their_module() {
+        assert_eq!(module_offset(0x1400_1234, Some(0x1400_0000), 0x1400_0000), "exe+0x1234");
+        assert_eq!(module_offset(0x7ff0_0010, Some(0x7ff0_0000), 0x1400_0000), "0x7ff00000+0x10");
+        assert_eq!(module_offset(0x42, None, 0x1400_0000), "0x42");
     }
 }
