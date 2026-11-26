@@ -713,6 +713,42 @@ pub fn incomplete(left_out: Option<u64>, marked_not_taken: usize, outside: usize
     why
 }
 
+/// Marks an [`outside`] key whose entry lies in the null block: the 256 MiB
+/// region had no block, so only the page's offset in its region is known
+/// (`NULL_BLOCK | offset`), not the region.
+pub const NULL_BLOCK: u64 = 1 << 63;
+
+/// The accesses outside the capture of one harness run: entries its page
+/// bitmap `bits` set that the game's `game` did not, whose page was not
+/// captured before the run. Title addresses, or [`NULL_BLOCK`] keys.
+pub fn outside(
+    c: &Capture,
+    bits: &std::collections::BTreeSet<u32>,
+    game: &std::collections::BTreeSet<u32>,
+) -> std::collections::BTreeSet<u64> {
+    let pre: std::collections::BTreeSet<u64> = c
+        .pages_of(Stage::Pre)
+        .map(|p| p.address & !(PAGE - 1))
+        .collect();
+    bits.difference(game)
+        .filter_map(|&e| {
+            if (e as usize) < BLOCK {
+                return Some(NULL_BLOCK | u64::from(e) << 16);
+            }
+            c.table.address_of(e as usize).filter(|a| !pre.contains(a))
+        })
+        .collect()
+}
+
+/// An [`outside`] key as text: an address, or `null block +offset`.
+pub fn outside_text(k: u64) -> String {
+    if k & NULL_BLOCK != 0 {
+        format!("null block +{:#x}", k & !NULL_BLOCK)
+    } else {
+        format!("{k:#x}")
+    }
+}
+
 impl Capture {
     /// [`incomplete`] for what the capture alone says (before a run).
     pub fn incomplete_before_run(&self) -> Vec<String> {
@@ -933,6 +969,29 @@ mod tests {
         assert_eq!(incomplete(Some(0), 3, 0).len(), 1);
         assert_eq!(incomplete(Some(0), 0, 121).len(), 1);
         assert_eq!(incomplete(Some(1), 1, 1).len(), 3);
+    }
+
+    /// A2 step 1 (determinism of the accesses outside the capture): only
+    /// entries the harness set beyond the game's, whose page was not taken
+    /// before, count; one in the null block keeps its offset, not a region.
+    #[test]
+    fn accesses_outside_the_capture_are_the_harness_only_pages_not_taken() {
+        let c = sample();
+        let set = |v: &[u32]| v.iter().copied().collect::<std::collections::BTreeSet<u32>>();
+        let b = BLOCK as u32;
+        // 0x110: a page in a region without a block; b+3 captured (pre);
+        // b+4 not captured (an arena page only in G); b+5 not captured but
+        // the game set it too; b+6 not captured and the harness only.
+        let harness = set(&[0x110, b + 3, b + 4, b + 5, b + 6]);
+        let game = set(&[b + 5]);
+        let got = outside(&c, &harness, &game);
+        let want: std::collections::BTreeSet<u64> =
+            [NULL_BLOCK | 0x110_0000, 0xdd0040000, 0xdd0060000].into();
+        assert_eq!(got, want);
+        assert_eq!(outside_text(NULL_BLOCK | 0x110_0000), "null block +0x1100000");
+        assert_eq!(outside_text(0xdd0040000), "0xdd0040000");
+        // Same bits as the game: nothing outside.
+        assert!(outside(&c, &game, &game).is_empty());
     }
 
     #[test]

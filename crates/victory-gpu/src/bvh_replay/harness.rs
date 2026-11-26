@@ -965,31 +965,28 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
     // Self-check: the bitmap.
     let extra: Vec<u32> = first.bitmap.difference(&game_bits).copied().collect();
     let lacking: Vec<u32> = game_bits.difference(&first.bitmap).copied().collect();
-    let misses = |v: &[u32]| {
-        v.iter()
-            .filter(|&&e| {
-                (e as usize) < BLOCK
-                    || c.table.address_of(e as usize).is_some_and(|a| {
-                        !c.pages_of(Stage::Pre).any(|p| p.address & !(PAGE - 1) == a)
-                    })
-            })
-            .count()
-    };
+    // Accesses outside the capture, per run (A2 step 1: the same set in
+    // every run -> a computation; changing -> a race or undefined input).
+    let outs: Vec<BTreeSet<u64>> = results
+        .iter()
+        .map(|r| outside(&c, &r.bitmap, &game_bits))
+        .collect();
+    let out_first = outs[0].len();
     let self_ok = extra.is_empty() && lacking.is_empty();
     println!(
         "self-check bitmap: {} (harness only {}, of them outside the capture {}; game only {}){}",
         if self_ok { "EQUAL" } else { "DIFFERS" },
         extra.len(),
-        misses(&extra),
+        out_first,
         lacking.len(),
-        if misses(&extra) > 0 {
+        if out_first > 0 {
             " -> capture incomplete: fix the capture/harness first"
         } else {
             ""
         }
     );
     // What the accesses outside the capture were: entry kinds, first addresses.
-    let outside: Vec<String> = extra
+    let outside_first: Vec<String> = extra
         .iter()
         .take(8)
         .map(|&e| match c.table.address_of(e as usize) {
@@ -997,12 +994,32 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
                 "{at:#x} {:?}",
                 c.table.entries.get(e as usize).copied().unwrap_or_default()
             ),
-            None => format!("region {:#x}", u64::from(e) << 28),
+            None => format!("null block +{:#x}", u64::from(e) << 16),
         })
         .collect();
-    if !outside.is_empty() {
-        println!("harness only, first: {}", outside.join(", "));
+    if !outside_first.is_empty() {
+        println!("harness only, first: {}", outside_first.join(", "));
     }
+    for (k, o) in outs.iter().enumerate() {
+        println!(
+            "run {k}: outside the capture {}: {}",
+            o.len(),
+            o.iter().take(64).map(|&a| outside_text(a)).collect::<Vec<_>>().join(" ")
+        );
+    }
+    let union: BTreeSet<u64> = outs.iter().flatten().copied().collect();
+    let common: BTreeSet<u64> = union
+        .iter()
+        .copied()
+        .filter(|a| outs.iter().all(|o| o.contains(a)))
+        .collect();
+    println!(
+        "outside the capture over {} runs: {} (union {}, in every run {})",
+        outs.len(),
+        if outs.iter().all(|o| *o == outs[0]) { "IDENTICAL" } else { "VARYING" },
+        union.len(),
+        common.len()
+    );
     // Determinism.
     let all_pages: BTreeSet<u64> = results
         .iter()
@@ -1104,7 +1121,7 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
             std::fs::write(dir.join(format!("run{k}.pages")), bytes)?;
         }
     }
-    let invalid = incomplete(c.left_out(), c.marked_not_taken(), misses(&extra));
+    let invalid = incomplete(c.left_out(), c.marked_not_taken(), out_first);
     if !invalid.is_empty() {
         println!(
             "RESULT: CAPTURE INVALID ({}) ({:.1} s)",
