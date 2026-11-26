@@ -144,8 +144,11 @@ const CARD_MOST: u64 = 1 << 30;
 
 /// `VICTORY_CARD_BUFFERS_MB=auto`: the cap is the budget DXGI gives the
 /// process in the host GPU's own memory at the start
-/// (`Host::card_budget`, asked once) divided by this, in whole MiB, within
-/// [`CARD_AUTO_LEAST`] and [`CARD_AUTO_MOST`].
+/// (`Host::card_budget`, asked once) divided by this, rounded down to
+/// [`CARD_AUTO_STEP`], not below [`CARD_AUTO_LEAST`] where a quarter of the
+/// budget allows it (else a quarter of the budget), and not above
+/// [`CARD_AUTO_MOST`]:
+/// `clamp(round_down_64MiB(budget / 8), min(896 MiB, budget / 4), 4 GiB)`.
 ///
 /// Where the 8 comes from (measured on an RTX 3070 with
 /// `VICTORY_EVICT_UNWRITTEN=1` and `VICTORY_TEXTURE_HEAPS_LEAN=1`, budget at
@@ -153,17 +156,24 @@ const CARD_MOST: u64 = 1 << 30;
 /// 1,024 MiB and one of 896 MiB cost no GPU time, 896 left the card 48 MB
 /// over its budget instead of 113; 768 MiB cost 79 ms of GPU time a frame
 /// and 512 MiB 114 ms, as the copies the title's compute shaders use most
-/// no longer fit. Of whole divisors only 8 puts that card's cap in the free
-/// window [896, 1024) MiB: 906 MiB (7 gives 1,035, 9 gives 805). On an RTX
-/// 4070 (budget 11,242 MiB) it gives 1,405 MiB, room for every copy the
+/// no longer fit. Of whole divisors only 8 puts that card's share in the
+/// window [896, 1024) MiB (906 MiB; 7 gives 1,035, 9 gives 805). On an RTX
+/// 4070 (budget 11,242 MiB) the share is 1,405 MiB, room for every copy the
 /// world makes with its acceleration structure builds (about 1,060 MB).
-/// The cap is not below 896 MiB on budgets of 7,168 MiB or more.
 const CARD_AUTO_SHARE: u64 = 8;
 
-/// The least cap `auto` gives (a card with a budget below 2 GiB, or a
-/// budget DXGI got wrong): copies past it stay in system memory, slower for
-/// the GPU, the same bytes.
-const CARD_AUTO_LEAST: u64 = 256 << 20;
+/// The step `auto` rounds its share down to: small changes of the budget
+/// at the start (another program, a second monitor) leave the cap as it
+/// was, so runs stay comparable. The RTX 3070 gets 896 MiB, the value
+/// measured, the RTX 4070 1,344 MiB.
+const CARD_AUTO_STEP: u64 = 64 << 20;
+
+/// The least cap `auto` gives where a quarter of the budget allows it: what
+/// the copies the title's compute shaders use most need is a size, not a
+/// share of the card (896 MiB measured free of GPU time, 768 MiB not). On a
+/// card whose budget is below 3,584 MiB a quarter of the budget is the
+/// least instead (the quarter rule of an unset cap stays the hard limit).
+const CARD_AUTO_LEAST: u64 = 896 << 20;
 
 /// The most cap `auto` gives: more than every copy of the world on a 12 GB
 /// card, so a large card's budget does not reserve what no copy needs.
@@ -177,7 +187,7 @@ fn card_cap_for(cap: CardCap, budget: Option<u64>, most: u64) -> u64 {
         CardCap::Bytes(bytes) => bytes,
         CardCap::Default => most.min(budget.map_or(u64::MAX, |b| b / 4)),
         CardCap::Auto => match budget {
-            Some(b) if b > 0 => ((b / CARD_AUTO_SHARE) & !((1 << 20) - 1)).clamp(CARD_AUTO_LEAST, CARD_AUTO_MOST),
+            Some(b) if b > 0 => ((b / CARD_AUTO_SHARE) & !(CARD_AUTO_STEP - 1)).clamp(CARD_AUTO_LEAST.min(b / 4), CARD_AUTO_MOST),
             // No budget to share: what an unset cap gives without one.
             _ => most,
         },
@@ -2244,22 +2254,41 @@ pub(crate) mod tests {
     const BUDGET_12GB: u64 = 11_788_091_392;
     const MIB: u64 = 1 << 20;
 
-    /// `auto` on the 8 GB card: 906 MiB, inside the window measured free of
-    /// GPU time (896 MiB) and below the old 1 GiB.
+    /// Every budget DXGI gave at the start in the run logs of both test
+    /// machines (87 runs on the RTX 3070, 13 on the RTX 4070; one value
+    /// each), with the cap `auto` gives.
+    const LOGGED: [(u64, u64); 2] = [(BUDGET_8GB, 896 * MIB), (BUDGET_12GB, 1344 * MIB)];
+
+    /// `auto` on the 8 GB card: 896 MiB, the cap measured free of GPU time
+    /// (its share, 906 MiB, rounded down to 64 MiB).
     #[test]
-    fn an_auto_cap_on_an_8_gb_card_lies_in_the_free_window() {
+    fn an_auto_cap_on_an_8_gb_card_is_the_measured_896_mib() {
         let cap = card_cap_for(card_cap_asked(Some("auto")), Some(BUDGET_8GB), CARD_MOST);
-        assert_eq!(cap, 906 * MIB);
-        assert!((896 * MIB..1024 * MIB).contains(&cap), "{}", cap / MIB);
+        assert_eq!(cap, 896 * MIB, "{} MiB", cap / MIB);
     }
 
-    /// `auto` on the 12 GB card: 1,405 MiB, more than the 1 GiB an unset cap
+    /// `auto` on the 12 GB card: 1,344 MiB, more than the 1 GiB an unset cap
     /// gives there.
     #[test]
     fn an_auto_cap_on_a_12_gb_card_is_larger() {
         let cap = card_cap_for(card_cap_asked(Some("auto")), Some(BUDGET_12GB), CARD_MOST);
-        assert_eq!(cap, 1405 * MIB);
+        assert_eq!(cap, 1344 * MIB, "{} MiB", cap / MIB);
         assert!(cap > card_cap_for(CardCap::Default, Some(BUDGET_12GB), CARD_MOST));
+    }
+
+    /// The budgets of the logs give their caps; on the 8 GB card a budget
+    /// smaller or larger by some hundred MiB at the start (82 MiB: a
+    /// browser) keeps 896 MiB.
+    #[test]
+    fn logged_budgets_give_their_caps_and_small_changes_keep_them() {
+        for (budget, cap) in LOGGED {
+            assert_eq!(card_cap_for(CardCap::Auto, Some(budget), CARD_MOST), cap, "budget {budget}");
+        }
+        for budget in [BUDGET_8GB - 82 * MIB, BUDGET_8GB - 1024 * MIB, BUDGET_8GB + 400 * MIB, 3584 * MIB, 7680 * MIB - 1] {
+            assert_eq!(card_cap_for(CardCap::Auto, Some(budget), CARD_MOST), 896 * MIB, "budget {} MiB", budget / MIB);
+        }
+        assert_eq!(card_cap_for(CardCap::Auto, Some(7680 * MIB), CARD_MOST), 960 * MIB);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(BUDGET_12GB - 82 * MIB), CARD_MOST), 1344 * MIB);
     }
 
     /// A number stays an override on any card; unset stays as it was.
@@ -2278,8 +2307,8 @@ pub(crate) mod tests {
 
     /// The edges: `auto` in any case and with blanks, words and numbers too
     /// large are unset, no budget (or 0) gives what unset gives without one,
-    /// tiny and huge budgets stay within the bounds, and the cap is whole
-    /// MiB.
+    /// below 3,584 MiB the cap is a quarter of the budget, huge budgets stop
+    /// at 4 GiB, and above the least the cap is whole steps of 64 MiB.
     #[test]
     fn the_auto_cap_holds_at_its_edges() {
         assert_eq!(card_cap_asked(Some(" AUTO ")), CardCap::Auto);
@@ -2289,13 +2318,18 @@ pub(crate) mod tests {
         assert_eq!(card_cap_asked(Some("18446744073709551615")), CardCap::Default, "overflows as bytes");
         assert_eq!(card_cap_for(CardCap::Auto, None, CARD_MOST), CARD_MOST);
         assert_eq!(card_cap_for(CardCap::Auto, Some(0), CARD_MOST), CARD_MOST);
-        assert_eq!(card_cap_for(CardCap::Auto, Some(1 << 30), CARD_MOST), CARD_AUTO_LEAST);
-        assert_eq!(card_cap_for(CardCap::Auto, Some(1), CARD_MOST), CARD_AUTO_LEAST);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(1 << 30), CARD_MOST), 256 * MIB, "a quarter of 1 GiB");
+        assert_eq!(card_cap_for(CardCap::Auto, Some(2 << 30), CARD_MOST), 512 * MIB);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(3 << 30), CARD_MOST), 768 * MIB);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(3584 * MIB - 4), CARD_MOST), 3584 * MIB / 4 - 1);
+        assert_eq!(card_cap_for(CardCap::Auto, Some(1), CARD_MOST), 0);
         assert_eq!(card_cap_for(CardCap::Auto, Some(64 << 30), CARD_MOST), CARD_AUTO_MOST);
         assert_eq!(card_cap_for(CardCap::Auto, Some(u64::MAX), CARD_MOST), CARD_AUTO_MOST);
-        assert_eq!(card_cap_for(CardCap::Auto, Some(7168 * MIB), CARD_MOST), 896 * MIB, "not below 896 MiB from 7,168 MiB");
-        assert_eq!(card_cap_for(CardCap::Auto, Some(7168 * MIB - 1), CARD_MOST), 895 * MIB);
-        assert_eq!(card_cap_for(CardCap::Auto, Some(BUDGET_8GB + 12345), CARD_MOST) % MIB, 0);
+        for budget in [8000 * MIB, 9999 * MIB + 7, 16 << 30, 20000 * MIB] {
+            let cap = card_cap_for(CardCap::Auto, Some(budget), CARD_MOST);
+            assert_eq!(cap % (64 * MIB), 0, "budget {} MiB: {} MiB", budget / MIB, cap / MIB);
+            assert!(cap <= budget / 8 && cap > budget / 8 - 64 * MIB);
+        }
     }
 
     /// A copy in the GPU's memory: title memory reaches the GPU's side;

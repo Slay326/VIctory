@@ -132,7 +132,7 @@ impl Host {
 
     /// The video memory budget DXGI gives the process in the host GPU's
     /// own memory, asked once; `None` where it cannot be asked. Copies in
-    /// the GPU's memory take at most a quarter of it, an eighth with
+    /// the GPU's memory take at most a quarter of it, about an eighth with
     /// `VICTORY_CARD_BUFFERS_MB=auto`, any with a number there
     /// (`crate::shadow`), so that
     /// a card with less memory than the 8 GB they were measured on keeps
