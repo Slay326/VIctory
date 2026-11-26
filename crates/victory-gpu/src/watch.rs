@@ -815,9 +815,18 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// [`writing`] for the runtime's writes on the title's behalf (kernel file
+/// reads, DirectStorage, clearing pages), counted apart from the title's
+/// own CPU writes by the stage 1 classification (`crate::memclass`).
+pub fn kernel_will_write(at: usize, len: usize) -> Writing {
+    crate::memclass::tag(crate::memclass::f::CPU_W_RUNTIME, at, len);
+    writing(at, len)
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::memclass::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     // Our own address of what it showed is no longer its address (taken
     // before the guards, never under them: see `Own`).
@@ -961,6 +970,7 @@ pub(crate) fn own_view_on() -> bool {
 /// we map a view of our own of all of it, kept until the section goes.
 pub fn title_memory_section(section: usize, bytes: usize) {
     use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    crate::memclass::section(section, bytes);
     if !own_view_on() {
         return;
     }
@@ -1005,6 +1015,7 @@ fn unmap_own(base: usize) {
 /// The runtime mapped `len` bytes of a section (its handle) from byte
 /// `offset` on at `at` (after `title_memory_remapped` of the range).
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: usize) {
+    crate::memclass::view(at, len, section, offset);
     if !own_view_on() || len == 0 {
         return;
     }
@@ -1148,6 +1159,9 @@ fn install() {
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            // Outside the guards' lock (stage 1 classification).
+            drop(g);
+            crate::memclass::tag(crate::memclass::f::CPU_W_TITLE, at, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {

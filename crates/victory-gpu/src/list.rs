@@ -905,6 +905,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     list.defer_after(move || {
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
+            crate::memclass::tag(crate::memclass::f::GPU_W_COPY, title + at, n);
             let _writing = crate::watch::writing(title + at, n);
             crate::host::write_mapped((title + at) as *mut u8, (data + at) as *const u8, n);
         }

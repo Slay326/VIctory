@@ -388,6 +388,25 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
     write_runs_by(at, merged, runs, None) != Put::Nothing
 }
 
+/// Stage 1 classification (`crate::memclass`): a copy-back's spans at an
+/// address and when it began, counted as GPU writes and sync traffic when
+/// dropped (the write done).
+struct Classified<'a>(usize, &'a [(usize, usize)], std::time::Instant);
+
+impl Drop for Classified<'_> {
+    fn drop(&mut self) {
+        let us = self.2.elapsed().as_micros() as u64;
+        let mut bytes = 0;
+        for &(start, end) in self.1 {
+            crate::memclass::tag(crate::memclass::f::GPU_W_BACK, self.0 + start, end - start);
+            bytes += end - start;
+        }
+        if let Some(&(first, _)) = self.1.first() {
+            crate::memclass::sync(crate::memclass::Sync::Back, self.0 + first, bytes, us);
+        }
+    }
+}
+
 /// What a copy-back's write did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Put {
@@ -414,6 +433,8 @@ fn write_runs_by(at: usize, merged: &[u8], runs: &[(usize, usize)], tracked: Opt
             _ => spans.push((start, end)),
         }
     }
+    // Stage 1 classification: the bytes shaders wrote that go back.
+    let _classified = crate::memclass::on().then(|| Classified(at, &spans, std::time::Instant::now()));
     // True if every span landed.
     let put = |delta: usize| {
         let mut all = true;
@@ -824,6 +845,7 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((address, address + len));
+        crate::memclass::tag(crate::memclass::f::GPU_W_DECL, address, len);
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             return;
@@ -1194,7 +1216,11 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        let classify = crate::memclass::on().then(std::time::Instant::now);
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if let Some(started) = classify {
+            crate::memclass::sync(crate::memclass::Sync::Up, from, to - from, started.elapsed().as_micros() as u64);
+        }
         self.card_changed(from - start, to - start);
         if let Some(t) = &self.tracked {
             // SAFETY: `to - from` bytes inside the mapping, just copied.
@@ -1570,6 +1596,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     if !held.is_empty() {
         let m = marks();
         for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            crate::memclass::tag(crate::memclass::f::GPU_W_MARK, page, PAGE);
             crate::memory::drop_withheld(page, PAGE);
         }
     }
@@ -1580,6 +1607,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    for (_, page) in &pages {
+        crate::memclass::tag(crate::memclass::f::GPU_W_MARK, *page, PAGE);
+    }
     // Of copies in the GPU's memory, the marked pages come down to the
     // CPU's sides first (one fetch for all of them). They are armed before:
     // the fetch is a round trip to the GPU while the title runs, and a title

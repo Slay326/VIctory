@@ -123,7 +123,26 @@ const COUNTERS: usize = 68;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
+    let i = c as usize;
+    COUNT[i].fetch_add(n, Relaxed);
+    if TOTALS.load(Relaxed) {
+        TOTAL[i].fetch_add(n, Relaxed);
+    }
+}
+
+/// Counters over the run (not cleared by the log line), kept only once
+/// asked for: the memclass stream checks its records against them.
+static TOTAL: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+static TOTALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on, counters are kept over the run too ([`total`]).
+pub(crate) fn keep_totals() {
+    TOTALS.store(true, Relaxed);
+}
+
+/// Counter `c` since [`keep_totals`].
+pub(crate) fn total(c: C) -> u64 {
+    TOTAL[c as usize].load(Relaxed)
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.

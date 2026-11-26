@@ -333,6 +333,7 @@ static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// garbage BVH nodes over meshlet buffers, run shards20), else from the
 /// frame's end ([`retake_dropped`]).
 pub(crate) fn drop_withheld(address: usize, len: usize) {
+    crate::memclass::tag(crate::memclass::f::GPU_W_KEPT, address, len);
     if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
         crate::watch::retake(address, len);
     } else {
@@ -579,7 +580,15 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
+        // Stage 1 classification: every copy the table names is one shaders
+        // may read (`crate::memclass`, GPU-read proxy), written or not;
+        // once per table and frame (the table is the same for every list).
+        let classify = crate::memclass::on() && crate::memclass::first_in_frame(Arc::as_ptr(l) as usize);
         for (c, bit) in l.copies.iter().zip(&l.bits) {
+            if classify {
+                let (start, len) = c.range();
+                crate::memclass::tag_units(crate::memclass::f::GPU_R_TABLE, start as usize, len as usize);
+            }
             if !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
