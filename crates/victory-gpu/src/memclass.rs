@@ -83,12 +83,18 @@ pub(crate) mod f {
     /// or the one before: the title's CPU wrote it, seen or not by a fault
     /// (a page left open after its first write faults no more).
     pub(crate) const CPU_W_DIRTY: u16 = 1 << 13;
+    /// Shaders wrote a page at addresses they computed and the copy-back
+    /// dropped it: the title wrote the page since the copy took it, its
+    /// bytes kept (`Shadow::copy_back_page`, "both wrote"). The whole page
+    /// (cut to the copy): which of its bytes the GPU wrote is not known
+    /// there. In no class rule (a diagnosis of H-02, local test branch).
+    pub(crate) const GPU_W_LOST: u16 = 1 << 14;
     /// Our own writes that make a refresh copy a unit again (not the CPU's).
     pub(crate) const OURS: u16 = GPU_W_MARK | GPU_W_BACK | GPU_W_COPY | GPU_W_KEPT | CPU_W_RUNTIME | REMAP;
 }
 
 /// Names of the flags, by bit (logs, the stream's documentation).
-pub(crate) const FLAG_NAMES: [&str; 14] = [
+pub(crate) const FLAG_NAMES: [&str; 15] = [
     "cpu_w_title",
     "cpu_w_runtime",
     "cpu_r_after_gpu",
@@ -103,6 +109,7 @@ pub(crate) const FLAG_NAMES: [&str; 14] = [
     "remap",
     "copied_up",
     "cpu_w_dirty",
+    "gpu_w_lost",
 ];
 
 /// Traffic that keeps the copies and title memory in step.
@@ -188,9 +195,26 @@ pub fn init() {
     ON.store(c.is_some(), Release);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the classifier this thread's hooks use instead of the
+    /// process's ([`on_this_thread`]).
+    static ON_THREAD: std::cell::Cell<Option<&'static Classifier>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: hooks called on this thread go to `c` (None: as before).
+#[cfg(test)]
+pub(crate) fn on_this_thread(c: Option<&'static Classifier>) {
+    ON_THREAD.with(|t| t.set(c));
+}
+
 /// The process's classifier, if [`init`] made one; never makes it.
 #[inline]
 fn global() -> Option<&'static Classifier> {
+    #[cfg(test)]
+    if let Some(c) = ON_THREAD.with(std::cell::Cell::get) {
+        return Some(c);
+    }
     if !ON.load(Acquire) {
         return None;
     }
@@ -263,6 +287,12 @@ pub(crate) fn copied_back(at: usize, spans: &[(usize, usize)], landed: bool, us:
 /// its end when dropped.
 pub(crate) fn submission(lists: usize) -> Option<Submission<'static>> {
     global().map(|c| c.submit(lists))
+}
+
+/// The number of the latest submission begun (the stream's `seq`); 0 with
+/// classifying off or before the first.
+pub(crate) fn seq() -> u64 {
+    global().map_or(0, |c| c.submissions.load(Relaxed))
 }
 
 /// Hook: a point of the submission under way.
@@ -1207,4 +1237,4 @@ impl Stream {
 
 #[cfg(test)]
 #[path = "memclass_tests.rs"]
-mod tests;
+pub(crate) mod tests;

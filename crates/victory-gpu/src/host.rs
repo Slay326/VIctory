@@ -1164,6 +1164,10 @@ struct Deferred {
     /// builder wrote through views of title buffers larger than
     /// [`crate::arena::BACK`]: they stay out of title memory.
     on_card: Vec<(usize, usize, usize)>,
+    /// With `VICTORY_BVH_ROOTS_LOG=1`: root views 0 and 4 the builder's
+    /// dispatches read (pipeline, slot, address, bytes from it to its
+    /// copy's end, 0 without a copy), each once (`crate::bvh_gt::roots`).
+    roots: Vec<(String, u8, u64, u64)>,
 }
 
 impl Host {
@@ -1509,6 +1513,10 @@ impl Host {
             let marks = lists.iter().flat_map(|l| l.deferred().gt.iter().map(|f| f()).collect::<Vec<_>>()).collect();
             crate::bvh_gt::Gt::take(*submitted, lists.len(), marks)
         });
+        if crate::bvh_gt::roots_log() {
+            let roots: Vec<(String, u8, u64, u64)> = runs.iter().flat_map(|l| l.deferred().roots.clone()).collect();
+            crate::bvh_gt::roots(*submitted, crate::memclass::seq(), &roots);
+        }
         if let Some(hash) = crate::bvh_gt::reader_target()
             && runs.iter().any(|l| l.uses_pipeline(hash))
         {
@@ -2349,6 +2357,15 @@ impl HostList {
     /// once the list has run, before the copy-backs clear it.
     pub(crate) fn defer_gt(&self, marks: impl Fn() -> crate::bvh_gt::Marks + Send + 'static) {
         self.deferred().gt.push(Box::new(marks));
+    }
+
+    /// With `VICTORY_BVH_ROOTS_LOG=1`: a builder dispatch reads root view
+    /// `slot` at `address` (`len`: bytes to its copy's end); kept once.
+    pub(crate) fn note_builder_root(&self, pipeline: &str, slot: u8, address: u64, len: u64) {
+        let mut d = self.deferred();
+        if !d.roots.iter().any(|r| r.0 == pipeline && r.1 == slot && r.2 == address) {
+            d.roots.push((pipeline.to_owned(), slot, address, len));
+        }
     }
 
     /// Whether the list bound a pipeline whose name holds `part` (a shader

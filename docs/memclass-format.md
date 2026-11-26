@@ -48,6 +48,7 @@ The same bits are used in the log (`ever=0x....`) and in the stream (`flag`).
 | 11 | `remap` | `title_memory_remapped` | |
 | 12 | `copied_up` | a refresh copied the unit (SYNC up); units only, no ACCESS record | |
 | 13 | `cpu_w_dirty` | derived at the frame end, units only: `copied_up` in this frame, the unit was copied before, and none of `gpu_w_mark`, `gpu_w_back`, `gpu_w_copy`, `gpu_w_kept`, `cpu_w_runtime`, `remap` in this frame or the one before | the title's CPU wrote it although no fault was seen (a page left open after its first write faults no more; Fable P2 A3). A replayer derives it the same way from SYNC up records |
+| 14 | `gpu_w_lost` | `Shadow::copy_back_page` when it keeps the title's bytes (the title wrote the page since the take, nothing saved: "both wrote a page", the shaders' bytes of the page are dropped) | the whole page cut to the copy (64 KiB at most; which bytes the GPU wrote is not known there); in no class rule. Added on the local test branch a1c/lost (H-02 intersection, night 2) without a new version: v1 readers that ignore unknown flag bits read such streams unchanged |
 
 GPU-read proxies are bits 7-9; the reader picks which count (F1 question 2).
 

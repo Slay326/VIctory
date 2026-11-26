@@ -80,6 +80,37 @@ pub(crate) fn reader_target() -> Option<&'static str> {
         .as_deref()
 }
 
+/// `VICTORY_BVH_ROOTS_LOG=1` (H-02 intersection, night 2): after each
+/// submission with builder dispatches, one line with the root views 0 and 4
+/// they read: pipeline, slot, address, and bytes from it to the end of its
+/// title buffer (the range a root view refreshes and reaches, `crate::draw`;
+/// 0 if no buffer holds it). With the memclass `seq` of the submission (0
+/// with memclass off), to meet its `gpu_w_lost` records.
+/// `VICTORY_BVH_ROOTS_MAX` (2000): the most lines in a run.
+pub(crate) fn roots_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_ROOTS_LOG").is_ok_and(|v| v.trim() == "1"))
+}
+
+static ROOT_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// The line of [`roots_log`] for host submission `submission`.
+pub(crate) fn roots(submission: u64, seq: u64, roots: &[(String, u8, u64, u64)]) {
+    if roots.is_empty() || ROOT_LINES.fetch_add(1, Ordering::Relaxed) >= number("VICTORY_BVH_ROOTS_MAX", 2000) {
+        return;
+    }
+    tracing::info!(target: "victory_gpu::bvh_gt", "{}", roots_line(submission, seq, roots));
+}
+
+fn roots_line(submission: u64, seq: u64, roots: &[(String, u8, u64, u64)]) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!("BVH roots s{submission} seq {seq}: {} views", roots.len());
+    for (pipeline, slot, at, len) in roots {
+        let _ = write!(line, "; [{pipeline}] slot {slot} at {at:#x} len {len:#x}");
+    }
+    line
+}
+
 #[derive(Default)]
 struct Last {
     submission: u64,
@@ -775,6 +806,17 @@ mod tests {
 
     fn read_of(words: &[u32], base: u64) -> impl Fn(u64) -> Option<u32> + '_ {
         move |at| words.get(at.checked_sub(base)? as usize / 4).copied()
+    }
+
+    /// The roots line names submission, seq and each view, as the
+    /// intersection script reads it (`scripts/h02/intersect.py`).
+    #[test]
+    fn the_roots_line_has_every_view() {
+        let roots = [("compute 5552dac6abc".to_owned(), 0u8, 0xd722_7a400u64, 0x1000u64), ("compute 5552dac6abc".to_owned(), 4, 0xd722_7a440, 0)];
+        assert_eq!(
+            roots_line(17, 3, &roots),
+            "BVH roots s17 seq 3: 2 views; [compute 5552dac6abc] slot 0 at 0xd7227a400 len 0x1000; [compute 5552dac6abc] slot 4 at 0xd7227a440 len 0x0"
+        );
     }
 
     #[test]

@@ -1165,6 +1165,16 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        // `VICTORY_BVH_ROOTS_LOG`: where the builder reads through root
+        // views 0 and 4 (H-02 intersection, `crate::bvh_gt::roots`).
+        if crate::bvh_gt::roots_log() && crate::pipeline::is_builder(self.pipeline as This) {
+            for slot in [0u8, 4] {
+                if let Some(&Root::View(address)) = self.roots_ref(true).get(usize::from(slot)) {
+                    let len = crate::shadow::holding(address).map_or(0, |(start, len)| (start + len).saturating_sub(address));
+                    list.note_builder_root(&p.name, slot, address, len);
+                }
+            }
+        }
         // `VICTORY_BVH_UAV_BARRIER`: the builder's stages each see the
         // writes of every dispatch before them in the list.
         if crate::bvh_gt::uav_barrier() && crate::pipeline::is_builder(self.pipeline as This) {

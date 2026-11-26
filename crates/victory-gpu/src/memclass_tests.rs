@@ -347,7 +347,7 @@ fn sync_over_regions_is_shared_by_bytes() {
 
 /// A record of the stream, decoded (`docs/memclass-format.md`).
 #[derive(Debug, PartialEq, Eq)]
-enum Record {
+pub(crate) enum Record {
     Access { flag: u16, seq: u64, at: u64, len: u64 },
     Counters([u64; 4]),
     Submit { seq: u64, lists: u64 },
@@ -358,7 +358,7 @@ enum Record {
     End(u64),
 }
 
-fn decode(bytes: &[u8]) -> (u8, Vec<Record>) {
+pub(crate) fn decode(bytes: &[u8]) -> (u8, Vec<Record>) {
     assert_eq!(&bytes[..4], STREAM_MAGIC);
     assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), STREAM_VERSION);
     let shift = bytes[6];

@@ -298,6 +298,57 @@ fn a_gpu_write_is_in_title_memory_at_the_sync_point() {
     }
 }
 
+/// H-02 diagnosis (memclass, night 2): a page written at computed
+/// addresses whose copy-back keeps the title's bytes (the title wrote
+/// elsewhere in the page since the take: "both wrote", the GPU's bytes are
+/// dropped) leaves one `gpu_w_lost` record: the page cut to the copy, with
+/// the submission it happened in. A title write on another page leaves none
+/// (the GPU's byte goes back).
+#[test]
+fn a_copy_back_that_drops_the_gpus_bytes_leaves_a_lost_record() {
+    use crate::memclass::{Classifier, Config, f::GPU_W_LOST, tests::Record};
+    for same_page in [true, false] {
+        let Some(f) = Fixture::new(2, pattern) else {
+            return; // no host GPU here
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "memclass-lost-{}-{:?}-{same_page}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.vmcs");
+        let config = Config { shift: 16, stream: Some(path.clone()), stream_frames: 0, interval_s: 3600, table_s: 3600 };
+        let c: &'static Classifier = Box::leak(Box::new(Classifier::new(config)));
+        crate::memclass::on_this_thread(Some(c));
+        let sub = c.submit(1);
+        let a = PAGE + 0x88;
+        let b = if same_page { PAGE + 0x4000 } else { 0x4000 };
+        submission(&f, Back::Computed, 0, f.len, &[(a, 0x8e)], &[(b, 0xb1)]);
+        drop(sub);
+        crate::memclass::on_this_thread(None);
+        c.finish();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_, records) = crate::memclass::tests::decode(&bytes);
+        let lost: Vec<Record> = records
+            .into_iter()
+            .filter(|r| matches!(r, Record::Access { flag, .. } if flag & GPU_W_LOST != 0))
+            .collect();
+        if same_page {
+            assert_eq!(f.title(a), pattern(a), "the GPU's byte at {a:#x} is lost today (what the record reports)");
+            assert_eq!(
+                lost,
+                [Record::Access { flag: GPU_W_LOST, seq: 1, at: (f.p + PAGE) as u64, len: PAGE as u64 }],
+                "one record: the page, in submission 1"
+            );
+        } else {
+            assert_eq!(f.title(a), 0x8e, "the GPU's byte at {a:#x} went back");
+            assert_eq!(lost, [], "nothing lost, no record");
+        }
+    }
+}
+
 // ---------------------------------------------------------------- (c) ---
 
 /// A step of a simulated schedule.

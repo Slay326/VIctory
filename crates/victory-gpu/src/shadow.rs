@@ -643,6 +643,8 @@ impl Shadow {
             saved = t.saved(page / PAGE);
             if saved.is_none() && t.changed(page / PAGE) {
                 t.unarm(page / PAGE);
+                // H-02 diagnosis (memclass on): where GPU bytes got lost.
+                crate::memclass::tag(crate::memclass::f::GPU_W_LOST, from, to - from);
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!(
