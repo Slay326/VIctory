@@ -150,7 +150,20 @@ classification, one region per line, `<at> <len> <class>` or
 `unknown`). Output: per region events, contradictions to its class,
 demotions with reasons, checks and violations per invariant, then
 `invariants: ok|VIOLATED`, `classification: consistent|REFUTED`,
-`verdict: GREEN|RED`. Stage 3 hooks in through the trait `MemModel`;
+`stream self-check`, `cpu reads`, `verdict: GREEN|RED|INVALID`.
+
+- Self-check first (verdict INVALID if it fails): `END` present, `COUNTERS`
+  after every `FRAME`, submissions 1, 2, ... each `SUBMIT`, one or more
+  `POINT executed`, one `gpu_done`, one `end`; no access of a submission
+  not begun; totals against the last `COUNTERS` (`SYNC up` = `copied`;
+  with copystat also refresh records and title-write records).
+- Bytes checked: both ends of every record and one per 4 KiB, plus the
+  byte before and after (guards). Decisions per the stream's unit (4 KiB
+  or 64 KiB, in the report as `decision unit`).
+- `cpu_r_after_gpu` (bit 2) is replayed as a CPU touch without a write.
+  Without such records a page the title only reads is never seen: the
+  report says `CPU reads not in the stream, GPU-only not provable`, and a
+  green replay with GPU-only regions is not a gate-3 proof. Stage 3 hooks in through the trait `MemModel`;
 `Today` is the engine as it is, `NoNet` and `RefNet` are test models.
 
     set VICTORY_REPLAY_STREAM=<capture.vmcs>

@@ -40,11 +40,20 @@
 //!   classified region are counted, not replayed. Views of one section are
 //!   not aliased (each range its own pool). `REGION` and `remap` records are
 //!   counted only.
-//! - Bytes are sampled: a CPU record writes its first byte and one byte per
-//!   64 KiB page it covers; a GPU write record (`gpu_w_back`, `gpu_w_copy`)
-//!   writes its first and last byte and one per page. `gpu_w_mark` and
-//!   `gpu_w_kept` are counted only (the bytes that went back are the
-//!   `gpu_w_back` records of the same copy-back).
+//! - Bytes are sampled: a write record (CPU, or GPU: `gpu_w_back`,
+//!   `gpu_w_copy`) writes its first and last byte and one at each 4 KiB
+//!   boundary in it; the byte before and after it are checked as guards.
+//!   `gpu_w_mark` and `gpu_w_kept` are counted only (the bytes that went
+//!   back are the `gpu_w_back` records of the same copy-back).
+//! - The model decides per the stream's unit (4 KiB or 64 KiB, or
+//!   `Replay::unit`); the copies sync and the touch check cover the 64 KiB
+//!   memory page. `Shadow::copy_back_page` keeps a page's title bytes when
+//!   the title wrote it since the take: a net deciding per 4 KiB that syncs
+//!   through it loses the GPU's bytes of a second unit of such a page
+//!   (finding for the stage 3 net, not tested here).
+//! - `cpu_r_after_gpu` (reserved in v1) is a CPU touch without a write;
+//!   without such records GPU-only cannot be proven (the report says so).
+//! - A stream failing [`self_check`] gives the verdict INVALID.
 //! - A byte the CPU and the GPU both write within one submission is a race
 //!   in the title too: it is not checked.
 //! - GPU writes of a submission are made when their records come (after
@@ -305,6 +314,10 @@ pub(crate) enum CpuKind {
     Title,
     /// The runtime for the title (`cpu_w_runtime`: file reads, clearing).
     Runtime,
+    /// The title read memory the GPU wrote (`cpu_r_after_gpu`; reserved in
+    /// v1, no recorder writes it yet: then a page the title only reads is
+    /// never seen, and GPU-only cannot be proven).
+    Read,
 }
 
 /// What the model does when the CPU is about to touch a page.
@@ -319,6 +332,10 @@ pub(crate) enum Touch {
     /// Synced as `Sync`, and demoted to shared for good (the reason is
     /// logged and counted per region).
     Demote(&'static str),
+    /// Demoted as `Demote`, but synced by putting the copy's whole 64 KiB
+    /// page into title memory (a naive net: it loses the CPU's bytes in the
+    /// page; only a planted fault of the tests answers this).
+    DemoteWhole(&'static str),
 }
 
 /// The memory model's decisions, per page: where the stage 3 logic
@@ -340,8 +357,10 @@ pub(crate) trait MemModel {
     /// At the sync point: do the GPU's writes in the page go back into
     /// title memory?
     fn copy_back(&self, page: Page) -> bool;
-    /// The CPU is about to write the page (detected by the guard or the
-    /// runtime's report).
+    /// The CPU is about to write (or, `CpuKind::Read`, read) the page
+    /// (detected by the guard or the runtime's report). A page is the
+    /// replay's decision unit (`Replay::unit`: the stream's unit, 4 KiB or
+    /// 64 KiB, unless set).
     fn cpu_touch(&mut self, page: Page, kind: CpuKind) -> Touch;
     /// A frame ended (a model may reclassify here).
     fn frame(&mut self, _frame: u64) {}
@@ -404,6 +423,8 @@ pub(crate) struct RefNet {
     pub(crate) classes: Vec<Class>,
     pub(crate) demoted: BTreeSet<Page>,
     pub(crate) forget_on_frame: bool,
+    /// Planted fault: syncs a demoted page whole (`Touch::DemoteWhole`).
+    pub(crate) whole_page_sync: bool,
 }
 
 impl RefNet {
@@ -412,6 +433,7 @@ impl RefNet {
             classes,
             demoted: BTreeSet::new(),
             forget_on_frame: false,
+            whole_page_sync: false,
         }
     }
     fn gpu_only(&self, p: Page) -> bool {
@@ -423,10 +445,10 @@ impl MemModel for RefNet {
     fn name(&self) -> String {
         format!(
             "refnet (test model){}",
-            if self.forget_on_frame {
-                ", forgets demotions"
-            } else {
-                ""
+            match (self.forget_on_frame, self.whole_page_sync) {
+                (true, _) => ", forgets demotions",
+                (_, true) => ", syncs whole pages",
+                _ => "",
             }
         )
     }
@@ -450,10 +472,16 @@ impl MemModel for RefNet {
             return Touch::Nothing;
         }
         self.demoted.insert(p);
-        Touch::Demote(match kind {
+        let why = match kind {
             CpuKind::Title => "title write",
             CpuKind::Runtime => "runtime write",
-        })
+            CpuKind::Read => "title read",
+        };
+        if self.whole_page_sync {
+            Touch::DemoteWhole(why)
+        } else {
+            Touch::Demote(why)
+        }
     }
     fn frame(&mut self, _: u64) {
         if self.forget_on_frame {
@@ -462,15 +490,137 @@ impl MemModel for RefNet {
     }
 }
 
+// ------------------------------------------------------- the self-check ---
+
+/// The stream's self-check (F4 review P4): problems found, empty if it
+/// passed. A stream that fails it is not replayed as evidence (verdict
+/// INVALID). Checked: it ended (`END`); a `COUNTERS` record after every
+/// `FRAME`; submissions numbered 1, 2, ... one at a time, each `SUBMIT`,
+/// one or more `POINT executed`, one `POINT gpu_done`, one `POINT end`, in
+/// that order; no `ACCESS` with a submission not begun; and the totals
+/// against the last `COUNTERS`: `SYNC up` bytes = `copied`, and where
+/// copystat counts (diagnostics builds) `gpu_r_refresh` records =
+/// `refreshes` and `cpu_w_title` records = `faults`. (Records lost by the
+/// recorder show as a difference in these totals.)
+pub(crate) fn self_check(s: &Stream) -> Vec<String> {
+    use crate::memclass::f;
+    let mut bad = Vec::new();
+    if !s.ended {
+        bad.push("no END record (cut off)".to_string());
+    }
+    // (seq, executed points, gpu_done seen) of the open submission.
+    let mut open: Option<(u64, u64, bool)> = None;
+    let mut last_seq = 0u64;
+    let (mut up, mut refreshes, mut faults) = (0u64, 0u64, 0u64);
+    let mut last: Option<([u64; 4], [u64; 3])> = None;
+    let mut frames = 0u64;
+    let mut want_counters = false;
+    let first = |bad: &mut Vec<String>, what: String| {
+        if bad.len() < 8 {
+            bad.push(what);
+        }
+    };
+    for (i, r) in s.records.iter().enumerate() {
+        if want_counters && !matches!(r, Rec::Counters(_)) {
+            first(&mut bad, format!("record {i}: FRAME without COUNTERS"));
+        }
+        want_counters = false;
+        match *r {
+            Rec::Access { flag, seq, len, .. } => {
+                if seq > last_seq {
+                    first(
+                        &mut bad,
+                        format!("record {i}: access of submission {seq} not begun"),
+                    );
+                }
+                if flag == f::GPU_R_REFRESH {
+                    refreshes += 1;
+                }
+                if flag == f::CPU_W_TITLE {
+                    faults += 1;
+                }
+                let _ = len;
+            }
+            Rec::Submit { seq, .. } => {
+                if open.is_some() {
+                    first(
+                        &mut bad,
+                        format!("record {i}: submission {seq} begun inside another"),
+                    );
+                }
+                if seq != last_seq + 1 {
+                    first(
+                        &mut bad,
+                        format!("record {i}: submission {seq} after {last_seq}"),
+                    );
+                }
+                last_seq = seq;
+                open = Some((seq, 0, false));
+            }
+            Rec::Point { kind, seq } => match (&mut open, kind) {
+                (Some((s, n, false)), 0) if *s == seq => *n += 1,
+                (Some((s, n, done)), 1) if *s == seq && *n > 0 && !*done => *done = true,
+                (Some((s, _, true)), 2) if *s == seq => open = None,
+                _ => first(
+                    &mut bad,
+                    format!("record {i}: point {kind} of submission {seq} out of order"),
+                ),
+            },
+            Rec::Sync { kind: 0, len, .. } => up += len,
+            Rec::Sync { .. } => {}
+            Rec::Frame(_) => {
+                frames += 1;
+                want_counters = true;
+            }
+            Rec::Counters(c) => last = Some((c, [up, refreshes, faults])),
+            Rec::Region { .. } | Rec::End(_) => {}
+        }
+    }
+    if open.is_some() {
+        first(&mut bad, "the last submission has no end".to_string());
+    }
+    match last {
+        None if frames == 0 => bad.push("no frames".to_string()),
+        None => bad.push("no COUNTERS".to_string()),
+        Some((c, [up, refreshes, faults])) => {
+            if up != c[2] {
+                first(
+                    &mut bad,
+                    format!("SYNC up {up} bytes, counter copied {}", c[2]),
+                );
+            }
+            if c[0] > 0 || c[1] > 0 {
+                if refreshes != c[0] {
+                    first(
+                        &mut bad,
+                        format!("{refreshes} refresh records, counter {}", c[0]),
+                    );
+                }
+                if faults != c[1] {
+                    first(
+                        &mut bad,
+                        format!("{faults} title write records, counter {}", c[1]),
+                    );
+                }
+            }
+        }
+    }
+    bad
+}
+
 // ----------------------------------------------------------- the replay ---
 
 const KIB64: u64 = PAGE as u64;
+
+/// One byte sampled per this many (and at each range's ends).
+const SAMPLE: u64 = 4 << 10;
 
 /// Counts per region.
 #[derive(Default, Clone)]
 struct Counts {
     cpu_title: u64,
     cpu_runtime: u64,
+    cpu_read: u64,
     gpu_read: u64,
     gpu_decl: u64,
     gpu_write: u64,
@@ -522,6 +672,13 @@ pub(crate) struct Replay<M: MemModel> {
     pub(crate) model: M,
     regions: Vec<Region>,
     shift: u8,
+    /// The decision unit: what a `Page` is (0: the stream's unit).
+    pub(crate) unit: u64,
+    /// What the stream's self-check found ([`self_check`]): not empty, the
+    /// replay is invalid.
+    invalid: Vec<String>,
+    cpu_reads: u64,
+    gpu_only_regions: bool,
     records: u64,
     outside: BTreeMap<&'static str, u64>,
     unreplayed: u64,
@@ -583,8 +740,12 @@ impl<M: MemModel> Replay<M> {
         }
         Some(Replay {
             model,
+            gpu_only_regions: classes.iter().any(|c| c.class == Class::GpuOnly),
             regions,
             shift: 16,
+            unit: 0,
+            invalid: Vec::new(),
+            cpu_reads: 0,
             records: 0,
             outside: BTreeMap::new(),
             unreplayed: 0,
@@ -622,38 +783,73 @@ impl<M: MemModel> Replay<M> {
         out
     }
 
+    fn unit(&self) -> u64 {
+        if self.unit == 0 { KIB64 } else { self.unit }
+    }
+
     fn page(&self, region: usize, off: u64) -> Page {
         Page {
             region,
-            at: (self.regions[region].class.at + off) & !(KIB64 - 1),
+            at: (self.regions[region].class.at + off) & !(self.unit() - 1),
         }
     }
 
-    /// The pages `[from, to)` (offsets) touches.
+    /// The pages (decision units) `[from, to)` (offsets) touches.
     fn pages(&self, region: usize, from: u64, to: u64) -> Vec<Page> {
         let base = self.regions[region].class.at;
-        let first = (base + from) & !(KIB64 - 1);
+        let unit = self.unit();
+        let first = (base + from) & !(unit - 1);
         (0..)
-            .map(|k| first + k * KIB64)
+            .map(|k| first + k * unit)
             .take_while(|&a| a < base + to)
             .map(|at| Page { region, at })
             .collect()
     }
 
-    /// The bytes a record writes in `[from, to)`: its first, one per page,
-    /// and its last (`ends`).
-    fn samples(&self, region: usize, from: u64, to: u64, ends: bool) -> Vec<u64> {
-        let base = self.regions[region].class.at;
-        let mut out: Vec<u64> = self
-            .pages(region, from, to)
-            .iter()
-            .map(|p| (p.at - base).max(from))
-            .collect();
-        if ends && to - 1 != from {
-            out.push(to - 1);
+    /// Offsets in the region of the 64 KiB memory page holding page `p`
+    /// (what the copies sync and what the touch check covers), cut to it.
+    fn memory_page(&self, p: Page) -> (u64, u64) {
+        let c = &self.regions[p.region].class;
+        let from = (p.at.max(c.at) - c.at) & !(KIB64 - 1);
+        (from, (from + KIB64).min(c.len.next_multiple_of(KIB64)))
+    }
+
+    /// The bytes a record writes in `[from, to)`: its first and last, and
+    /// one at each 4 KiB boundary in it (the smallest decision unit: host
+    /// guards and `VICTORY_MEMCLASS_GRAN=4k`).
+    pub(crate) fn samples(&self, from: u64, to: u64) -> Vec<u64> {
+        let mut out = vec![from];
+        let mut at = (from / SAMPLE + 1) * SAMPLE;
+        while at < to {
+            out.push(at);
+            at += SAMPLE;
         }
+        out.push(to - 1);
         out.dedup();
         out
+    }
+
+    /// The bytes just before and after `[from, to)` inside the region:
+    /// nobody writes them with the record; they are checked like written
+    /// bytes, so a sync or copy-back that writes past a range shows.
+    pub(crate) fn guards(&self, region: usize, from: u64, to: u64) -> Vec<u64> {
+        let len = self.regions[region].class.len;
+        let mut out = Vec::new();
+        if from > 0 {
+            out.push(from - 1);
+        }
+        if to < len {
+            out.push(to);
+        }
+        out
+    }
+
+    /// Guard bytes join the checked bytes with the value they hold.
+    fn watch_guards(&mut self, region: usize, from: u64, to: u64) {
+        for g in self.guards(region, from, to) {
+            let v = self.truth(region, g);
+            self.regions[region].truth.entry(g).or_insert(v);
+        }
     }
 
     fn next_value(&mut self, old: u8) -> u8 {
@@ -711,6 +907,10 @@ impl<M: MemModel> Replay<M> {
     /// Plays every record; then [`Replay::report`].
     pub(crate) fn run(&mut self, stream: &Stream) {
         self.shift = stream.shift;
+        if self.unit == 0 {
+            self.unit = 1u64 << stream.shift.clamp(12, 16);
+        }
+        self.invalid = self_check(stream);
         for r in &stream.records {
             self.records += 1;
             self.step(r);
@@ -724,10 +924,14 @@ impl<M: MemModel> Replay<M> {
                 flag, seq, at, len, ..
             } => {
                 self.seq = self.seq.max(seq);
+                if flag == f::CPU_R_AFTER_GPU {
+                    self.cpu_reads += 1;
+                }
                 let parts = self.clip(at, len);
                 let kind = match flag {
                     f::CPU_W_TITLE => "cpu_w_title",
                     f::CPU_W_RUNTIME => "cpu_w_runtime",
+                    f::CPU_R_AFTER_GPU => "cpu_r_after_gpu",
                     f::GPU_R_REFRESH | f::GPU_R_HEAP | f::GPU_R_TABLE => "gpu_r",
                     f::GPU_W_DECL => "gpu_w_decl",
                     f::GPU_W_BACK | f::GPU_W_COPY => "gpu_w",
@@ -745,6 +949,7 @@ impl<M: MemModel> Replay<M> {
                     match flag {
                         f::CPU_W_TITLE => self.cpu_write(r, from, to, CpuKind::Title),
                         f::CPU_W_RUNTIME => self.cpu_write(r, from, to, CpuKind::Runtime),
+                        f::CPU_R_AFTER_GPU => self.cpu_read(r, from, to),
                         f::GPU_R_REFRESH | f::GPU_R_HEAP | f::GPU_R_TABLE => {
                             self.gpu_read(r, from, to)
                         }
@@ -809,11 +1014,12 @@ impl<M: MemModel> Replay<M> {
         match kind {
             CpuKind::Title => c.cpu_title += 1,
             CpuKind::Runtime => c.cpu_runtime += 1,
+            CpuKind::Read => c.cpu_read += 1,
         }
         if self.regions[r].class.class == Class::GpuOnly {
             self.regions[r].counts.contradictions += 1;
         }
-        let samples = self.samples(r, from, to, false);
+        let samples = self.samples(from, to);
         let mut touched = BTreeSet::new();
         for off in samples {
             let p = self.page(r, off);
@@ -827,6 +1033,19 @@ impl<M: MemModel> Replay<M> {
             self.regions[r].truth.insert(off, v);
             self.sub_cpu.insert((r, off));
         }
+        self.watch_guards(r, from, to);
+    }
+
+    /// The title reads `[from, to)` (memory the GPU wrote): each page it
+    /// touches is a CPU touch, then invariant 2 there; nothing is written.
+    fn cpu_read(&mut self, r: usize, from: u64, to: u64) {
+        self.regions[r].counts.cpu_read += 1;
+        if self.regions[r].class.class == Class::GpuOnly {
+            self.regions[r].counts.contradictions += 1;
+        }
+        for p in self.pages(r, from, to) {
+            self.touch(p, CpuKind::Read);
+        }
     }
 
     /// The CPU is about to write page `p`: the model's answer, done; then
@@ -835,9 +1054,27 @@ impl<M: MemModel> Replay<M> {
         let t = self.model.cpu_touch(p, kind);
         self.check_demoted(p, self.model.class(p) == Class::GpuOnly, "cpu touch");
         let r = p.region;
-        let pool_page = self.regions[r].p + (p.at - self.regions[r].class.at) as usize;
+        let (from, to) = self.memory_page(p);
+        let pool_page = self.regions[r].p + from as usize;
         match t {
             Touch::Nothing => {}
+            Touch::DemoteWhole(_) => {
+                // The naive net: the copy's page over title memory.
+                let n = (to - from) as usize;
+                let bytes: Vec<u8> = self.regions[r]
+                    .copy
+                    .as_ref()
+                    .expect("replayed")
+                    .read_host(pool_page as u64, n / 4)
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                for (i, b) in bytes.into_iter().enumerate() {
+                    // SAFETY: a byte of the region's pool (guards fault open).
+                    unsafe { ((pool_page + i) as *mut u8).write_volatile(b) };
+                }
+                self.regions[r].counts.synced_pages += 1;
+            }
             Touch::Sync | Touch::Demote(_) => {
                 self.regions[r]
                     .copy
@@ -847,13 +1084,11 @@ impl<M: MemModel> Replay<M> {
                 self.regions[r].counts.synced_pages += 1;
             }
         }
-        if let Touch::Demote(why) = t {
+        if let Touch::Demote(why) | Touch::DemoteWhole(why) = t {
             *self.regions[r].counts.demotions.entry(why).or_default() += 1;
             self.demoted.insert(p);
             self.demotions.push((p, why, self.seq, self.frame + 1));
         }
-        let base = self.regions[r].class.at;
-        let (from, to) = (p.at - base, p.at - base + KIB64);
         let written: Vec<(u64, u8)> = self.regions[r]
             .truth
             .range(from..to)
@@ -864,7 +1099,7 @@ impl<M: MemModel> Replay<M> {
             self.regions[r].counts.checks[1] += 1;
             let t = self.title(r, off);
             if t != v {
-                self.violate(2, r, off, format!("the CPU would read {t:#04x} where the GPU wrote {v:#04x} (no sync before the touch)"));
+                self.violate(2, r, off, format!("the CPU would see {t:#04x} where one memory holds {v:#04x} (touch of page {:#x})", p.at));
             }
         }
     }
@@ -878,6 +1113,7 @@ impl<M: MemModel> Replay<M> {
         // Runs of pages the model refreshes, cut to the read range.
         let pages = self.pages(r, from, to);
         let base = self.regions[r].class.at;
+        let unit = self.unit();
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for p in pages {
             let refresh = self.model.refresh(p);
@@ -885,7 +1121,10 @@ impl<M: MemModel> Replay<M> {
             let c = &mut self.regions[r].counts;
             if refresh {
                 c.refreshed_pages += 1;
-                let (a, b) = ((p.at - base).max(from), (p.at - base + KIB64).min(to));
+                let (a, b) = (
+                    p.at.saturating_sub(base).max(from),
+                    (p.at + unit).saturating_sub(base).min(to),
+                );
                 match runs.last_mut() {
                     Some((_, e)) if *e == a => *e = b,
                     _ => runs.push((a, b)),
@@ -960,7 +1199,7 @@ impl<M: MemModel> Replay<M> {
         if reg.class.class == Class::CpuOnly {
             reg.counts.contradictions += 1;
         }
-        for off in self.samples(r, from, to, true) {
+        for off in self.samples(from, to) {
             let v = self.next_value(self.copy_byte(r, off));
             let at = self.regions[r].p as u64 + off;
             self.regions[r]
@@ -970,6 +1209,7 @@ impl<M: MemModel> Replay<M> {
                 .write_host(at, &[v]);
             self.sub_gpu.insert((r, off), v);
         }
+        self.watch_guards(r, from, to);
     }
 
     /// `POINT end`: copy-backs as the model says, then invariant 2 where
@@ -1009,7 +1249,7 @@ impl<M: MemModel> Replay<M> {
             self.check_demoted(p, !b, "copy-back");
             if b {
                 let r = p.region;
-                let pool_page = self.regions[r].p + (p.at - self.regions[r].class.at) as usize;
+                let pool_page = self.regions[r].p + self.memory_page(p).0 as usize;
                 self.regions[r]
                     .copy
                     .as_ref()
@@ -1081,9 +1321,21 @@ impl<M: MemModel> Replay<M> {
             .collect()
     }
 
-    /// Green: no violation and no region refuted.
+    /// Green: a valid stream, no violation and no region refuted.
     pub(crate) fn green(&self) -> bool {
-        self.violations() == [0; 3] && self.refuted().is_empty()
+        self.invalid.is_empty() && self.violations() == [0; 3] && self.refuted().is_empty()
+    }
+
+    /// What the stream's self-check found (empty: valid).
+    pub(crate) fn invalid(&self) -> &[String] {
+        &self.invalid
+    }
+
+    /// Green and able to prove GPU-only classes: a page the title only
+    /// reads shows only through `cpu_r_after_gpu` records, so where the
+    /// classification has GPU-only regions the stream must carry them.
+    pub(crate) fn gate_proof(&self) -> bool {
+        self.green() && (!self.gpu_only_regions || self.cpu_reads > 0)
     }
 
     /// The report: stream addresses only, the same text for the same stream,
@@ -1092,9 +1344,11 @@ impl<M: MemModel> Replay<M> {
         let mut s = String::new();
         let _ = writeln!(
             s,
-            "replay model={} unit={} records={} submissions={} frames={} regions={}",
+            "replay model={} stream unit={} decision unit={} sample={} records={} submissions={} frames={} regions={}",
             self.model.name(),
             1u64 << self.shift,
+            self.unit(),
+            SAMPLE,
             self.records,
             self.submissions,
             self.frame,
@@ -1109,7 +1363,7 @@ impl<M: MemModel> Replay<M> {
                 .collect();
             let _ = writeln!(
                 s,
-                "region {i} at={:#x} len={:#x} class={}{}: cpu_w_title={} cpu_w_runtime={} gpu_r={} gpu_w_decl={} gpu_w={} other={} \
+                "region {i} at={:#x} len={:#x} class={}{}: cpu_w_title={} cpu_w_runtime={} cpu_r={} gpu_r={} gpu_w_decl={} gpu_w={} other={} \
                  contradictions={} demotions={} [{}] synced_pages={} refreshed_pages={} unrefreshed_pages={} \
                  sync_up_bytes={} sync_back_bytes={} checks inv1={} inv2={} inv3={} violations inv1={} inv2={} inv3={}",
                 r.class.at,
@@ -1122,6 +1376,7 @@ impl<M: MemModel> Replay<M> {
                 },
                 c.cpu_title,
                 c.cpu_runtime,
+                c.cpu_read,
                 c.gpu_read,
                 c.gpu_decl,
                 c.gpu_write,
@@ -1193,7 +1448,34 @@ impl<M: MemModel> Replay<M> {
                 format!("REFUTED in regions {refuted:?}")
             }
         );
-        let _ = writeln!(s, "verdict: {}", if self.green() { "GREEN" } else { "RED" });
+        let _ = writeln!(
+            s,
+            "stream self-check: {}",
+            if self.invalid.is_empty() {
+                "passed".to_string()
+            } else {
+                format!("FAILED: {}", self.invalid.join("; "))
+            }
+        );
+        let _ = writeln!(
+            s,
+            "cpu reads: {}",
+            if self.cpu_reads > 0 {
+                format!("{} records in the stream", self.cpu_reads)
+            } else {
+                "CPU reads not in the stream, GPU-only not provable".to_string()
+            }
+        );
+        let verdict = if !self.invalid.is_empty() {
+            "INVALID (the stream failed its self-check)"
+        } else if !self.green() {
+            "RED"
+        } else if self.gate_proof() {
+            "GREEN"
+        } else {
+            "GREEN as a tool, NOT a gate-3 proof (CPU reads not in the stream, GPU-only not provable)"
+        };
+        let _ = writeln!(s, "verdict: {verdict}");
         s
     }
 }

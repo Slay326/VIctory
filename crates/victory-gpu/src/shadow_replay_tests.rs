@@ -21,18 +21,24 @@ struct W {
     last: u64,
     seq: u64,
     frame: u64,
+    /// `SYNC up` bytes so far: the `copied` counter of the frame records.
+    copied: u64,
 }
 
 impl W {
     fn new() -> W {
+        W::with_shift(16)
+    }
+    fn with_shift(shift: u8) -> W {
         let mut b = b"VMCS".to_vec();
         b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&[16, 0]);
+        b.extend_from_slice(&[shift, 0]);
         W {
             b,
             last: 0,
             seq: 0,
             frame: 0,
+            copied: 0,
         }
     }
     fn access(&mut self, flag: u16, at: u64, len: u64) {
@@ -56,21 +62,22 @@ impl W {
         }
     }
     fn sync(&mut self, kind: u64, at: u64, len: u64) {
+        if kind == 0 {
+            self.copied += len;
+        }
         for v in [u64::from(rec::SYNC), kind, at, len, 3] {
             var(&mut self.b, v);
         }
     }
     fn frame(&mut self) {
+        self.frame_with([0, 0, self.copied, 0]);
+    }
+    fn frame_with(&mut self, counters: [u64; 4]) {
         self.frame += 1;
-        for v in [
-            u64::from(rec::FRAME),
-            self.frame,
-            u64::from(rec::COUNTERS),
-            0,
-            0,
-            0,
-            0,
-        ] {
+        for v in [u64::from(rec::FRAME), self.frame, u64::from(rec::COUNTERS)] {
+            var(&mut self.b, v);
+        }
+        for v in counters {
             var(&mut self.b, v);
         }
     }
@@ -119,7 +126,9 @@ fn class_list(s: Class) -> Vec<Class> {
 /// declared ranges, a title write while the GPU runs, GPU writes back into
 /// G and S inside and outside the declared ranges, a GPU copy into G), then
 /// title writes to pages of S the GPU just wrote, and a write outside every
-/// region. Covers: invariant 1 (title bytes refreshed before the next read,
+/// region. Two groups of lists go to the GPU (two `POINT executed`), and the
+/// title also writes while the GPU runs and between `gpu_done` and `end`
+/// (while the copy-backs run). Covers: invariant 1 (title bytes refreshed before the next read,
 /// GPU bytes kept in the copy), invariant 2 (at the sync point on the
 /// snapshot and the computed path, and at the title's touch of a page the
 /// GPU wrote), and, with S marked GPU-only, demotions for invariant 3.
@@ -143,6 +152,7 @@ fn synthetic(frames: u64) -> Vec<u8> {
         w.point(0);
         // The title writes a declared page while the GPU runs.
         w.access(f::CPU_W_TITLE, S + P + 1000 + k * 31, 1);
+        w.point(0);
         w.point(1);
         // Copy-backs: what the GPU wrote.
         w.access(f::GPU_W_MARK, S, P);
@@ -154,6 +164,8 @@ fn synthetic(frames: u64) -> Vec<u8> {
         // Not declared: written at computed addresses.
         w.access(f::GPU_W_BACK, S + 3 * P + 500 + k, 2);
         w.sync(1, S + 200, 8);
+        // The title writes a declared page while the copy-backs run.
+        w.access(f::CPU_W_TITLE, S + P + 2000 + k, 1);
         w.point(2);
         // The title then writes pages the GPU wrote.
         w.access(f::CPU_W_TITLE, S + 3 * P + 600 + k, 1);
@@ -536,4 +548,218 @@ fn replay_a_capture() {
         std::fs::write(out, &report).expect("the report file");
     }
     assert!(green, "replay red");
+}
+
+/// Records are sampled at both ends, at every 4 KiB boundary (the smallest
+/// decision unit), and watched one byte before and after (guards, cut to
+/// the region).
+#[test]
+fn every_4k_unit_and_both_ends_are_sampled_with_guards() {
+    let Some(r) = Replay::new(&classes(Class::Shared), Today, BUDGET) else {
+        return; // no host GPU here
+    };
+    assert_eq!(r.samples(100, 9000), [100, 4096, 8192, 8999]);
+    assert_eq!(r.samples(4096, 4097), [4096]);
+    assert_eq!(r.samples(10, 12), [10, 11]);
+    assert_eq!(r.guards(1, 100, 9000), [99, 9000]);
+    assert_eq!(
+        r.guards(1, 0, 4 * P),
+        Vec::<u64>::new(),
+        "cut to the region"
+    );
+}
+
+/// Two title writes to two 4 KiB units of one 64 KiB page of S, marked
+/// GPU-only, in a stream of 4 KiB units.
+fn two_units_of_one_page() -> Vec<u8> {
+    let mut w = W::with_shift(12);
+    w.access(f::CPU_W_TITLE, S + 0x10, 1);
+    w.access(f::CPU_W_TITLE, S + 0x1010, 1);
+    w.frame();
+    w.end()
+}
+
+/// A net deciding per 4 KiB unit that syncs a demoted unit by taking the
+/// copy's whole 64 KiB page loses the title's byte of the unit demoted
+/// before: red. The reference net (the copies' page sync) keeps it; at
+/// 64 KiB decisions the second write demotes nothing and the naive net
+/// does no harm (the decision unit matters, and the report names it).
+#[test]
+fn a_net_syncing_whole_pages_over_the_titles_bytes_is_red() {
+    let wrong = classes(Class::GpuOnly);
+    let mut net = RefNet::new(class_list(Class::GpuOnly));
+    net.whole_page_sync = true;
+    let Some(r) = replay(&wrong, net, &two_units_of_one_page()) else {
+        return; // no host GPU here
+    };
+    let report = r.report();
+    assert!(
+        report.contains("decision unit=4096 sample=4096"),
+        "{report}"
+    );
+    assert!(
+        r.violations()[1] > 0,
+        "the title's byte at +0x10 is lost\n{report}"
+    );
+    assert!(
+        report.contains("violation inv2 region=1 at=0x200100010"),
+        "{report}"
+    );
+
+    let r = replay(
+        &wrong,
+        RefNet::new(class_list(Class::GpuOnly)),
+        &two_units_of_one_page(),
+    )
+    .unwrap();
+    let report = r.report();
+    assert_eq!(r.violations(), [0; 3], "{report}");
+    assert_eq!(r.demotions_of(1), 2, "two units demoted\n{report}");
+
+    let mut net = RefNet::new(class_list(Class::GpuOnly));
+    net.whole_page_sync = true;
+    let stream = read_stream(&two_units_of_one_page()).unwrap();
+    let mut r = Replay::new(&wrong, net, BUDGET).unwrap();
+    r.unit = P;
+    r.run(&stream);
+    let report = r.report();
+    assert_eq!(r.violations(), [0; 3], "{report}");
+    assert_eq!(r.demotions_of(1), 1, "{report}");
+}
+
+/// The GPU writes G; the title only reads it afterwards (`cpu_r_after_gpu`
+/// records when `read`, else nothing shows the reads).
+fn gpu_writes_cpu_reads(read: bool) -> Vec<u8> {
+    let mut w = W::new();
+    for k in 1..=2 {
+        w.submit(1);
+        w.access(f::GPU_R_REFRESH, G, P);
+        w.access(f::GPU_W_DECL, G, P);
+        w.point(0);
+        w.point(1);
+        w.access(f::GPU_W_BACK, G + 0x100 + k, 4);
+        w.point(2);
+        if read {
+            w.access(f::CPU_R_AFTER_GPU, G + 0x100 + k, 4);
+        }
+        w.frame();
+    }
+    w.end()
+}
+
+/// A page the title only reads, wrongly GPU-only: with CPU read records a
+/// model without a net is red (the title would read stale bytes) and the
+/// reference net demotes it (reason "title read"); without them the replay
+/// is green but says it proves no GPU-only class.
+#[test]
+fn a_page_the_title_only_reads_is_not_gpu_only() {
+    let wrong = classes(Class::Shared); // G GPU-only, but the title reads it
+    let Some(r) = replay(
+        &wrong,
+        NoNet {
+            classes: class_list(Class::Shared),
+        },
+        &gpu_writes_cpu_reads(true),
+    ) else {
+        return; // no host GPU here
+    };
+    let report = r.report();
+    assert!(r.violations()[1] > 0, "{report}");
+    assert!(
+        report.contains("verdict: RED") && report.contains("cpu reads: 2 records"),
+        "{report}"
+    );
+
+    let r = replay(
+        &wrong,
+        RefNet::new(class_list(Class::Shared)),
+        &gpu_writes_cpu_reads(true),
+    )
+    .unwrap();
+    let report = r.report();
+    assert_eq!(r.violations(), [0; 3], "{report}");
+    assert!(
+        report.contains("[title read:1]") && r.refuted() == [0],
+        "{report}"
+    );
+
+    // Without the read records the same wrong class passes the replay ...
+    let r = replay(
+        &wrong,
+        NoNet {
+            classes: class_list(Class::Shared),
+        },
+        &gpu_writes_cpu_reads(false),
+    )
+    .unwrap();
+    let report = r.report();
+    assert!(r.green() && !r.gate_proof(), "{report}");
+    assert!(
+        report.contains("cpu reads: CPU reads not in the stream, GPU-only not provable"),
+        "{report}"
+    );
+    assert!(report.contains("NOT a gate-3 proof"), "{report}");
+
+    // ... and with them and the right class it is a proof.
+    let mut right = classes(Class::Shared);
+    right[0].class = Class::Shared;
+    let r = replay(&right, Today, &gpu_writes_cpu_reads(true)).unwrap();
+    let report = r.report();
+    assert!(
+        r.gate_proof() && report.contains("verdict: GREEN\n"),
+        "{report}"
+    );
+}
+
+/// The self-check: the synthetic stream (two `executed` per submission)
+/// passes; counters off, a cut stream, points out of order and an access
+/// of a submission not begun make the replay INVALID, not green.
+#[test]
+fn streams_failing_the_self_check_are_invalid() {
+    let ok = read_stream(&synthetic(3)).unwrap();
+    assert_eq!(self_check(&ok), Vec::<String>::new());
+
+    let mut w = W::new();
+    w.submit(1);
+    w.point(0);
+    w.sync(0, S, 4096);
+    w.point(1);
+    w.point(2);
+    w.frame_with([0, 0, 4095, 0]);
+    let off = w.end();
+    let bad = self_check(&read_stream(&off).unwrap());
+    assert!(
+        bad.iter()
+            .any(|b| b.contains("SYNC up 4096 bytes, counter copied 4095")),
+        "{bad:?}"
+    );
+    let Some(r) = replay(&classes(Class::Shared), Today, &off) else {
+        return; // no host GPU here
+    };
+    let report = r.report();
+    assert!(!r.green() && !r.invalid().is_empty(), "{report}");
+    assert!(report.contains("verdict: INVALID"), "{report}");
+
+    let data = synthetic(2);
+    let cut = self_check(&read_stream(&data[..data.len() - 2]).unwrap());
+    assert!(cut.iter().any(|b| b.contains("no END")), "{cut:?}");
+
+    let mut w = W::new();
+    w.submit(1);
+    w.point(0);
+    w.point(2); // no gpu_done
+    w.frame();
+    let order = self_check(&read_stream(&w.end()).unwrap());
+    assert!(
+        order.iter().any(|b| b.contains("out of order")),
+        "{order:?}"
+    );
+
+    let mut w = W::new();
+    w.seq = 3; // an access naming submission 3 before any began
+    w.access(f::CPU_W_TITLE, S, 1);
+    w.seq = 0;
+    w.frame();
+    let early = self_check(&read_stream(&w.end()).unwrap());
+    assert!(early.iter().any(|b| b.contains("not begun")), "{early:?}");
 }
