@@ -193,7 +193,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
@@ -1059,8 +1059,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `site`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, site: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1075,8 +1075,16 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach the access, and run it there, read the
+        // descriptor: a vector access under a narrowed EXEC is not run by
+        // lanes that left EXEC (a skip only they could take brings nothing).
+        let mut known = Known::new();
+        if let Some(lanes) = self.lanes {
+            known.push((lanes.reach[site.0], true));
+            if let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1184,7 +1192,11 @@ impl<'a> Tracer<'a> {
         // An edge no lane takes (a skip only helper lanes would take, say)
         // brings nothing a lane reads: it takes a taken edge's source, and
         // lowering joins no value there (`never_taken`).
-        let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
+        // Likewise an edge none of the reading lanes (`known`) takes.
+        let taken: Vec<bool> = preds
+            .iter()
+            .map(|&q| self.edge_taken(q, block) && self.edge_read(q, block, known))
+            .collect();
         let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
             let edge: Vec<Term> = words
                 .iter()
@@ -1225,6 +1237,26 @@ impl<'a> Tracer<'a> {
         }
         // The very test lowering makes, so both drop the same edges.
         lanes.bools.meet(&edge)
+    }
+
+    /// Whether a lane holding `known` can go from block `q` to `b`: with
+    /// nothing known beyond reaching, as [`Self::edge_taken`].
+    fn edge_read(&self, q: usize, b: usize, known: &Known) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        let mut edge = known.clone();
+        edge.push((lanes.reach[q], true));
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            edge.push((when, taken == b));
+        }
+        meet(lanes, &edge)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -3629,5 +3661,69 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// Lanes outside `v0 < 32` leave EXEC (`s_and_saveexec`); a wave with
+    /// none left skips the block that builds the sampler, straight to the
+    /// sample. `restore` puts EXEC back before the sample.
+    fn sampler_built_under_exec(restore: bool) -> Result<Resources, ShaderError> {
+        let mut words = vec![
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_00A0, // v_cmp_gt_u32 vcc_lo, 32, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0004, // s_cbranch_execz (over the four moves)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0382, // s_mov_b32 s9, 2
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0381, // s_mov_b32 s11, 1
+        ];
+        if restore {
+            words.push(0x887E_067E); // s_or_b32 exec_lo, exec_lo, s6
+        }
+        words.extend([
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, &[param(Table, 0, 1)], HwStage::Cs, lanes(&p).as_ref())
+    }
+
+    #[test]
+    fn a_descriptor_joined_where_exec_leaves_the_skipping_lanes_out_is_the_built_one() {
+        // Every lane that runs the sample came through the moves: the
+        // skip edge brings no lane that reads the sampler, and takes the
+        // built sampler as an edge no lane takes does.
+        let r = sampler_built_under_exec(false).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
+        let Some(Source::Phi { args, .. }) = sampler.map(|d| &d.source) else {
+            panic!("{sampler:?}")
+        };
+        assert_eq!(args.len(), 2);
+        assert!(
+            args.iter()
+                .all(|a| *a == Source::Constant(vec![0, 2, 0, 1])),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_joined_after_exec_is_restored_still_holds_the_skipped_edge() {
+        // With EXEC back, a lane from the skip edge runs the sample with
+        // whatever s[8:11] held: the edge is live and nothing is made up.
+        let r = sampler_built_under_exec(true);
+        let built = r.as_ref().is_ok_and(|r| {
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0, 2, 0, 1]))
+        });
+        assert!(!built, "{r:?}");
     }
 }
