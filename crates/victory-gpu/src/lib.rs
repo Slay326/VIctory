@@ -66,6 +66,9 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+// Night 2 block 1: tests for the planned PageNet (stub interface, ignored).
+#[cfg(all(test, feature = "pagenet_tests"))]
+mod pagenet_tests;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
