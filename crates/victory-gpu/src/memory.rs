@@ -262,7 +262,7 @@ pub(crate) fn release_waited(copy: &Shadow, from: u64, len: u64) {
         if at < from || at >= from + len || word < start || word + 4 * n as u64 > start + size {
             continue;
         }
-        let v = copy.read_host(word, n);
+        let Some(v) = copy.host_dwords(word, n, true) else { continue };
         let value = u64::from(v[0]) | v.get(1).map_or(0, |&h| u64::from(h) << 32);
         let mut title = [0u8; 8];
         let readable = crate::host::read_into(at as *const u8, &mut title[..usize::from(bytes.min(8))]);
