@@ -371,6 +371,48 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
     }
 }
 
+/// The card's and system memory's GPU memory by kind, in MB: host textures
+/// (`gpu`/`title`: [`crate::resource::texture_census`] in MB), the free room
+/// in heaps of textures, host copies of title memory on the card and in
+/// system memory, and what is left (swap chain, view heaps, list memory,
+/// upload and read-back buffers); with the host textures given up since the
+/// last line (`VICTORY_EVICT_UNWRITTEN`: those the GPU may write that
+/// nothing wrote yet among them).
+#[cfg(feature = "diagnostics")]
+fn log_vram_by_kind(gpu: [f64; 3], title: [f64; 3]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([(local, budget), (system, _)]) = video_memory() else {
+        return;
+    };
+    let [written_otherwise, unwritten] = crate::resource::unwritten_census().map(|b| b as f64 / 1e6);
+    let textures: f64 = gpu.iter().chain(title.iter()).sum();
+    let heap_free = crate::placement::free_bytes() as f64 / 1e6;
+    let card_copies = crate::shadow::card_copies().1 as f64 / 1e6;
+    let copies = crate::shadow::all().iter().map(|s| s.range().1).sum::<u64>() as f64 / 1e6;
+    let given = crate::resource::EVICTIONS.each_ref().map(|c| c.swap(0, Relaxed));
+    let unwritten_given = crate::resource::UNWRITTEN_GIVEN_UP.each_ref().map(|c| c.swap(0, Relaxed));
+    tracing::info!(
+        "VRAM by kind (MB): card {local:.0} of {budget:.0} ({:+.0} over): host textures {textures:.0} \
+         (GPU-written used by lists {:.0}, not used by lists: written or maybe written {written_otherwise:.0}, \
+         never written {unwritten:.0}; from title memory {:.0}), free in heaps of textures {heap_free:.0}, \
+         title buffer copies on the card {card_copies:.0}, rest {:.0}; system memory {system:.0}: \
+         host copies of title memory {copies:.0}, rest {:.0}; given up since the last line {} ({:.0} MB; \
+         never written {} {:.0} MB), made again {} ({} within 10 frames), evict unwritten {}",
+        local - budget,
+        gpu[0],
+        title.iter().sum::<f64>(),
+        local - textures - heap_free - card_copies,
+        system - copies,
+        given[0],
+        given[1] as f64 / 1e6,
+        unwritten_given[0],
+        unwritten_given[1] as f64 / 1e6,
+        given[2],
+        given[3],
+        if crate::resource::evict_unwritten() { "on" } else { "off" },
+    );
+}
+
 /// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
@@ -3195,6 +3237,7 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
+                log_vram_by_kind(gpu, title);
                 // Window caption updates leave the report counters intact.
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
