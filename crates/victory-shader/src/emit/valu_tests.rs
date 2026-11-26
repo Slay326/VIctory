@@ -153,6 +153,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     })?;
 
     let shader = HostShader {
@@ -1726,6 +1727,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     })
     .expect("lower");
     let shader = HostShader {

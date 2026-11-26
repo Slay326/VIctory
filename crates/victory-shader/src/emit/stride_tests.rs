@@ -224,6 +224,7 @@ fn build(
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     })
     .expect("lower");
     let shader = HostShader {

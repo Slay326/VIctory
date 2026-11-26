@@ -295,6 +295,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     })
     .map_err(e)?;
     Ok(HostShader {

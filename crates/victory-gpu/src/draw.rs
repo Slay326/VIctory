@@ -3681,7 +3681,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             &st,
             &io,
             &res,
-            Options { view_marks: true, group_x_offset: false },
+            Options { view_marks: true, group_x_offset: false, loop_limit: None },
         )
         .unwrap();
         assert!(host_shader.view_marks);

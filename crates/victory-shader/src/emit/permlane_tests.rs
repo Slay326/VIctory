@@ -95,6 +95,7 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     });
     let result = result?;
     let shader = HostShader {

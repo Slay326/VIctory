@@ -99,6 +99,9 @@ pub(crate) struct Parts<'a> {
     pub host_wave_max: u32,
     /// The group id in x has the host's offset added (`Options`).
     pub group_x_offset: bool,
+    /// Iterations after which a loop is left ([`LOOP_LIMIT`] unless
+    /// [`super::Options::loop_limit`] says otherwise).
+    pub loop_limit: u32,
 }
 
 enum Stop {
@@ -11223,7 +11226,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(self.x.loop_limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -11968,6 +11971,7 @@ mod tests {
             view_marks: false,
             host_wave_max: 64,
             group_x_offset: false,
+            loop_limit: crate::emit::loop_limit(),
         })
         .map(|_| ())
     }
@@ -12021,6 +12025,7 @@ mod tests {
             view_marks: false,
             host_wave_max: 64,
             group_x_offset: false,
+            loop_limit: crate::emit::loop_limit(),
         })
     }
 
@@ -12243,6 +12248,7 @@ mod tests {
             view_marks: false,
             host_wave_max: 64,
             group_x_offset: false,
+            loop_limit: crate::emit::loop_limit(),
         })
         .unwrap();
 
@@ -12720,6 +12726,7 @@ mod tests {
             view_marks: false,
             host_wave_max: 64,
             group_x_offset,
+            loop_limit: crate::emit::loop_limit(),
         })
         .unwrap()
     }
@@ -13243,6 +13250,7 @@ mod tests {
                 view_marks: false,
                 host_wave_max: 64,
                 group_x_offset: false,
+                loop_limit: crate::emit::loop_limit(),
             })
             .unwrap();
             assert!(lowered.wave_ops);

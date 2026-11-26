@@ -72,6 +72,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.

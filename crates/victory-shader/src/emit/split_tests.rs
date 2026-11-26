@@ -175,6 +175,7 @@ fn lower_words(words: &[u32], host_wave_max: u32) -> Result<lower::Lowered, crat
         view_marks: false,
         host_wave_max,
         group_x_offset: false,
+        loop_limit: super::loop_limit(),
     })
 }
 

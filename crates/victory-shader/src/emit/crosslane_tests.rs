@@ -413,6 +413,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         view_marks: false,
         host_wave_max: 64,
         group_x_offset: false,
+        loop_limit: crate::emit::loop_limit(),
     })
     .expect("lower");
 

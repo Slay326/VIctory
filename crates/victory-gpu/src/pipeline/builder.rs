@@ -39,6 +39,11 @@ fn image() -> Option<(usize, usize)> {
     *IMAGE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether `code` lies in the builder's image.
+pub(crate) fn in_image(code: *const u8) -> bool {
+    image().is_some_and(|(start, end)| (start..end).contains(&(code as usize)))
+}
+
 /// Whether the pipeline being created is the builder's: `code` (the title's
 /// bytecode pointers) lies in its image, or its code is among our callers.
 #[inline(never)]
