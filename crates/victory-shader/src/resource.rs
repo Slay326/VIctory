@@ -1075,17 +1075,21 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access, and run it there, read the
-        // descriptor: a vector access under a narrowed EXEC is not run by
-        // lanes that left EXEC (a skip only they could take brings nothing).
-        let mut known = Known::new();
-        if let Some(lanes) = self.lanes {
-            known.push((lanes.reach[site.0], true));
-            if let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) {
+        // Only the lanes that reach the access read the descriptor.
+        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[site.0], true)));
+        let traced = self.classify(&words, &mut Vec::new(), &mut known);
+        // Nor does a lane outside the EXEC guard of a vector access: a join
+        // only such lanes come to can be left out of the descriptor.
+        let guard = self
+            .lanes
+            .and_then(|l| l.guards.get(site.0).and_then(|g| g.get(site.1)).copied().flatten());
+        match (traced, guard) {
+            (Err(e), Some(guard)) => {
                 known.push((guard, true));
+                self.classify(&words, &mut Vec::new(), &mut known).map_err(|_| e)
             }
+            (traced, _) => traced,
         }
-        self.classify(&words, &mut Vec::new(), &mut known)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1192,11 +1196,7 @@ impl<'a> Tracer<'a> {
         // An edge no lane takes (a skip only helper lanes would take, say)
         // brings nothing a lane reads: it takes a taken edge's source, and
         // lowering joins no value there (`never_taken`).
-        // Likewise an edge none of the reading lanes (`known`) takes.
-        let taken: Vec<bool> = preds
-            .iter()
-            .map(|&q| self.edge_taken(q, block) && self.edge_read(q, block, known))
-            .collect();
+        let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
         let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
             let edge: Vec<Term> = words
                 .iter()
@@ -1207,13 +1207,33 @@ impl<'a> Tracer<'a> {
                 .collect();
             self.classify(&edge, joins, known)
         };
-        let args = match taken.iter().position(|&t| t) {
-            Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
-                (0..preds.len())
-                    .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
-                    .collect::<Result<_, _>>()
-            }),
-            _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
+        let join = |taken: &[bool], joins: &mut Vec<usize>, known: &mut Known| {
+            match taken.iter().position(|&t| t) {
+                Some(first) if taken.contains(&false) => {
+                    edge(first, joins, known).and_then(|live| {
+                        (0..preds.len())
+                            .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                }
+                _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect(),
+            }
+        };
+        // Likewise an edge none of the reading lanes (`known`) takes, as
+        // long as what it takes instead is an immediate: lowering still
+        // joins along such an edge, where only an immediate is defined.
+        let read: Vec<bool> = (0..preds.len())
+            .map(|j| taken[j] && self.edge_read(preds[j], block, known))
+            .collect();
+        let args = match join(&taken, joins, known) {
+            Err(e) if read != taken => join(&read, joins, known)
+                .ok()
+                .filter(|args| {
+                    (0..preds.len())
+                        .all(|j| read[j] || !taken[j] || matches!(args[j], Source::Constant(_)))
+                })
+                .ok_or(e),
+            args => args,
         };
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
