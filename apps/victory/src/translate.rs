@@ -593,6 +593,7 @@ fn translate(
                     let marks = emit::Options {
                         view_marks: true,
                         group_x_offset: false,
+                        loop_limit: None,
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
