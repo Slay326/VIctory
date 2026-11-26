@@ -344,6 +344,9 @@ pub(crate) fn card_fetch(ranges: &[(&Shadow, usize, usize)]) {
     if let Err(e) = fetched {
         fail(format_args!("what shaders wrote to host copies in GPU memory could not be fetched ({e})"));
     }
+    // A title write while the fetch ran (tests).
+    #[cfg(test)]
+    crate::shadow::tests::during_fetch();
     STATS[3].fetch_add(ranges.len() as u64, Ordering::Relaxed);
     STATS[4].fetch_add(1, Ordering::Relaxed);
     STATS[5].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
