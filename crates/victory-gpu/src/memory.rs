@@ -293,6 +293,9 @@ struct Stats {
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
+    /// Misses at addresses with no title memory, not counted
+    /// (`crate::arena::unmapped_misses_ignored`): pages, regions.
+    unmapped: (u64, u64),
 }
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -433,7 +436,7 @@ pub(crate) fn log_frame() {
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         and {} 256 MiB regions with no copy (first: {}); not counted (no title memory there) {} pages {} regions",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -442,7 +445,9 @@ pub(crate) fn log_frame() {
         s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
         s.missed_regions,
-        missed.join(" ")
+        missed.join(" "),
+        s.unmapped.0,
+        s.unmapped.1,
     );
 }
 
@@ -754,15 +759,27 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
 
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
 fn has_missed(marks: &[u32], l: &Layout) -> bool {
+    // `VICTORY_BVH_MISS_UNMAPPED=ignore`: marks where no title memory is
+    // are no miss.
+    let ignored = crate::arena::unmapped_misses_ignored();
     for (w, &mark) in marks.iter().enumerate() {
         let mut bits = mark;
         while bits != 0 {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let block = entry / BLOCK;
-            if block == 0
-                || l.blocks.get(block).is_none()
-                || l.owner.get(entry).is_none_or(|&o| o == NO_OWNER) && !l.in_arena(entry)
+            if block == 0 {
+                if !ignored || crate::arena::title_memory_in_region(entry) {
+                    return true;
+                }
+                continue;
+            }
+            let Some(&l1) = l.blocks.get(block) else {
+                return true;
+            };
+            if l.owner.get(entry).is_none_or(|&o| o == NO_OWNER)
+                && !l.in_arena(entry)
+                && (!ignored || crate::arena::title_memory_at((l1 << 28 | (entry % BLOCK) << 16) as u64))
             {
                 return true;
             }
@@ -831,6 +848,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     }
                     match l.owner.get(entry) {
                         Some(&k) if k != NO_OWNER => m.owned.push((l.copies[k as usize].clone(), at)),
+                        _ if crate::arena::unmapped_misses_ignored() && !crate::arena::title_memory_at(at as u64) => {}
                         _ => {
                             m.missed_pages += 1;
                             if m.first_missed.len() < 3 {
@@ -874,6 +892,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // copies invalid, those in arena pages valid).
         let keep = arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) && crate::arena::keep_builder_writes();
         let mut writes = Vec::new();
+        let ignored = crate::arena::unmapped_misses_ignored();
+        let mut unmapped = (0, 0);
         for (w, mark) in marks.iter_mut().enumerate() {
             if *mark == 0 {
                 continue;
@@ -885,6 +905,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let (block, page) = (entry / BLOCK, entry % BLOCK);
                 // Block 0's bits are 256 MiB regions with no block.
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                    if ignored && block == 0 && !crate::arena::title_memory_in_region(entry) {
+                        unmapped.1 += 1;
+                        continue;
+                    }
                     regions += 1;
                     missed.push((entry as u64) << 28);
                     if asks {
@@ -902,6 +926,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
+                    _ if ignored && !crate::arena::title_memory_at(at) => unmapped.0 += 1,
                     _ => {
                         pages += 1;
                         missed.push(at);
@@ -961,6 +986,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             s.withheld += withheld;
             s.missed_pages += pages;
             s.missed_regions += regions;
+            s.unmapped.0 += unmapped.0;
+            s.unmapped.1 += unmapped.1;
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
         });
