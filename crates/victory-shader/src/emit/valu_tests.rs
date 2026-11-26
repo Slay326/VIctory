@@ -143,6 +143,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         view_marks: false,
         host_wave_max: 64,
         loop_limit: super::loop_limit(),
+        group_x_offset: false,
     })?;
 
     let shader = HostShader {
@@ -1290,6 +1291,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         view_marks: false,
         host_wave_max: 64,
         loop_limit: super::loop_limit(),
+        group_x_offset: false,
     })
     .expect("lower");
     let shader = HostShader {

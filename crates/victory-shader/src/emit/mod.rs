@@ -390,6 +390,13 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// [`UserData::dword`] of the entry that takes the groups in x the host's
+/// dispatch starts after ([`Options::group_x_offset`]; 0 for a dispatch
+/// not split).
+pub const GROUP_X_OFFSET: u32 = 5;
+/// The user-data dword that entry is in: past the 16 user-data SGPRs a
+/// console compute program has.
+pub const GROUP_X_OFFSET_INDEX: u32 = 16;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +427,10 @@ pub struct Options {
     /// and loops to the limit for seconds). `None`: [`loop_limit`]; the
     /// translation is then the same as before the option existed.
     pub loop_limit: Option<u32>,
+    /// A compute program's group id in x has the user-data dword
+    /// [`GROUP_X_OFFSET_INDEX`] added ([`GROUP_X_OFFSET`]): the host splits
+    /// a dispatch of more than 65,535 groups in x into several.
+    pub group_x_offset: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -546,6 +557,7 @@ pub fn emit_with(
         view_marks: options.view_marks,
         host_wave_max: host_wave_max(),
         loop_limit: options.loop_limit.map_or_else(loop_limit, |l| l.max(1)),
+        group_x_offset: options.group_x_offset,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

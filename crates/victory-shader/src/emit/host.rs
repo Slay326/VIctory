@@ -756,6 +756,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_marks: false,
         host_wave_max: 64,
         loop_limit: super::loop_limit(),
+        group_x_offset: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

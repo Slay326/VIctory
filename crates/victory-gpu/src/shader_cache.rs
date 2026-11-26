@@ -127,6 +127,28 @@ fn host_build(build: &[u8; 32], views: u32, title: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Whether the compute program in `container` is one the title dispatches
+/// with more than the host's 65,535 groups in x: its translation takes a
+/// group offset and the host splits its dispatches
+/// (`victory_shader::emit::Options::group_x_offset`). Listed by content
+/// hash (16 hex digits, as the logs name shaders) in `VICTORY_WIDE_GROUPS`,
+/// by default Grand Theft Auto VI's screen-probe final gather (72,432
+/// groups in x at 2560x1440).
+// shortcut: a list, not found at run time; a program missing from it keeps
+// its dispatches cut at 65,535 groups (the clamp, `crate::indirect`).
+pub fn wide_groups(container: &[u8]) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_WIDE_GROUPS").unwrap_or_else(|_| "2dc364df5d3278b8".into());
+        list.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    let hash = blake3::hash(container).to_hex();
+    list.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
@@ -140,7 +162,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 pub fn host_shader_with(container: &[u8], loop_limit: Option<u32>) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true, loop_limit };
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        loop_limit,
+        group_x_offset: wide_groups(container),
+    };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     // The host first: making it says what its view heaps are like, which
     // translations depend on. Without a host they are as for most hosts.

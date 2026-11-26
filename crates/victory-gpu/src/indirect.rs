@@ -35,6 +35,8 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Parts of a split dispatch (kind 3).
+static const uint PARTS = 4;
 // Clamps the record at `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
@@ -59,6 +61,19 @@ uint clamped(uint at) {
         }
         cost = g.x * g.y * g.z * 64;
         dest.Store3(at, g);
+    } else if (kind == 3) {
+        // A dispatch split into PARTS of at most 65,535 groups in x, each
+        // record its offset in x and its groups (the program adds the
+        // offset to its group id).
+        uint3 g = min(args.Load3(at), uint3(PARTS * 65535u, 65535u, 65535u));
+        if (g.z != 0 && g.x * g.y > GROUPS * PARTS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64;
+        for (uint k = 0; k < PARTS; k++) {
+            uint part = min(65535u, g.x - min(g.x, k * 65535u));
+            dest.Store4(k * 16, uint4(k * 65535u, part, g.y, g.z));
+        }
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
@@ -106,7 +121,13 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            dest.Store(at, 0);
+            if (kind == 3) {
+                for (uint k = 0; k < PARTS; k++) {
+                    dest.Store(k * 16 + 4, 0);
+                }
+            } else {
+                dest.Store(at, 0);
+            }
         }
     }
     if (lane == 0) {
@@ -185,6 +206,16 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
+/// The clamp's kind for one dispatch record split into [`SPLIT_PARTS`]
+/// records of [`SPLIT_STRIDE`] bytes: the group offset in x (a root
+/// constant), then a dispatch of at most 65,535 groups in x.
+pub(crate) const SPLIT_DISPATCH: u32 = 3;
+/// Records of a split dispatch (`PARTS` in the clamp): up to 262,140 groups
+/// in x.
+pub(crate) const SPLIT_PARTS: u32 = 4;
+/// Bytes per split dispatch record.
+pub(crate) const SPLIT_STRIDE: u32 = 16;
+
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` (a title
 /// buffer's copy, only read) into the list's own argument buffer, left
@@ -210,7 +241,12 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let size = if kind == SPLIT_DISPATCH {
+        u64::from(SPLIT_STRIDE) * u64::from(SPLIT_PARTS)
+    } else {
+        u64::from(stride) * u64::from(records.max(1))
+    };
+    let out = list.arguments(size)?;
     let l = &list.list;
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
@@ -310,6 +346,41 @@ mod tests {
             out?.Map(0, None, Some(&mut out_data)).unwrap();
             let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
+        }
+    }
+
+    /// A split dispatch (kind 3): 72,432 groups in x (the title's final
+    /// gather at 2560x1440, which the plain clamp cuts at 65,535) become
+    /// four records of offset and groups, 65,535 then 6,897 then none;
+    /// past four parts the groups are cut.
+    #[test]
+    fn a_split_dispatch_runs_every_group_in_parts() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        for (x, parts) in [
+            (72_432u32, [65_535u32, 6_897, 0, 0]),
+            (65_535, [65_535, 0, 0, 0]),
+            (300_000, [65_535; 4]),
+        ] {
+            let (title, data) = host.shared_buffer(64).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: our mapped buffers, written before the list runs and
+            // read after it has; live buffers.
+            unsafe {
+                data.cast::<[u32; 3]>().write_volatile([x, 1, 1]);
+                let out = super::bound(&list, title.GetGPUVirtualAddress(), (super::SPLIT_DISPATCH, 12, 1)).unwrap();
+                super::done(&list, &out);
+                list.close();
+                host.execute(&[&list]);
+                let mut words = std::ptr::null_mut();
+                out.Map(0, None, Some(&mut words)).unwrap();
+                let words = std::slice::from_raw_parts(words.cast::<u32>(), 16);
+                for k in 0..4 {
+                    let record = &words[k * 4..k * 4 + 4];
+                    assert_eq!(record, [k as u32 * 65_535, parts[k], 1, 1], "{x} groups, part {k}");
+                }
+            }
         }
     }
 

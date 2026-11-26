@@ -145,6 +145,7 @@ fn lowered(native: &NativeProgram, limit: u32) -> Result<lower::Lowered, crate::
         view_marks: false,
         host_wave_max: 64,
         loop_limit: limit,
+        group_x_offset: false,
     })
 }
 
