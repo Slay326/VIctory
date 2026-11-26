@@ -63,6 +63,92 @@ fn most_submissions() -> u64 {
     *N.get_or_init(|| number("VICTORY_BVH_GT_MAX", 200))
 }
 
+/// `VICTORY_BVH_GT_READER=<shader hash>` (a ray tracing program, such as
+/// f607780a): after each submission with a list that bound it, the headers
+/// the last builder comparison found are checked again in what the GPU
+/// holds now, the structures as the readers saw them (the builder's later
+/// stages done, or what withholding left).
+pub(crate) fn reader_target() -> Option<&'static str> {
+    static TARGET: OnceLock<Option<String>> = OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            std::env::var("VICTORY_BVH_GT_READER")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+        })
+        .as_deref()
+}
+
+#[derive(Default)]
+struct Last {
+    submission: u64,
+    headers: Vec<u64>,
+    /// Copy (none: an arena page), page, where its bytes start.
+    pages: Vec<(Option<Arc<Shadow>>, usize, usize)>,
+}
+
+static LAST: std::sync::Mutex<Last> = std::sync::Mutex::new(Last { submission: 0, headers: Vec::new(), pages: Vec::new() });
+static READER_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+/// What kind of structure a header's dword 0 names: still packed, a top
+/// level one whose bounds are still the builder's start values (being
+/// built), or one to check.
+fn kind(d0: u32, bounds_start: bool) -> &'static str {
+    if d0 >> 16 & 0x100 != 0 {
+        "packed"
+    } else if d0 >> 16 & 0x8000 == 0 && bounds_start {
+        "top,building"
+    } else if d0 >> 16 & 0x8000 == 0 {
+        "top"
+    } else {
+        "bottom"
+    }
+}
+
+/// After submission `submission`, whose lists bound the reader program: the
+/// last builder comparison's headers checked in the GPU's bytes now.
+pub(crate) fn reader_check(submission: u64) {
+    if READER_CHECKS.fetch_add(1, Ordering::Relaxed) >= most_submissions() {
+        return;
+    }
+    let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.headers.is_empty() {
+        return;
+    }
+    let wanted: Vec<u64> = last.pages.iter().filter(|p| p.0.is_none()).map(|p| p.1 as u64).collect();
+    let mut now: Vec<(usize, Vec<u8>)> = crate::arena::fetch(&wanted).into_iter().map(|(at, g)| (at as usize, g)).collect();
+    now.extend(last.pages.iter().filter_map(|(copy, page, _)| copy.as_ref()?.gpu_bytes(*page)));
+    let read = reader(&now);
+    let mut by_kind: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
+    let mut first = Vec::new();
+    for &at in &last.headers {
+        let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
+        if !is_header(d0, d1) {
+            let e = by_kind.entry("gone").or_default();
+            e.0 += 1;
+            continue;
+        }
+        let start = (4..10).any(|i| read(at + 4 * i).is_some_and(|w| f32::from_bits(w).abs() == f32::MAX));
+        let k = kind(d0, start);
+        let c = check(&read, at);
+        let e = by_kind.entry(k).or_default();
+        e.0 += 1;
+        e.1 += u32::from(c.valid);
+        if !c.valid && k == "bottom" && first.len() < 3 {
+            first.push(format!("{at:#x} {}", c.why.as_deref().unwrap_or("?")));
+        }
+    }
+    let kinds: Vec<String> = by_kind.iter().map(|(k, (n, v))| format!("{k} {v}/{n}")).collect();
+    tracing::info!(
+        target: "victory_gpu::bvh_gt",
+        "BVH GT reader s{submission} (headers of builder s{}): valid by kind {}; first invalid bottom: {}",
+        last.submission,
+        kinds.join(", "),
+        first.join(", "),
+    );
+}
+
 /// `VICTORY_BVH_GT_DUMPS` (3): invalid headers per submission whose raw
 /// dwords are logged.
 fn dumps() -> usize {
@@ -149,6 +235,14 @@ impl Gt {
             Some(Page { from, page, copy: Some(copy), g })
         }));
         let g = scan(&pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>());
+        // Remembered for the readers' check ([`reader_check`]): the pages
+        // with headers, where they live.
+        if reader_target().is_some() && !g.headers.is_empty() {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            last.headers = g.headers.iter().map(|(at, _)| *at).collect();
+            last.pages = pages.iter().map(|p| (p.copy.clone(), p.page, p.from)).collect();
+            last.submission = submission;
+        }
         Some(Gt {
             submission,
             lists,
@@ -289,10 +383,19 @@ impl Gt {
         let plausible_n = self.g.headers.iter().filter(|(at, _)| plausible(*at)).count();
         let plausible_valid = self.g.headers.iter().filter(|(at, c)| c.valid && plausible(*at)).count();
         let valid_past_header = self.g.headers.iter().filter(|(at, _)| check_with(&read, *at, 64).valid).count();
+        let mut by_kind: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
+        for (at, c) in &self.g.headers {
+            let start = (4..10).any(|i| read(at + 4 * i).is_some_and(|w| f32::from_bits(w).abs() == f32::MAX));
+            let e = by_kind.entry(kind(read(*at).unwrap_or(0), start)).or_default();
+            e.0 += 1;
+            e.1 += u32::from(c.valid);
+        }
+        let kinds: Vec<String> = by_kind.iter().map(|(k, (n, v))| format!("{k} {v}/{n}")).collect();
         tracing::info!(
             target: "victory_gpu::bvh_gt",
-            "BVH GT s{s} format: headers {} plausible (dwords 10/13 64-byte multiples inside the size) {plausible_n}, of them valid {plausible_valid}; valid if the size counts the nodes past the header {valid_past_header}",
+            "BVH GT s{s} format: headers {} plausible (dwords 10/13 64-byte multiples inside the size) {plausible_n}, of them valid {plausible_valid}; valid if the size counts the nodes past the header {valid_past_header}; valid by kind {}",
             self.g.headers.len(),
+            kinds.join(", "),
         );
         if self.g.headers.iter().any(|(_, c)| !c.valid) {
             let words = |at: u64, n: u64| -> String {
