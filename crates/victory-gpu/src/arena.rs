@@ -237,6 +237,9 @@ struct Arena {
     /// ([`want_around`]), and the runs already given (start).
     around: BTreeSet<u64>,
     around_done: HashSet<u64>,
+    /// Pages such addresses lay in that hold no title memory, or that a copy
+    /// holds (not looked at again).
+    not_title: HashSet<u64>,
     wanted_regions: BTreeSet<usize>,
     /// Pages with no memory at their address when asked (not asked again).
     nothing: HashSet<u64>,
@@ -269,6 +272,7 @@ fn new_arena() -> Arena {
         wanted: BTreeSet::new(),
         around: BTreeSet::new(),
         around_done: HashSet::new(),
+        not_title: HashSet::new(),
         wanted_regions: BTreeSet::new(),
         nothing: HashSet::new(),
         watched: BTreeMap::new(),
@@ -367,10 +371,40 @@ pub(crate) fn want_around(address: u64) {
         return;
     }
     with(|a| {
-        if a.dir.get(address / PAGE).is_none() {
+        let page = address / PAGE;
+        if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
             a.around.insert(address);
         }
     });
+}
+
+/// Addresses a builder dispatch's root constants may hold: dword pairs (low,
+/// high below 2^40) and single dwords in 256-byte units at or above 4 GiB
+/// (where the title's GPU memory lies). Those in title memory no copy holds
+/// get their committed run as [`want_around`] does; the rest are passed by.
+pub(crate) fn want_constants(values: &[u32]) {
+    if !enabled() {
+        return;
+    }
+    let candidates = constant_addresses(values);
+    if candidates.is_empty() {
+        return;
+    }
+    with(|a| {
+        for address in candidates {
+            let page = address / PAGE;
+            if a.dir.get(page).is_none() && !a.not_title.contains(&page) {
+                a.around.insert(address);
+            }
+        }
+    });
+}
+
+/// The addresses [`want_constants`] looks at.
+fn constant_addresses(values: &[u32]) -> Vec<u64> {
+    let pairs = values.windows(2).filter(|w| (1..256).contains(&w[1])).map(|w| u64::from(w[0]) | u64::from(w[1]) << 32);
+    let units = values.iter().map(|&v| u64::from(v) << 8).filter(|&a| a >= 1 << 32);
+    pairs.chain(units).collect()
 }
 
 /// A list reached memory in 256 MiB region `l1`, which has no block.
@@ -512,8 +546,17 @@ pub(crate) fn provide() {
     let mut fills: Vec<(Slot, u64)> = Vec::new();
     // The builder's pools first, whole and in this submission.
     let mut first: Vec<(u64, Memory)> = Vec::new();
+    let around_started = std::time::Instant::now();
+    let around_runs = a.stats.around_runs;
     for address in std::mem::take(&mut a.around) {
-        let Some((start, len)) = committed_around(address) else { continue };
+        if a.dir.get(address / PAGE).is_some() {
+            continue;
+        }
+        let in_copy = crate::shadow::find(address, 1).is_some();
+        let Some((start, len)) = committed_around(address).filter(|_| !in_copy) else {
+            a.not_title.insert(address / PAGE);
+            continue;
+        };
         if !a.around_done.insert(start) {
             continue;
         }
@@ -630,6 +673,19 @@ pub(crate) fn provide() {
     if !pieces.is_empty() {
         upload(a, &pieces);
         a.stats.fill_us += started.elapsed().as_micros() as u64;
+    }
+    // Logged at once: a submission that hangs never reaches a frame line.
+    if a.stats.around_runs > around_runs {
+        tracing::info!(
+            target: "victory_gpu::arena",
+            "BVH arena: builder memory given before its run: {} runs of title memory, {} pages in this submission ({:.1} ms); arena {} of {} pages{}",
+            a.stats.around_runs - around_runs,
+            around_pages,
+            around_started.elapsed().as_secs_f64() * 1e3,
+            a.dir.len(),
+            a.dir.most,
+            a.stopped.as_deref().map(|w| format!(" (stopped: {w})")).unwrap_or_default(),
+        );
     }
     if refresh_on() && !a.watched.is_empty() {
         let started = std::time::Instant::now();
@@ -872,6 +928,18 @@ pub(crate) mod tests {
         assert_eq!(d.len(), 2);
         assert_eq!(d.add(PAGES), Err(Refused::Outside), "2^40 and above");
         assert_eq!(Directory::new(0).add(5), Err(Refused::Budget));
+    }
+
+    #[test]
+    fn root_constants_name_addresses_as_pairs_and_in_256_byte_units() {
+        // A pool address as a pair, a count, and an address in 256-byte
+        // units (0xd_7227_a400 >> 8).
+        let values = [0x7227_a400, 0xd, 5768, 0x0d72_27a4];
+        let found = constant_addresses(&values);
+        assert!(found.contains(&0xd_7227_a400), "{found:x?}");
+        assert!(found.contains(&(0x0d72_27a4u64 << 8)), "{found:x?}");
+        assert!(!found.iter().any(|&a| a == 5768 << 8 || a < 1 << 32), "small values are no addresses: {found:x?}");
+        assert!(constant_addresses(&[1, 2, 3]).is_empty());
     }
 
     #[test]
