@@ -858,7 +858,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // took its whole budget in the loading screens before the builder
         // first ran (run 144238: budget used, then its first submission read
         // zeros and the device hung).
-        let asks = arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed);
+        // (The synthetic test has no builder: its stage stands for one.)
+        let asks = arena && (ran_builder.load(std::sync::atomic::Ordering::Relaxed) || cfg!(test));
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =

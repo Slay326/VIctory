@@ -113,6 +113,10 @@ fn faults_per_frame() -> u64 {
     *N.get_or_init(|| number("VICTORY_BVH_ARENA_FAULTS", 512))
 }
 
+/// Bytes of committed title memory given from a builder root argument's
+/// address on (1 MiB).
+const AROUND_WINDOW: u64 = 1 << 20;
+
 /// Pages prepared after each address that looks like a structure's in the
 /// builder's input buffers (256 KiB).
 const PREPARED_PAGES: u64 = 4;
@@ -665,10 +669,14 @@ pub(crate) fn provide() {
             a.not_title.insert(address / PAGE);
             continue;
         };
+        // From the address's page on, at most `AROUND_WINDOW` bytes of the
+        // run: whole runs took the budget (run 144749: 6 runs wanted 33,344
+        // pages before the builder's first submission, then 71 runs 257,243).
+        let from = (address & !(PAGE - 1)).max(start);
+        let (start, len) = (from, (start + len - from).min(AROUND_WINDOW).min(around_most()));
         if !a.around_done.insert(start) {
             continue;
         }
-        let len = len.min(around_most());
         a.stats.around_runs += 1;
         for page in start / PAGE..(start + len).div_ceil(PAGE) {
             if a.dir.get(page).is_none() {
