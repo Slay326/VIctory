@@ -469,7 +469,8 @@ fn memory_at(address: u64) -> Memory {
     }
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
     // SAFETY: room for one answer; no reset, so nothing changes.
-    let watched = unsafe { GetWriteWatch(0, address as *const _, PAGE as usize, (&raw mut found).cast(), &mut count, &mut granularity) == 0 };
+    // Its 4 KiB page alone: a range past the allocation fails.
+    let watched = unsafe { GetWriteWatch(0, (address & !0xfff) as *const _, 4096, (&raw mut found).cast(), &mut count, &mut granularity) == 0 };
     // The title's memory: its private allocations are write-watched, its
     // physical pages mapped views; the host's own (heaps, images) is neither.
     if !watched && info.Type != windows_sys::Win32::System::Memory::MEM_MAPPED {
@@ -939,7 +940,7 @@ pub(crate) mod tests {
         assert!(found.contains(&0xd_7227_a400), "{found:x?}");
         assert!(found.contains(&(0x0d72_27a4u64 << 8)), "{found:x?}");
         assert!(!found.iter().any(|&a| a == 5768 << 8 || a < 1 << 32), "small values are no addresses: {found:x?}");
-        assert!(constant_addresses(&[1, 2, 3]).is_empty());
+        assert!(constant_addresses(&[1, 0x300, 7]).is_empty());
     }
 
     #[test]
