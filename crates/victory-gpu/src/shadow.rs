@@ -121,9 +121,32 @@ fn card_limits() -> (u64, Option<u64>) {
 /// VI fills it on an 8 GB card).
 const CARD_MOST: u64 = 1 << 30;
 
+/// The most bytes of copies in the GPU's memory with the BVH arena on
+/// (`crate::arena`) unless `VICTORY_CARD_BUFFERS_MB` says otherwise: the
+/// arena takes the room (copies past it stay in system memory, slower for
+/// the GPU, the same bytes).
+const CARD_MOST_ARENA: u64 = 512 << 20;
+
 /// The most bytes of copies in the GPU's memory on `host` ([`card_limits`]).
 fn card_most(host: &crate::host::Host) -> u64 {
-    card_limits().1.unwrap_or_else(|| CARD_MOST.min(host.card_budget().map_or(u64::MAX, |b| b / 4)))
+    let most = if crate::arena::enabled() { CARD_MOST_ARENA } else { CARD_MOST };
+    card_limits().1.unwrap_or_else(|| most.min(host.card_budget().map_or(u64::MAX, |b| b / 4)))
+}
+
+/// The cap on copies in the GPU's memory now, and what it would be without
+/// the BVH arena (`crate::arena`'s log line).
+pub(crate) fn card_cap() -> (u64, u64) {
+    let Some(host) = host() else { return (0, 0) };
+    let without = card_limits().1.unwrap_or_else(|| CARD_MOST.min(host.card_budget().map_or(u64::MAX, |b| b / 4)));
+    (card_most(host), without)
+}
+
+/// Copies refused a GPU side by the cap so far, and their bytes.
+static CARD_REFUSED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub(crate) fn card_refused() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (CARD_REFUSED[0].load(Relaxed), CARD_REFUSED[1].load(Relaxed))
 }
 
 /// The smallest title buffer whose copy goes to the GPU's memory
@@ -156,6 +179,8 @@ fn card_for(size: u64, least: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES.fetch_add(size, Relaxed) + size > card_most(host) {
         CARD_BYTES.fetch_sub(size, Relaxed);
+        CARD_REFUSED[0].fetch_add(1, Relaxed);
+        CARD_REFUSED[1].fetch_add(size, Relaxed);
         return None;
     }
     let buffer = host.card_buffer(size);
