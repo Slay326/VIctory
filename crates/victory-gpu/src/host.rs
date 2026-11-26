@@ -69,6 +69,7 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 mod card;
+pub(crate) mod overlap;
 pub(crate) use card::card_fetch;
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -1320,7 +1321,12 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        // Heap syncs beside the wait (`VICTORY_SYNC_OVERLAP`),
+                        // not while lists are timed one by one.
+                        let mode = if groups.len() == 1 { overlap::mode() } else { 0 };
+                        overlap::while_waiting(mode, crate::descriptor::sync_heaps, || {
+                            WaitForSingleObject(self.event, INFINITE)
+                        });
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -2937,6 +2943,14 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            if overlap::mode() > 0 {
+                let [passes, us] = [0, 1].map(|i| overlap::OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "heap syncs while submissions ran: {passes:.1}/frame, {:.1} ms/frame (VICTORY_SYNC_OVERLAP={})",
+                    us / 1e3,
+                    overlap::mode()
+                );
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

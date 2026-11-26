@@ -956,6 +956,53 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
     }
 
+    /// With heap syncs beside a submission's wait (`VICTORY_SYNC_OVERLAP`
+    /// 2): a record the title copies in during the wait is made during it,
+    /// and one it copies in as the wait ends is made by the sync the next
+    /// submission starts with, before anything is prepared.
+    #[cfg(windows)]
+    #[test]
+    fn records_copied_while_a_submission_runs_are_made_before_the_next_one() {
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            let copy_in = |slot: u64| {
+                // SAFETY: 16 bytes of each, ours; the heap's page is guarded
+                // (our handler opens it).
+                unsafe { std::ptr::copy_nonoverlapping(at as *const u8, (memory as u64 + slot * 16) as *mut u8, 16) };
+            };
+            let made_during = crate::host::overlap::while_waiting(2, sync_heaps, || {
+                copy_in(7);
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !host.made(7) && std::time::Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                host.made(7)
+            });
+            assert!(made_during, "made while the submission ran");
+            crate::host::overlap::while_waiting(2, sync_heaps, || copy_in(9));
+            // What the next submission does first (`Host::execute`).
+            sync_heaps();
+            assert!(host.made(9), "made before the next submission is prepared");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
     /// Grand Theft Auto VI places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]

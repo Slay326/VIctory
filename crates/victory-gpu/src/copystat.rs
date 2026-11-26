@@ -104,8 +104,12 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Heap syncs run while submissions ran on the GPU
+    /// (`VICTORY_SYNC_OVERLAP`) and their time.
+    OverlapPasses,
+    OverlapUs,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 63;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -310,6 +314,14 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    if crate::host::overlap::mode() > 0 {
+        tracing::info!(
+            "  heap syncs while submissions ran per frame: {:.1}, {:.1} ms; before submissions {:.1} ms",
+            c[C::OverlapPasses as usize],
+            ms(c[C::OverlapUs as usize]),
+            ms(c[C::SyncHeapsUs as usize]),
+        );
+    }
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
