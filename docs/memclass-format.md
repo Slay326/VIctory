@@ -136,3 +136,28 @@ for 8 minutes. Measure it with the first 180 s run before a full capture.
   region (their views are, via the section).
 - Card copies (VRAM) and snapshots are not SYNC records (copystat has them).
 - The guards see the title's first write after a take only.
+
+## Replayer (F4 tool b)
+
+`crates/victory-gpu/src/shadow_replay.rs` (test code, no game, nothing runs
+on the GPU): plays a stream against the real host copies (`Shadow`, with the
+page tracking and guards) under a memory model and checks the three
+invariants (CPU-written page in the copy before a GPU read; GPU-written page
+in title memory at the sync point, or before the CPU's touch where it is not
+copied back; a demoted page never GPU-only again). Input: the stream and a
+classification, one region per line, `<at> <len> <class>` or
+`at=.. len=.. class=..` (classes `gpu-only`, `cpu-only`, `shared`,
+`unknown`). Output: per region events, contradictions to its class,
+demotions with reasons, checks and violations per invariant, then
+`invariants: ok|VIOLATED`, `classification: consistent|REFUTED`,
+`verdict: GREEN|RED`. Stage 3 hooks in through the trait `MemModel`;
+`Today` is the engine as it is, `NoNet` and `RefNet` are test models.
+
+    set VICTORY_REPLAY_STREAM=<capture.vmcs>
+    set VICTORY_REPLAY_CLASSES=<classes.txt>
+    set VICTORY_REPLAY_MODEL=today|refnet|nonet
+    cargo test -p victory-gpu replay_a_capture -- --ignored --nocapture
+
+Optional: `VICTORY_REPLAY_MAX_MB` (pools, default 4096; regions beyond are
+listed as not replayed), `VICTORY_REPLAY_OUT` (report file). Shortcuts are
+listed at the top of the source.

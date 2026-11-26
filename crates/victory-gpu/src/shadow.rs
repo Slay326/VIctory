@@ -2062,6 +2062,12 @@ pub(crate) fn near(va: u64) -> String {
 #[path = "shadow_invariants.rs"]
 mod invariants;
 
+/// Replays memclass event streams against the copies and checks the
+/// invariants (F4 tool b), tested without game data.
+#[cfg(test)]
+#[path = "shadow_replay.rs"]
+mod replay;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
