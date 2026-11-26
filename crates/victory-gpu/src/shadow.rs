@@ -1462,14 +1462,17 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         })
         .collect();
     crate::host::card_fetch(&fetch);
-    for (copy, page) in pages {
-        if withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
-        }
-        let written = copy.copy_back_marked(page);
+    drop(fetch);
+    let pages: Vec<(Arc<Shadow>, usize)> = pages
+        .into_iter()
+        .filter(|(copy, page)| {
+            !withheld
+                .iter()
+                .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && *page < a + n)
+        })
+        .collect();
+    let back = |(copy, page): &(Arc<Shadow>, usize)| {
+        let written = copy.copy_back_marked(*page);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1477,7 +1480,76 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
+    };
+    let threads = back_threads();
+    if threads < 2 || pages.len() < PARALLEL_LEAST {
+        pages.iter().for_each(back);
+        return;
     }
+    // Pages on their own go back on several threads at once (each is read,
+    // compared and written apart from the others: ~25 us a page, ~70 ms of
+    // a world frame on one thread, run 20261125-231403). A page two of the
+    // marked copies hold, or one that shows elsewhere too
+    // (`crate::watch::title_memory_aliased`), goes back after them, in the
+    // order it had: a copy-back there is seen by the other copy's.
+    let alone = pages_alone(&pages.iter().map(|(_, page)| page / PAGE).collect::<Vec<_>>());
+    let (apart, together): (Vec<_>, Vec<_>) = pages.iter().zip(&alone).partition(|&(_, &alone)| alone);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        loop {
+            // A few pages at a time: neighbours stay on one thread.
+            let i = next.fetch_add(PARALLEL_TAKE, std::sync::atomic::Ordering::Relaxed);
+            if i >= apart.len() {
+                break;
+            }
+            apart[i..(i + PARALLEL_TAKE).min(apart.len())].iter().for_each(|(page, _)| back(page));
+        }
+    };
+    if apart.len() >= PARALLEL_LEAST {
+        std::thread::scope(|scope| {
+            for _ in 1..threads {
+                scope.spawn(work);
+            }
+            work();
+        });
+    } else {
+        work();
+    }
+    together.iter().for_each(|(page, _)| back(page));
+}
+
+/// Fewer marked pages than this go back on the submitting thread alone.
+const PARALLEL_LEAST: usize = 32;
+
+/// The pages a copy-back thread takes at a time.
+const PARALLEL_TAKE: usize = 8;
+
+/// The threads marked pages go back on (`VICTORY_BACK_THREADS`, 1 to 8;
+/// 1, the default, is the submitting thread alone).
+fn back_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let threads = std::env::var("VICTORY_BACK_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8);
+        if threads > 1 {
+            tracing::info!(threads, "marked pages go back on several threads (VICTORY_BACK_THREADS)");
+        }
+        threads
+    })
+}
+
+/// For each of `pages` (page numbers): whether no other of them is the same
+/// page and the page shows nowhere else.
+fn pages_alone(pages: &[usize]) -> Vec<bool> {
+    let mut count: std::collections::HashMap<usize, u32> = std::collections::HashMap::with_capacity(pages.len());
+    for &page in pages {
+        *count.entry(page).or_default() += 1;
+    }
+    let aliased = crate::watch::aliased(pages);
+    pages.iter().zip(aliased).map(|(page, aliased)| !aliased && count[page] == 1).collect()
 }
 
 struct Entry {
@@ -1818,6 +1890,20 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Marked pages go back on several threads only where each is on its
+    /// own: not a page two marked copies hold, nor one that shows elsewhere.
+    #[test]
+    fn pages_two_copies_hold_or_shown_elsewhere_go_back_in_order() {
+        // Page numbers no test's memory has (addresses past user space).
+        let base = 0x7fff_0000_0000usize;
+        let (a, b, c, d, e) = (base, base + 1, base + 2, base + 3, base + 4);
+        crate::watch::title_memory_aliased(d * PAGE, &[e * PAGE]);
+        assert_eq!(pages_alone(&[a, b, a, c, d]), [false, true, false, true, false]);
+        assert_eq!(pages_alone(&[e, c]), [false, true]);
+        crate::watch::title_memory_remapped(d * PAGE, PAGE);
+        assert_eq!(pages_alone(&[d, e]), [true, true]);
+    }
 
     thread_local! {
         /// [`card_least`] for the test on this thread.
