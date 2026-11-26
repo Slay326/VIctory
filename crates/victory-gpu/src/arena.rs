@@ -297,6 +297,8 @@ struct Stats {
     refused: u64,
     /// Slots taken back for pages missed in many frames.
     evicted: u64,
+    /// Pages of unwatched title memory sent up again.
+    unwatched_sent: u64,
     nothing: u64,
     regions: u64,
     writes: u64,
@@ -358,6 +360,11 @@ struct Arena {
     /// slot to take back goes on ([`victim`]).
     zero_pages: HashSet<u64>,
     evict_cursor: u64,
+    /// Pages filled from title memory that is not write-watched (mapped
+    /// views): their later title writes never go up ([`refresh_unwatched`]),
+    /// and where the last refresh of them ended.
+    unwatched: BTreeSet<u64>,
+    unwatched_cursor: u64,
     /// Missed pages without a slot: in how many frames, and the last one
     /// ([`want_pages`]; old entries pruned in [`log_frame`]).
     misses: std::collections::HashMap<u64, (u32, u64)>,
@@ -403,6 +410,8 @@ fn new_arena() -> Arena {
         shader_pages: HashSet::new(),
         zero_pages: HashSet::new(),
         evict_cursor: 0,
+        unwatched: BTreeSet::new(),
+        unwatched_cursor: 0,
         misses: std::collections::HashMap::new(),
         builder_now: false,
         scans: 0,
@@ -964,6 +973,8 @@ pub(crate) fn provide() {
                 if let Memory::Committed(base, watched) = memory {
                     if watched {
                         a.watched.insert(page, base);
+                    } else {
+                        a.unwatched.insert(page);
                     }
                     fills.push((slot, page * PAGE));
                     a.stats.filled += 1;
@@ -985,6 +996,7 @@ pub(crate) fn provide() {
         }
     }
     evict_for_persistent(a, evict_for, &mut fills);
+    refresh_unwatched(a, &mut fills);
     // Pages that took title memory go up: write tracking is reset first, so
     // a write while they are read goes up at the next refresh.
     let pieces: Vec<(Slot, u64, u64)> = fills
@@ -1085,15 +1097,45 @@ fn evict_for_persistent(a: &mut Arena, wanted: Vec<(u64, Memory)>, fills: &mut V
         };
         a.dir.remove(old);
         a.watched.remove(&old);
+        a.unwatched.remove(&old);
         let Ok((slot, _)) = a.dir.add(page) else { continue };
         a.generation += 1;
         a.stats.evicted += 1;
         if let Memory::Committed(base, watched) = memory {
             if watched {
                 a.watched.insert(page, base);
+            } else {
+                a.unwatched.insert(page);
             }
             fills.push((slot, page * PAGE));
             a.stats.filled += 1;
+        }
+    }
+}
+
+/// Pages of unwatched title memory sent up again whole per submission
+/// (`VICTORY_BVH_ARENA_REFRESH_UNWATCHED`, 0 = off; local test): such a
+/// page kept the bytes it had when it was made, and the builder's bottom
+/// levels took in points at the origin with complete inputs (run 184001:
+/// 58-70 % of the child boxes outside their parent's were outside only by
+/// the origin; zero pages of reserved memory were not the cause, run
+/// 184825).
+fn refresh_unwatched(a: &mut Arena, fills: &mut Vec<(Slot, u64)>) {
+    static N: OnceLock<usize> = OnceLock::new();
+    let n = *N.get_or_init(|| number("VICTORY_BVH_ARENA_REFRESH_UNWATCHED", 0) as usize);
+    if n == 0 || a.unwatched.is_empty() {
+        return;
+    }
+    let from = a.unwatched_cursor;
+    let pages: Vec<u64> = a.unwatched.range(from..).chain(a.unwatched.range(..from)).copied().take(n).collect();
+    for p in pages {
+        a.unwatched_cursor = p + 1;
+        if a.shader_pages.contains(&p) {
+            continue;
+        }
+        if let Some(slot) = a.dir.get(p) {
+            fills.push((slot, p * PAGE));
+            a.stats.unwatched_sent += 1;
         }
     }
 }
@@ -1332,7 +1374,7 @@ pub(crate) fn log_frame() {
     tracing::info!(
         target: "victory_gpu::arena",
         "BVH arena this frame: input buffers scanned {} MB -> {} structure pages; prepared before the builder ran {} pages; builder root addresses {}, \
-         builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, slots taken back for pages missed in many frames {}, \
+         builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, slots taken back for pages missed in many frames {}, unwatched pages sent again {} (of {}), \
          no memory there {}, host memory {}, below 256 MiB {}, missed in too few frames {} (tracked {}), \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms), not sent (page written by shaders) {}; \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
@@ -1350,6 +1392,8 @@ pub(crate) fn log_frame() {
         s.refused,
         a.stopped.as_deref().map(|w| format!(" (stopped: {w})")).unwrap_or_default(),
         s.evicted,
+        s.unwatched_sent,
+        a.unwatched.len(),
         s.nothing,
         s.host,
         s.low,
