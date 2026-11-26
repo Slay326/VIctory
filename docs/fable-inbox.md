@@ -140,3 +140,19 @@ Erste Läufe PC 2 (180 s, play-Schalter + Arena/RETAKE_LATE/EVICT, BVH an) [M]: 
 (rt/play, zwei Läufe) gegen 887 ms auf test/bvh31-blimit (480 s, s46-reads); kein Device-Removed.
 Variante `test/rtplay-2098` (+ upstream #2098, 97abc79): ein Lauf 908 ms, Leser-Werte in der Streuung;
 Einzelheiten im JOURNAL unter "senior 48". **unverified, for Fable**: Streuung bei 26 Frames je Lauf groß.
+
+---
+
+## F4 (Entscheidung, kurz): Bewertung der Werkzeuge a-e und Rangfolge
+
+Status: offen. Blockiert: welches Werkzeug nach S3/S4 als Nächstes gebaut wird (Karten Q9, Q10; Recorder in S4).
+Daten und Tabelle: `docs/dev-efficiency.md` (Abschnitte 1, 3, 4). Kurzfassung:
+- 48 h: 327 Spielläufe [M], 28,1 h Laufzeit inkl. Laden [C], 83 Abstürze = 25,4 % [C], 17 Abbrüche ohne meta [M],
+  Aufwärmen >= 7,6 h [C, LB]; 38 getestete Hypothesen [H, Stichwort-Heuristik] = 0,94 GPU-Stunden je Hypothese.
+- Guard-Faults: 1.128/Frame à ~64 µs [M] = 72,2 ms/Frame seriell [C].
+- Werkzeuge: a Kostenmodell (S3), b Host-Record/Replay (Format in S4), c GPU-Frame-Replay PIX/RenderDoc (S3 prüft),
+  d Laufzeit-Schalter (Q9), e statische Analyse der Spieldatei nach Schreibstellen.
+- Vorschlag Opus (**unverified, for Fable**): b > d > a > c > e. Begründung: Stufe 1 schreibt die Ereignisse als
+  Capture, Stufe 3 (Z2) wird offline gegen echte Zugriffsfolgen getestet; d halbiert die Läufe je A-B.
+Bitte entscheiden: (1) Rangfolge; (2) reicht die Methode in Abschnitt 1 (Heuristik + Handliste) als Grundlage, oder
+soll "getestete Hypothese" anders gezählt werden; (3) Q10 (Clean-Room Guard-Faults) vor oder nach Stufe 3?

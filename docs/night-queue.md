@@ -228,6 +228,65 @@ alle Opus-Karten 1.000 min = 16,7 h [C aus S]. Mit zwei PCs und CPU-Arbeit paral
 
 ---
 
+## Werkzeuge und parallele Streams (senior 55, 26.11. ~21:30; Hintergrund `docs/dev-efficiency.md`)
+
+### Q9 Laufzeit-Schalter für Host-Optionen (A-B im selben Spiellauf)
+- Status: offen (Rangfolge wartet auf Fable F4; die Karte ist unabhängig davon baubar)
+- Ziel: Host-Optionen im laufenden Spiel umschalten, damit ein A-B in einem Lauf entsteht (gleiche Szene,
+  gleicher Speicherzustand, ein Laden statt zwei). Nur Host-Optionen (z. B. `VICTORY_BACK_THREADS`, Kopierwege,
+  `VICTORY_CLAMP_WINDOW`); nichts, was beim Start Ressourcen, Heaps, Caches oder Pipelines anlegt.
+- Schritte:
+  1. Neue Funktion neben `switch::on` (victory-gpu `switch.rs`): Wert aus einer Steuerdatei
+     (`VICTORY_SWITCH_FILE=<pfad>`), gelesen höchstens einmal je Frame an der Frame-Grenze, sonst Env-Wert.
+  2. Zeitplan-Modus: `VICTORY_SWITCH_EVERY=30` wechselt A/B alle 30 s selbst (Datei optional), damit kein
+     externer Taktgeber nötig ist.
+  3. Nur Schalter umstellen, die heute per `OnceLock` gelesen werden und die laut Code-Durchsicht ohne
+     Neuanlage wechseln dürfen; Liste in der Karte nachtragen. Wechsel nur an der Frame-Grenze, nie mitten in einer
+     Submission.
+  4. Log: bei jedem Wechsel eine Zeile `switch interval <n> <A|B> <schalter=wert,...> frame=<f>`.
+  5. `pc1eval.py` (lokal): Intervalle je A/B auswerten (Median Vorbereitung / GPU / Zurück, fps, Streuung),
+     erstes Intervall nach jedem Wechsel als Einschwingen verwerfen.
+- Abnahme: Unit-Test für den Wechsel (Datei/Zeitplan -> Wert an der Frame-Grenze, kein Wechsel mitten im Frame),
+  rot ohne / grün mit Umsetzung gezeigt; Log markiert jedes Intervall; pc1eval wertet je Intervall aus (Test mit
+  Fixture-Log wie Q7); `cargo test --workspace` grün bis auf bekannte Ausnahmen. Erster Spiellauf erst nach den
+  Offline-Tests: PC 1, 180 s, A = B (gleicher Wert) als Leertest, Unterschied muss im Rauschen liegen.
+- PC: Bau/Tests PC 1 (CPU), Beweislauf PC 1. Aufwärmen: nein (Host-Code). Abhängig von: nichts.
+  Dauer: 4 h [S]. Wer: Opus. Review Fable, falls ein umgeschalteter Schalter Copy-back oder Sync betrifft.
+
+### Q10 Clean-Room: Guard-Faults billiger
+- Status: offen. **Nur für einen Agenten, der weder xcl- noch console_insn-Code gelesen hat (nicht senior 50/51).**
+  Die Beschreibung unten ist die einzige Grundlage; kein Bezug auf fremden Code.
+- Ausgang: ~1.128 Guard-Faults pro Frame à ~64 µs [M, play-Baseline] = 72,2 ms/Frame seriell [C, devstats.py].
+- Ziel: Guard-Faults auf überwachten Seiten billiger machen, ohne die Seitenverfolgung zu verfälschen.
+  1. **Einzelne Schreibzugriffe im Fault-Handler ausführen**: Wenn der Titel auf eine überwachte Seite schreibt,
+     den einen auslösenden Befehl dekodieren und seine Wirkung (Ziel, Wert, Breite) im Handler selbst ausführen,
+     die Seite als vom CPU beschrieben vermerken und hinter dem Befehl weitermachen, statt die Seite freizugeben,
+     den Block zu kopieren und wieder zu schützen. Unbekannte Befehle gehen den heutigen Weg (sicherer Rückfall).
+  2. **Gleiche Werte nicht schreiben**: An heißen Schreibstellen, die meist einen schon vorhandenen Wert
+     schreiben (z. B. Flags setzen, die schon gesetzt sind), zuerst lesen und nur bei Änderung schreiben und
+     markieren. Die Stellen findet man zur Laufzeit an ihren Faults (Zähler je Befehlsadresse, Anteil
+     "Wert unverändert").
+- Schritte: (a) Zähler je Fault-Adresse und Anteil unveränderter Werte (nur messen); (b) Dekoder/Emulator für die
+  häufigsten Befehlsformen mit Tabellen-Tests gegen echte CPU-Ausführung; (c) Handler-Weg hinter Schalter
+  `VICTORY_GUARD_EMULATE=1` (Standard aus); (d) Offline-Tests zuerst, Spiellauf nur als Beweis.
+- Abnahme: Tests ohne Spiel: emulierter Befehl == echte Ausführung (Register, Speicher, Flags) für jede
+  unterstützte Form, unbekannte Form -> alter Weg; Seite ist nach emuliertem Write als CPU-beschrieben markiert und
+  wird vor dem nächsten GPU-Lesen synchronisiert (Invariante wie Q6); jeder Test rot ohne / grün mit Umsetzung.
+  Dann PC 1 A-B-A (Faults/Frame, µs/Fault, fps, Streuung), PC 2 Bildvergleich im Rauschen.
+  **Danach Fable-Review**, weil es die Seitenverfolgung betrifft; kein Merge nach play ohne Review.
+- PC: Bau/Tests CPU, Beweis PC 1 + PC 2. Aufwärmen: nein (Host-Code). Abhängig von: nichts.
+  Dauer: 6 h [S]. Wer: Opus (Clean-Room-Agent), Review Fable.
+
+### S1-S4 Parallele Streams (Owner laut JOURNAL-Tabelle "STREAMS")
+- **S1 BVH-Capture + Harness, PC 2**: in Arbeit (senior 52).
+- **S2 BVH-Hypothesen, PC 2 offline**: offen bis das Capture aus S1 steht; dann 2-3 Agenten, je eine Hypothese,
+  Fable urteilt gebündelt.
+- **S3 Kostenmodell + Mikro-Benchmarks, PC 1**: in Arbeit (senior 53); prüft auch GPU-Replay (Werkzeug c).
+- **S4 Stufe-1-Vorbereitung, PC 1, offline bis 23:00**: in Arbeit (senior 54); legt das Ereignisformat für
+  Host-Record/Replay an (Werkzeug b), damit Stufe 3 gegen Captures getestet wird.
+
+---
+
 ## Nur Fable (Opus bereitet höchstens Tests/Daten vor)
 
 ### Z1 Stufe 2: Design `docs/memory-model.md` und Go/No-Go je Stufe — FABLE ONLY
