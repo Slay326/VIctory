@@ -519,18 +519,32 @@ fn committed_around(address: u64) -> Option<(u64, u64)> {
     }
     // The committed regions of its allocation that touch it: from the
     // allocation's start, the run holding `address`, then on while committed.
-    let (mut at, mut start) = (alloc, alloc);
-    while at <= address {
+    // Regions are cut where protections differ (the change tracker guards
+    // pages one by one), so the walk is bounded: past `WALK` regions the run
+    // is taken from the address's own region on (run 135239: an unbounded
+    // walk per candidate held a submission ~30 s).
+    const WALK: usize = 256;
+    let (mut at, mut start, mut steps) = (alloc.max(address.saturating_sub(around_most())), alloc, 0);
+    if at > alloc {
+        start = at;
+    }
+    while at <= address && steps < WALK {
         let r = query(at)?;
         let end = r.BaseAddress as u64 + r.RegionSize as u64;
         if r.State != MEM_COMMIT {
             start = end;
         }
         at = end.max(at + 4096);
+        steps += 1;
+    }
+    if at <= address {
+        (start, at) = (info.BaseAddress as u64, region_end);
     }
     let mut end = at;
-    while let Some(r) = query(end).filter(|r| r.AllocationBase as u64 == alloc && r.State == MEM_COMMIT) {
+    steps = 0;
+    while let Some(r) = query(end).filter(|r| r.AllocationBase as u64 == alloc && r.State == MEM_COMMIT && steps < WALK) {
         end = r.BaseAddress as u64 + r.RegionSize as u64;
+        steps += 1;
     }
     Some((start, end - start))
 }
@@ -596,8 +610,9 @@ pub(crate) fn provide() {
         if a.dir.get(address / PAGE).is_some() {
             continue;
         }
+        // A copy holds it (asked first: the walk below is not free).
         let in_copy = crate::shadow::find(address, 1).is_some();
-        let Some((start, len)) = committed_around(address).filter(|_| !in_copy) else {
+        let Some((start, len)) = (!in_copy).then(|| committed_around(address)).flatten() else {
             a.not_title.insert(address / PAGE);
             continue;
         };
