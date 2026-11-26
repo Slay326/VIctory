@@ -245,11 +245,10 @@ struct Stats {
     around: u64,
     /// Addresses builder dispatches' root arguments named.
     candidates: u64,
-    /// The builder's input buffers scanned (bytes), structure addresses
-    /// found in them (pages), and pages prepared from those.
+    /// The builder's input buffers scanned (bytes) and structure addresses
+    /// found in them (pages).
     scanned: u64,
     found: u64,
-    prepared: u64,
 }
 
 struct Arena {
