@@ -2905,6 +2905,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        crate::descriptor::sweep();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
@@ -2979,6 +2980,12 @@ impl Meter {
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
                     );
                 }
+                let (entries, free, reclaimed) = crate::descriptor::view_counts();
+                tracing::info!(
+                    "view list: {entries} entries ({free} free), {reclaimed} reclaimed so far; last sweep {:.1} ms, {} entries named",
+                    crate::descriptor::RECLAIMED[1].load(Ordering::Relaxed) as f64 / 1e3,
+                    crate::descriptor::RECLAIMED[2].load(Ordering::Relaxed),
+                );
                 let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));
                 tracing::info!(
                     "host texture MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
