@@ -819,6 +819,9 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Our own address of what it showed is no longer its address (taken
+    // before the guards, never under them: see `Own`).
+    forget_views(at, at.saturating_add(len));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
@@ -888,6 +891,232 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
         && protect(&mut g, &[page]).is_empty()
     {
         changed(&mut g, page, page + 1, false);
+    }
+}
+
+// Our own view of the title's page sections (`VICTORY_BACK_OWN_VIEW=1`).
+//
+// A copy-back writing a guarded page through the title's view must open the
+// guard (`VirtualProtect`, under the guard lock) and guard it again after
+// (another), with the guard lock taken three times a page: tens of ms a
+// world frame strictly one at a time, and the title threads' faults wait
+// for the same lock. View memory (the runtime's physical
+// pages, `xmem`) is a section; a view of our own of the whole section shows
+// the same pages, read-write, and no guard covers it. A copy-back writes
+// there: the title's view keeps its protection, so nothing is opened or
+// guarded again, and the guard lock is taken twice a page, briefly, with no
+// system call under it, to mark the other trackers of the page (as
+// `writing` and its drop do).
+//
+// Private memory (`XMemVirtualAlloc`'s pools) has no second view: copy-backs
+// there go as before.
+
+/// Our own views and the title's views they stand for. Lock order: this,
+/// then the guard lock (a copy-back holds it while writing beside and while
+/// marking); the runtime takes it with its page lock held, never with the
+/// guard lock held; the fault handler never takes it.
+struct Own {
+    /// Our read-write view of each section the runtime made for physical
+    /// pages, by the section's handle: its address and bytes (address 0:
+    /// the host gave none).
+    sections: BTreeMap<usize, (usize, usize)>,
+    /// The title's views of those sections by address: bytes, the
+    /// section's handle, the byte offset in it.
+    views: BTreeMap<usize, (usize, usize, usize)>,
+}
+
+static OWN: std::sync::RwLock<Own> =
+    std::sync::RwLock::new(Own { sections: BTreeMap::new(), views: BTreeMap::new() });
+
+fn own() -> std::sync::RwLockReadGuard<'static, Own> {
+    OWN.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn own_mut() -> std::sync::RwLockWriteGuard<'static, Own> {
+    OWN.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether copy-backs write view memory through our own view of its
+/// section (`VICTORY_BACK_OWN_VIEW=1`; off unless asked for). Always on in
+/// the crate's tests: memory the runtime did not report goes as before.
+pub(crate) fn own_view_on() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = crate::switch::on("VICTORY_BACK_OWN_VIEW");
+            if on {
+                tracing::info!("copy-backs write view memory through a view of our own (VICTORY_BACK_OWN_VIEW)");
+            }
+            on
+        })
+    }
+}
+
+/// The runtime made a section of `bytes` for physical pages (its handle):
+/// we map a view of our own of all of it, kept until the section goes.
+pub fn title_memory_section(section: usize, bytes: usize) {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    if !own_view_on() {
+        return;
+    }
+    // SAFETY: the whole of a section the runtime just made, by its open
+    // handle; the view is ours until `title_memory_section_gone`.
+    let base = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, bytes) }.Value as usize;
+    if base == 0 {
+        tracing::warn!(bytes, error = %std::io::Error::last_os_error(), "no view of our own of the title's pages");
+    }
+    let old = {
+        let mut own = own_mut();
+        // A handle's number given out again: views of the old section go.
+        own.views.retain(|_, v| v.1 != section);
+        own.sections.insert(section, (base, bytes))
+    };
+    // A handle's number given out again (the section that had it is gone).
+    if let Some((old, _)) = old.filter(|&(old, _)| old != 0) {
+        unmap_own(old);
+    }
+}
+
+/// The runtime lets go of a section: our view of it goes, and with it
+/// every title view we knew of it (all unmapped by now).
+pub fn title_memory_section_gone(section: usize) {
+    if !own_view_on() {
+        return;
+    }
+    let mut own = own_mut();
+    own.views.retain(|_, v| v.1 != section);
+    // Unmapped with the lock held: no copy-back is writing through it.
+    if let Some((base, _)) = own.sections.remove(&section).filter(|&(base, _)| base != 0) {
+        unmap_own(base);
+    }
+}
+
+fn unmap_own(base: usize) {
+    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+    // SAFETY: a view of ours.
+    unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }) };
+}
+
+/// The runtime mapped `len` bytes of a section (its handle) from byte
+/// `offset` on at `at` (after `title_memory_remapped` of the range).
+pub fn title_memory_view(at: usize, len: usize, section: usize, offset: usize) {
+    if !own_view_on() || len == 0 {
+        return;
+    }
+    let mut own = own_mut();
+    if own.sections.contains_key(&section) {
+        own.views.insert(at, (len, section, offset));
+    }
+}
+
+/// Title views overlapping `[at, end)` are gone or show something else.
+fn forget_views(at: usize, end: usize) {
+    if !own_view_on() || at >= end {
+        return;
+    }
+    let mut own = own_mut();
+    let first = own.views.range(..=at).next_back().filter(|(base, v)| *base + v.0 > at).map(|(&base, _)| base);
+    let hit: Vec<usize> = first.into_iter().chain(own.views.range(at.saturating_add(1)..end).map(|(&b, _)| b)).collect();
+    for base in hit {
+        own.views.remove(&base);
+    }
+}
+
+impl Own {
+    /// Our own address of title memory `[at, at + len)`, if it lies in one
+    /// title view of a section we have a view of.
+    fn beside(&self, at: usize, len: usize) -> Option<usize> {
+        let (&base, &(bytes, section, offset)) = self.views.range(..=at).next_back()?;
+        if at.checked_add(len)? > base + bytes {
+            return None;
+        }
+        let &(whole, size) = self.sections.get(&section)?;
+        let within = offset + (at - base);
+        (whole != 0 && within + len <= size).then(|| whole + within)
+    }
+}
+
+/// Marks pages `[first, last)` changed in their trackers but `ours`, and
+/// the pages showing the same memory elsewhere in all of theirs, with no
+/// guard opened: our write beside them is not the title's, and a guard
+/// stays as it is (a page changed and guarded is taken again by the next
+/// refresh, as after a [`retake`]). With `save`, before the write lands.
+fn mark_beside(g: &mut Guards, first: usize, last: usize, ours: &Arc<Changed>, save: bool) {
+    let mark = |c: &Arc<Changed>, page: usize| {
+        let first_write = {
+            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            set_dirty(c.2, true);
+            set.insert(page)
+        };
+        if first_write && save {
+            c.save(page);
+        }
+    };
+    for (&page, holders) in g.holders.range(first..last) {
+        holders.iter().filter(|c| !Arc::ptr_eq(c, ours)).for_each(|c| mark(c, page));
+    }
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    for page in others {
+        if let Some(holders) = g.holders.get(&page) {
+            holders.iter().for_each(|c| mark(c, page));
+        }
+    }
+}
+
+impl Tracked {
+    /// A copy-back's write of title memory `[at, at + len)` (one page at
+    /// most) through our own view of its section, by `put`, given what to
+    /// add to a title address for ours: `None` (nothing done) if the
+    /// memory is no view we have one of. The title's view keeps its guard:
+    /// a title write meanwhile faults and marks this tracker too (the
+    /// caller asks [`Tracked::changed`] after). The other trackers of the
+    /// page are marked, before the write (keeping their bytes from before
+    /// it where armed, as [`writing`]) and after (as its drop).
+    pub(crate) fn write_beside(&self, at: usize, len: usize, put: impl FnOnce(usize) -> bool) -> Option<()> {
+        if !own_view_on() || len == 0 {
+            return None;
+        }
+        debug_assert_eq!(at / PAGE, (at + len - 1) / PAGE, "one page at most");
+        let own = own();
+        let to = own.beside(at, len)?;
+        let (first, last) = (at / PAGE, (at + len).div_ceil(PAGE));
+        {
+            // Busy as under `writing`: no tracker takes the page while the
+            // write is under way.
+            let mut g = guards();
+            g.busy.push((first, last));
+            mark_beside(&mut g, first, last, &self.changed, true);
+        }
+        let written = put(to.wrapping_sub(at));
+        // Still under our lock: the runtime cannot remap the title's view
+        // and have its new pages marked before these.
+        let mut g = guards();
+        if let Some(i) = g.busy.iter().position(|&r| r == (first, last)) {
+            g.busy.swap_remove(i);
+        }
+        mark_beside(&mut g, first, last, &self.changed, false);
+        if !written {
+            // Not all of it landed: the copy no longer holds what title
+            // memory does, so the next refresh takes the page.
+            let mut set = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            set.extend(first..last);
+            set_dirty(self.changed.2, true);
+        }
+        drop(g);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BesidePages, 1);
+        Some(())
+    }
+
+    /// Whether page `page` (a page number) is guarded now (tests).
+    #[cfg(test)]
+    pub(crate) fn guarded(&self, page: usize) -> bool {
+        guards().protected.contains(&page)
     }
 }
 
@@ -1442,6 +1671,158 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// A pagefile section of `pages` pages, reported as the runtime does
+    /// when it makes one for physical pages, mapped twice as the title's
+    /// views (the second showing the same pages elsewhere): (section, first
+    /// view, second view).
+    pub(crate) fn reported_section(pages: usize) -> (usize, usize, usize) {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        let len = pages * PAGE;
+        // SAFETY: a pagefile section mapped read-write twice; the test keeps
+        // both views.
+        let (section, a, b) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (
+                section as usize,
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
+            )
+        };
+        assert!(a != 0 && b != 0);
+        title_memory_section(section, len);
+        for (view, others) in [(a, None), (b, Some(a))] {
+            title_memory_view(view, len, section, 0);
+            if let Some(other) = others {
+                for k in (0..len).step_by(PAGE) {
+                    title_memory_aliased(view + k, &[other + k]);
+                }
+            }
+        }
+        (section, a, b)
+    }
+
+    /// As the runtime makes them: a section that reserves its pages, one
+    /// page committed through the title's view only. A write beside lands
+    /// there; a page committed nowhere is not written and is left changed.
+    #[test]
+    fn writes_beside_reach_pages_committed_through_the_titles_view() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MapViewOfFile, SEC_RESERVE, VirtualAlloc,
+        };
+        let len = 2 * PAGE;
+        // SAFETY: a pagefile section reserving its pages, mapped once; its
+        // first page committed through that view. The test keeps both.
+        let (section, a) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            assert!(a != 0 && !VirtualAlloc(a as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            (section as usize, a)
+        };
+        title_memory_section(section, len);
+        title_memory_view(a, len, section, 0);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        let bytes = [0x3cu8; 16];
+        let put = |at: usize| move |delta: usize| crate::host::write_mapped(at.wrapping_add(delta) as *mut u8, bytes.as_ptr(), 16);
+        assert_eq!(t.write_beside(a + 32, 16, put(a + 32)), Some(()));
+        // SAFETY: a byte of the committed page.
+        assert_eq!(unsafe { ((a + 40) as *const u8).read_volatile() }, 0x3c, "the bytes landed");
+        assert!(t.clean(), "nothing to take");
+        assert_eq!(t.write_beside(a + PAGE + 32, 16, put(a + PAGE + 32)), Some(()));
+        assert!(t.changed(a / PAGE + 1), "not committed: not written, left for the next refresh");
+        title_memory_section_gone(section);
+    }
+
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        info.Protect
+    }
+
+    /// A copy-back through our own view of a section (`write_beside`): the
+    /// bytes land, the title's view stays guarded (no protection changes),
+    /// the tracker writing stays clean, and every other tracker of the
+    /// memory (the same address, or another view of the pages) has it
+    /// changed. A title write while the copy-back runs faults as always:
+    /// its byte stays, and the writing tracker has the page changed (the
+    /// next refresh takes it). Memory with no view of
+    /// ours, and a view the runtime remapped, are not written beside.
+    #[test]
+    fn copy_backs_beside_the_guard_keep_it_and_the_titles_writes() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        let (section, a, b) = reported_section(2);
+        let page = a / PAGE + 1;
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        let u = track(a + PAGE, PAGE, true).expect("views are tracked");
+        let w = track(b, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        assert_eq!(u.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        assert_eq!(w.take(b, b + 2 * PAGE), [(b, b + 2 * PAGE)]);
+        assert_eq!(protection(a + PAGE), PAGE_READONLY);
+        let read = |at: usize| {
+            // SAFETY: a byte of our views (reads need no guard opened).
+            unsafe { (at as *const u8).read_volatile() }
+        };
+        // 1. No title write meanwhile.
+        let done = t.write_beside(a + PAGE + 64, 32, |delta| {
+            assert_ne!(delta, 0, "another address");
+            // SAFETY: our own view of the section, read-write.
+            unsafe { ((a + PAGE + 64).wrapping_add(delta) as *mut u8).write_bytes(0x5a, 32) };
+            true
+        });
+        assert_eq!(done, Some(()));
+        assert_eq!((read(a + PAGE + 64), read(a + PAGE + 95), read(b + PAGE + 64)), (0x5a, 0x5a, 0x5a), "the bytes landed");
+        assert!(t.guarded(page) && protection(a + PAGE) == PAGE_READONLY, "the title's guard stayed");
+        assert!(t.clean() && !t.changed(page), "the writer's copy has the bytes: nothing to take");
+        assert!(u.changed(page), "another copy of the page takes it again");
+        assert!(w.changed(b / PAGE + 1) && !w.changed(b / PAGE), "so does a copy of another view of it");
+        assert_eq!(u.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        assert_eq!(w.take(b, b + 2 * PAGE), [(b + PAGE, b + 2 * PAGE)]);
+        // 2. A title thread writes the page while the copy-back is under
+        // way (before our bytes land): its fault marks the writer too.
+        let done = t.write_beside(a + PAGE + 64, 32, |delta| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    // SAFETY: the title's view, guarded: the handler opens it.
+                    unsafe { ((a + PAGE + 1000) as *mut u8).write_volatile(0x77) };
+                });
+            });
+            // SAFETY: as above.
+            unsafe { ((a + PAGE + 64).wrapping_add(delta) as *mut u8).write_bytes(0x6b, 32) };
+            true
+        });
+        assert_eq!(done, Some(()));
+        assert_eq!((read(a + PAGE + 64), read(a + PAGE + 1000)), (0x6b, 0x77), "both bytes are there");
+        assert!(t.changed(page) && u.changed(page), "the title's write marks every copy, the writer's too");
+        assert!(!t.guarded(page), "its fault opened the guard");
+        // Taken again as before: guarded and clean.
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        assert!(t.clean() && t.guarded(page) && protection(a + PAGE) == PAGE_READONLY);
+        // 3. Memory with no view of ours goes as before.
+        let p = pool(1);
+        let v = track(p, PAGE, true).expect("pool memory is tracked");
+        assert!(v.write_beside(p, 8, |_| panic!("not beside")).is_none());
+        drop(v);
+        free(p);
+        // 4. A view the runtime remapped is not ours any more.
+        title_memory_remapped(a, 2 * PAGE);
+        assert!(t.write_beside(a + PAGE, 8, |_| panic!("not beside")).is_none());
+        title_memory_section_gone(section);
+        assert!(w.write_beside(b, 8, |_| panic!("not beside")).is_none(), "nor one of a section gone");
     }
 
     /// A write or mapping that runs past the end of the address space (a
