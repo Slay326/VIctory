@@ -113,6 +113,47 @@ fn faults_per_frame() -> u64 {
     *N.get_or_init(|| number("VICTORY_BVH_ARENA_FAULTS", 512))
 }
 
+/// Frames in which the builder was recorded, whether it was in this one,
+/// and dispatches held back while learning ([`learning_skips`]).
+static BUILDER_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BUILDER_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LEARN_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a builder dispatch of program `name` is held back because the
+/// arena is still learning the builder's memory: in its first
+/// `VICTORY_BVH_ARENA_LEARN` (3) frames, the stages that loop on zeros
+/// (`VICTORY_BVH_ARENA_LEARN_SKIP`, default 5552dac6, 3b90165a, ffd93c8a,
+/// f28a33a8: in flight at every device removal on PC 2) do not run; the
+/// stages before them do, and the pages they reach become arena pages.
+/// Their first runs read zeros from placeholders that only the GPU uses
+/// (130,000 missed pages; runs 145223-150019: 4.9 s or a hang at 7-8 s).
+pub(crate) fn learning_skips(name: &str) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !enabled() {
+        return false;
+    }
+    BUILDER_SEEN.store(true, Relaxed);
+    static LEARN: OnceLock<u64> = OnceLock::new();
+    static SKIP: OnceLock<Vec<String>> = OnceLock::new();
+    let learn = *LEARN.get_or_init(|| number("VICTORY_BVH_ARENA_LEARN", 3));
+    if BUILDER_FRAMES.load(Relaxed) >= learn {
+        return false;
+    }
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_BVH_ARENA_LEARN_SKIP")
+            .unwrap_or_else(|_| "5552dac6,3b90165a,ffd93c8a,f28a33a8".into())
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let held = skip.iter().any(|h| name.contains(h.as_str()));
+    if held {
+        LEARN_SKIPPED.fetch_add(1, Relaxed);
+    }
+    held
+}
+
 /// Bytes of committed title memory given from a builder root argument's
 /// address on (1 MiB).
 const AROUND_WINDOW: u64 = 1 << 20;
@@ -1048,6 +1089,16 @@ pub(crate) fn fetch(pages: &[u64]) -> Vec<(u64, Vec<u8>)> {
 pub(crate) fn log_frame() {
     if !enabled() {
         return;
+    }
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        if BUILDER_SEEN.swap(false, Relaxed) {
+            let frames = BUILDER_FRAMES.fetch_add(1, Relaxed) + 1;
+            let skipped = LEARN_SKIPPED.swap(0, Relaxed);
+            if skipped > 0 {
+                tracing::info!(target: "victory_gpu::arena", frames, skipped, "BVH arena learning: builder stages that loop on zeros held back this frame");
+            }
+        }
     }
     let mut guard = arena();
     let Some(a) = guard.as_mut() else { return };

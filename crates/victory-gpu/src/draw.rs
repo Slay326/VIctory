@@ -1155,6 +1155,12 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        // `VICTORY_BVH_ARENA`: while the arena learns the builder's memory,
+        // its stages that loop on zeros wait (`crate::arena::learning_skips`).
+        if crate::pipeline::is_builder(self.pipeline as This) && crate::arena::learning_skips(&p.name) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
