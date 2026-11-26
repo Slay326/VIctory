@@ -940,7 +940,7 @@ pub(crate) mod tests {
         assert!(found.contains(&0xd_7227_a400), "{found:x?}");
         assert!(found.contains(&(0x0d72_27a4u64 << 8)), "{found:x?}");
         assert!(!found.iter().any(|&a| a == 5768 << 8 || a < 1 << 32), "small values are no addresses: {found:x?}");
-        assert!(constant_addresses(&[1, 0x300, 7]).is_empty());
+        assert!(constant_addresses(&[1, 0x300, 0x400]).is_empty());
     }
 
     #[test]
