@@ -1154,6 +1154,9 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// With `VICTORY_BVH_GT`: what the list's bitmap marked, asked once the
+    /// list has run, before anything goes back (`crate::bvh_gt`).
+    gt: Vec<Box<dyn Fn() -> crate::bvh_gt::Marks + Send>>,
 }
 
 impl Host {
@@ -1482,6 +1485,14 @@ impl Host {
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        // With `VICTORY_BVH_GT`: G of the pages the named program's lists
+        // wrote, before anything goes back.
+        let gt_target = crate::bvh_gt::target();
+        let mut gt = gt_target.and_then(|hash| {
+            let lists: Vec<&HostList> = runs.iter().copied().filter(|l| l.uses_pipeline(hash)).collect();
+            let marks = lists.iter().flat_map(|l| l.deferred().gt.iter().map(|f| f()).collect::<Vec<_>>()).collect();
+            crate::bvh_gt::Gt::take(*submitted, lists.len(), marks)
+        });
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
         // title's own data (runs c1, c4), and so does what every program
@@ -1497,6 +1508,10 @@ impl Host {
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
+        if let (Some(gt), Some(hash)) = (&mut gt, gt_target) {
+            let list_missed = runs.iter().zip(&missed).any(|(l, &m)| m && l.uses_pipeline(hash));
+            gt.decided(list_missed, withholding);
+        }
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
@@ -1562,6 +1577,9 @@ impl Host {
                 work();
             }
         }
+        if let Some(gt) = &mut gt {
+            gt.read_title(0);
+        }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -1569,6 +1587,10 @@ impl Host {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
+        }
+        if let Some(gt) = &mut gt {
+            gt.read_title(1);
+            gt.log();
         }
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
@@ -2270,6 +2292,22 @@ impl HostList {
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
         self.deferred().missed.push(Box::new(check));
+    }
+
+    /// With `VICTORY_BVH_GT`: `marks` reads what the list's bitmap marked
+    /// once the list has run, before the copy-backs clear it.
+    pub(crate) fn defer_gt(&self, marks: impl Fn() -> crate::bvh_gt::Marks + Send + 'static) {
+        self.deferred().gt.push(Box::new(marks));
+    }
+
+    /// Whether the list bound a pipeline whose name holds `part` (a shader
+    /// hash).
+    pub(crate) fn uses_pipeline(&self, part: &str) -> bool {
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|name| name.contains(part))
     }
 
     /// Runs `work` once the list has run (each submission), before its

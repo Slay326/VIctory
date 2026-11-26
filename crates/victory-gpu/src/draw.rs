@@ -1143,6 +1143,11 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        // `VICTORY_BVH_UAV_BARRIER`: the builder's stages each see the
+        // writes of every dispatch before them in the list.
+        if crate::bvh_gt::uav_barrier() && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::list::global_uav_barrier(list);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]

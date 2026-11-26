@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod bindless;
+#[cfg(windows)]
+mod bvh_gt;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
