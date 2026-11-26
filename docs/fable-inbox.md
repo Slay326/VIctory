@@ -122,3 +122,21 @@ Status: offen. Blockiert: nichts (Tests ändern keinen Produktivcode). Bitte nur
    Test (b) schreibt für diesen Weg deshalb eine andere Seite. **unverified, for Fable:** für Stufe 3 relevant?
 5. Gerüste (d) für Z2: Erwartungen stehen in den Doc-Kommentaren; bitte bei der Umsetzung anpassen.
 
+
+---
+
+## F3 (Review, vor jedem Merge nach play): rt/play bereit zum Review
+
+`rt/play` (Fork, 2e852e6) = `play` 37dd138 + die RT-Commits von `test/bvh31-blimit` (636c4ad..ed47e60 ohne
+c8bd823) + zwei Basis-Commits, die der volle Builder braucht: #2118-Port (1be6814, Builder-Erkennung) und #2703
+(d807613, Root-Konstante Dword 4). NICHT in play mergen, bevor Fable die Speicher-Sync-Teile geprüft hat:
+- `memory.rs`: Arena-Seiten in play's direkt geschriebener Seitentabelle (`write_table(.., extra, out)`, Owner
+  u32/NO_OWNER), `has_missed` mit Arena und `VICTORY_BVH_MISS_UNMAPPED`, Builder-Writes in großen Titelpuffern
+  bleiben in den Kopien (`RETAKE_LATE`), gepoolte Bitmaps im GT-Leser.
+- `arena.rs` (Write-Watch mit Reset, `REFRESH_UNWATCHED`/`REFRESH_READS`), `shadow.rs`, `host.rs`, `queue.rs`.
+Tests: victory-gpu 292 ok / 1 rot (bekannt: view_addresses_cover_tables_made_afresh), victory-shader 323 ok
+[M]; arena:: 8/8, bvh_gt:: 3/3. SOURCE_HASH ad24c477ccf615f1.
+Erste Läufe PC 2 (180 s, play-Schalter + Arena/RETAKE_LATE/EVICT, BVH an) [M]: 690 / 820 ms pro Frame
+(rt/play, zwei Läufe) gegen 887 ms auf test/bvh31-blimit (480 s, s46-reads); kein Device-Removed.
+Variante `test/rtplay-2098` (+ upstream #2098, 97abc79): ein Lauf 908 ms, Leser-Werte in der Streuung;
+Einzelheiten im JOURNAL unter "senior 48". **unverified, for Fable**: Streuung bei 26 Frames je Lauf groß.
