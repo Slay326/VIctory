@@ -204,6 +204,10 @@ pub(crate) struct Directory {
     pages: BTreeMap<u64, Slot>,
     most: u32,
     regions: BTreeSet<usize>,
+    /// Slots of pages taken back ([`Directory::remove`]), given again first,
+    /// and the slots ever given.
+    free: Vec<Slot>,
+    top: u32,
 }
 
 impl Directory {
@@ -212,7 +216,16 @@ impl Directory {
             pages: BTreeMap::new(),
             most,
             regions: BTreeSet::new(),
+            free: Vec::new(),
+            top: 0,
         }
+    }
+
+    /// Takes page `page`'s slot back (to be given again); its slot.
+    pub(crate) fn remove(&mut self, page: u64) -> Option<Slot> {
+        let slot = self.pages.remove(&page)?;
+        self.free.push(slot);
+        Some(slot)
     }
 
     pub(crate) fn get(&self, page: u64) -> Option<Slot> {
@@ -226,7 +239,7 @@ impl Directory {
 
     /// The slot the next new page gets.
     pub(crate) fn next(&self) -> Slot {
-        Slot(self.len())
+        self.free.last().copied().unwrap_or(Slot(self.top))
     }
 
     /// Chunks the slots given fill.
@@ -246,7 +259,13 @@ impl Directory {
         if self.len() >= self.most {
             return Err(Refused::Budget);
         }
-        let slot = self.next();
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.top += 1;
+                Slot(self.top - 1)
+            }
+        };
         self.pages.insert(page, slot);
         Ok((slot, true))
     }
@@ -276,6 +295,8 @@ struct Stats {
     filled: u64,
     zero: u64,
     refused: u64,
+    /// Slots taken back for pages missed in many frames.
+    evicted: u64,
     nothing: u64,
     regions: u64,
     writes: u64,
@@ -333,6 +354,10 @@ struct Arena {
     faults: u64,
     /// Arena pages shaders wrote ([`note_shader_pages`]).
     shader_pages: HashSet<u64>,
+    /// Pages given as zeros (reserved memory), and where the search for a
+    /// slot to take back goes on ([`victim`]).
+    zero_pages: HashSet<u64>,
+    evict_cursor: u64,
     /// Missed pages without a slot: in how many frames, and the last one
     /// ([`want_pages`]; old entries pruned in [`log_frame`]).
     misses: std::collections::HashMap<u64, (u32, u64)>,
@@ -376,6 +401,8 @@ fn new_arena() -> Arena {
         capped: false,
         faults: 0,
         shader_pages: HashSet::new(),
+        zero_pages: HashSet::new(),
+        evict_cursor: 0,
         misses: std::collections::HashMap::new(),
         builder_now: false,
         scans: 0,
@@ -854,11 +881,21 @@ pub(crate) fn provide() {
     // from zeros land in reservations too, and must not take the budget
     // before the pools' pages do.
     let (mut committed, mut reserved, mut looked) = (Vec::new(), Vec::new(), 0);
+    let mut evict_for: Vec<(u64, Memory)> = Vec::new();
     for page in wanted {
         if a.dir.get(page).is_some() || a.nothing.contains(&page) {
             continue;
         }
         if a.stopped.is_some() {
+            // A page missed again and again takes the slot of one no shader
+            // wrote ([`evict_for_persistent`]).
+            if evict_on()
+                && a.misses.get(&page).is_some_and(|e| e.0 >= persist_frames())
+                && let m @ Memory::Committed(..) = memory_at(page * PAGE)
+            {
+                evict_for.push((page, m));
+                continue;
+            }
             a.stats.refused += 1;
             continue;
         }
@@ -932,6 +969,7 @@ pub(crate) fn provide() {
                     a.stats.filled += 1;
                 } else {
                     a.stats.zero += 1;
+                    a.zero_pages.insert(page);
                 }
             }
             Err(Refused::Budget) => {
@@ -946,6 +984,7 @@ pub(crate) fn provide() {
             }
         }
     }
+    evict_for_persistent(a, evict_for, &mut fills);
     // Pages that took title memory go up: write tracking is reset first, so
     // a write while they are read goes up at the next refresh.
     let pieces: Vec<(Slot, u64, u64)> = fills
@@ -978,6 +1017,84 @@ pub(crate) fn provide() {
         let started = std::time::Instant::now();
         refresh(a);
         a.stats.refresh_us += started.elapsed().as_micros() as u64;
+    }
+}
+
+/// Whether a full arena gives pages missed in many frames the slots of pages
+/// no shader wrote (`VICTORY_BVH_ARENA_EVICT=1`, off by default, local
+/// test): the budget filled with pages of addresses computed from zeros in
+/// the loading screens, and the builder's inputs missed for the rest of the
+/// run (runs 165348-174702: 3-15 pages a builder submission, the same ones
+/// frame after frame, "refused 148-12,636" a frame, only 12-20 % of the
+/// bottom levels the readers met valid).
+fn evict_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_ARENA_EVICT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Frames a page must be missed in to take another's slot
+/// (`VICTORY_BVH_ARENA_PERSIST`, 4).
+fn persist_frames() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_ARENA_PERSIST", 4).max(1) as u32)
+}
+
+/// The most slots taken back per submission (`VICTORY_BVH_ARENA_EVICT_STEP`,
+/// 512).
+fn evict_step() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_ARENA_EVICT_STEP", 512) as usize)
+}
+
+/// A page to take the slot of: no shader wrote it (its bytes are title
+/// memory's, or zeros), not missed itself; zero pages (reserved memory,
+/// addresses computed from zeros) first, then the others in address order
+/// from where the last search ended.
+fn victim(a: &mut Arena) -> Option<u64> {
+    let free = |a: &Arena, p: u64| !a.shader_pages.contains(&p) && a.dir.get(p).is_some();
+    if let Some(&p) = a.zero_pages.iter().find(|&&p| free(a, p)) {
+        a.zero_pages.remove(&p);
+        return Some(p);
+    }
+    let from = a.evict_cursor;
+    let found = a
+        .dir
+        .pages
+        .range(from..)
+        .chain(a.dir.pages.range(..from))
+        .map(|(&p, _)| p)
+        .find(|&p| !a.shader_pages.contains(&p) && !a.misses.get(&p).is_some_and(|e| e.0 >= persist_frames()));
+    if let Some(p) = found {
+        a.evict_cursor = p + 1;
+    }
+    found
+}
+
+/// Gives the pages in `wanted` (missed in [`persist_frames`] frames,
+/// committed title memory) the slots of victims ([`victim`]), at most
+/// [`evict_step`]; their fills join `fills`.
+fn evict_for_persistent(a: &mut Arena, wanted: Vec<(u64, Memory)>, fills: &mut Vec<(Slot, u64)>) {
+    for (k, (page, memory)) in wanted.into_iter().enumerate() {
+        if k >= evict_step() {
+            a.stats.refused += 1;
+            continue;
+        }
+        let Some(old) = victim(a) else {
+            a.stats.refused += 1;
+            break;
+        };
+        a.dir.remove(old);
+        a.watched.remove(&old);
+        let Ok((slot, _)) = a.dir.add(page) else { continue };
+        a.generation += 1;
+        a.stats.evicted += 1;
+        if let Memory::Committed(base, watched) = memory {
+            if watched {
+                a.watched.insert(page, base);
+            }
+            fills.push((slot, page * PAGE));
+            a.stats.filled += 1;
+        }
     }
 }
 
@@ -1215,7 +1332,7 @@ pub(crate) fn log_frame() {
     tracing::info!(
         target: "victory_gpu::arena",
         "BVH arena this frame: input buffers scanned {} MB -> {} structure pages; prepared before the builder ran {} pages; builder root addresses {}, \
-         builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
+         builder memory given up front {} runs; no room for a chunk: {}; pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, slots taken back for pages missed in many frames {}, \
          no memory there {}, host memory {}, below 256 MiB {}, missed in too few frames {} (tracked {}), \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms), not sent (page written by shaders) {}; \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
@@ -1232,6 +1349,7 @@ pub(crate) fn log_frame() {
         s.fill_us as f64 / 1e3,
         s.refused,
         a.stopped.as_deref().map(|w| format!(" (stopped: {w})")).unwrap_or_default(),
+        s.evicted,
         s.nothing,
         s.host,
         s.low,
@@ -1306,6 +1424,19 @@ pub(crate) mod tests {
         assert!(found.contains(&(0x0d72_27a4u64 << 8)), "{found:x?}");
         assert!(!found.iter().any(|&a| a == 5768 << 8 || a < 1 << 32), "small values are no addresses: {found:x?}");
         assert!(constant_addresses(&[1, 0x300, 0x400]).is_empty());
+    }
+
+    #[test]
+    fn a_slot_taken_back_is_given_again_and_the_budget_holds() {
+        let mut d = Directory::new(2);
+        d.add(1).unwrap();
+        d.add(2).unwrap();
+        assert_eq!(d.remove(1), Some(Slot(0)));
+        assert_eq!(d.get(1), None);
+        assert_eq!(d.next(), Slot(0));
+        assert_eq!(d.add(3), Ok((Slot(0), true)), "the freed slot");
+        assert_eq!(d.add(4), Err(Refused::Budget));
+        assert_eq!(d.remove(9), None);
     }
 
     #[test]
