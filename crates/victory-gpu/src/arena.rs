@@ -19,6 +19,9 @@
 //!   ([`provide`], at most `VICTORY_BVH_ARENA_STEP` (4096) new pages a
 //!   submission); a 256 MiB region with no block first gets a block, so that
 //!   the next marks there name pages;
+//! * a missed page is asked for only once missed in two frames, and never
+//!   in region 0 ([`MissFilter`]): addresses the builder computes from
+//!   zeros come and go, its pools are reached every frame;
 //! * a new page takes title memory's bytes where memory is committed, else
 //!   it stays zero; free memory gets no page (an address computed from
 //!   zeros);
@@ -111,6 +114,77 @@ fn reserved_on() -> bool {
 fn faults_per_frame() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| number("VICTORY_BVH_ARENA_FAULTS", 512))
+}
+
+/// What becomes of a missed page before it may take a slot ([`MissFilter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Below the lowest address taken: computed from zeros (region 0).
+    Low,
+    /// Not missed in enough frames yet: waits.
+    Wait,
+    /// Missed in enough frames: asked for.
+    Take,
+}
+
+/// Missed pages take arena pages only once missed in `need` different
+/// frames within `window` frames, and never below `low` (bytes). The
+/// builder's stages reading zeros compute addresses from them: on PC 2 they
+/// asked for 130,000-142,000 pages a submission (run 150500, budget 32,768),
+/// region 0 among them; pages the builder really uses are reached again
+/// every frame. `VICTORY_BVH_ARENA_MISS_FRAMES` (2; 1: every miss is
+/// taken), `VICTORY_BVH_ARENA_MISS_WINDOW` (8 frames),
+/// `VICTORY_BVH_ARENA_LOW_MB` (256: region 0).
+struct MissFilter {
+    need: u32,
+    window: u64,
+    low: u64,
+    /// Page -> (last frame it was missed in, frames it was missed in).
+    seen: std::collections::HashMap<u64, (u64, u32)>,
+}
+
+impl MissFilter {
+    fn from_env() -> MissFilter {
+        MissFilter::new(
+            number("VICTORY_BVH_ARENA_MISS_FRAMES", 2).clamp(1, 1 << 16) as u32,
+            number("VICTORY_BVH_ARENA_MISS_WINDOW", 8).max(1),
+            number("VICTORY_BVH_ARENA_LOW_MB", 256) << 20,
+        )
+    }
+
+    fn new(need: u32, window: u64, low: u64) -> MissFilter {
+        MissFilter { need, window, low, seen: std::collections::HashMap::new() }
+    }
+
+    /// Page `page` was missed in frame `frame`.
+    fn admit(&mut self, page: u64, frame: u64) -> Verdict {
+        if page.saturating_mul(PAGE) < self.low {
+            return Verdict::Low;
+        }
+        if self.need <= 1 {
+            return Verdict::Take;
+        }
+        let e = self.seen.entry(page).or_insert((frame, 0));
+        if e.1 == 0 || e.0 != frame {
+            e.0 = frame;
+            e.1 = e.1.saturating_add(1);
+        }
+        if e.1 >= self.need { Verdict::Take } else { Verdict::Wait }
+    }
+
+    /// Forgets pages not missed in the last `window` frames: how many of
+    /// them were missed in one frame only.
+    fn prune(&mut self, frame: u64) -> u64 {
+        let (window, mut once) = (self.window, 0);
+        self.seen.retain(|_, &mut (last, frames)| {
+            let keep = last + window >= frame;
+            if !keep && frames == 1 {
+                once += 1;
+            }
+            keep
+        });
+        once
+    }
 }
 
 /// Frames in which the builder was recorded, whether it was in this one,
@@ -298,6 +372,13 @@ struct Stats {
     /// found in them (pages).
     scanned: u64,
     found: u64,
+    /// Missed pages the filter held ([`MissFilter`]): below its lowest
+    /// address, missed for the first time (waiting), missed again (taken),
+    /// and forgotten after one frame's miss.
+    miss_low: u64,
+    miss_wait: u64,
+    miss_again: u64,
+    miss_once: u64,
 }
 
 struct Arena {
@@ -341,6 +422,9 @@ struct Arena {
     /// input lists, scanned for structure addresses before it runs.
     inputs: BTreeSet<(u64, u64)>,
     stage: Option<(ID3D12Resource, usize)>,
+    /// Which misses take pages, and the frame it last forgot pages in.
+    filter: MissFilter,
+    pruned: u64,
     stats: Stats,
 }
 
@@ -377,6 +461,8 @@ fn new_arena() -> Arena {
         scanned_at: BTreeMap::new(),
         inputs: BTreeSet::new(),
         stage: None,
+        filter: MissFilter::from_env(),
+        pruned: 0,
         stats: Stats::default(),
     }
 }
@@ -738,7 +824,17 @@ pub(crate) fn provide() {
     if reserve_on() && !a.reserved {
         reserve(host, a);
     }
+    let frame = crate::frame::current();
+    if frame != a.pruned {
+        a.pruned = frame;
+        a.stats.miss_once += a.filter.prune(frame);
+    }
     for l1 in std::mem::take(&mut a.wanted_regions) {
+        // Region 0 (addresses from zeros) gets no block below the filter's
+        // lowest address.
+        if ((l1 as u64 + 1) << 28) <= a.filter.low {
+            continue;
+        }
         if !a.dir.has_region(l1) && region_has_memory(l1) && a.dir.add_region(l1) {
             a.stats.regions += 1;
             a.generation += 1;
@@ -817,6 +913,18 @@ pub(crate) fn provide() {
     for page in wanted {
         if a.dir.get(page).is_some() || a.nothing.contains(&page) {
             continue;
+        }
+        match a.filter.admit(page, frame) {
+            Verdict::Low => {
+                a.stats.miss_low += 1;
+                continue;
+            }
+            Verdict::Wait => {
+                a.stats.miss_wait += 1;
+                continue;
+            }
+            Verdict::Take if a.filter.need > 1 => a.stats.miss_again += 1,
+            Verdict::Take => {}
         }
         if a.stopped.is_some() {
             a.stats.refused += 1;
@@ -1162,8 +1270,27 @@ pub(crate) fn log_frame() {
     let s = std::mem::take(&mut a.stats);
     a.faults = 0;
     let no_room = a.no_room.take();
-    if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs + s.scanned == 0 {
+    if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs + s.scanned + s.miss_low + s.miss_wait + s.miss_once == 0 {
         return;
+    }
+    if s.miss_low + s.miss_wait + s.miss_again + s.miss_once > 0 {
+        tracing::info!(
+            target: "victory_gpu::arena",
+            low = s.miss_low,
+            first = s.miss_wait,
+            again = s.miss_again,
+            once = s.miss_once,
+            waiting = a.filter.seen.len(),
+            "BVH arena miss filter this frame (pages taken once missed in {} frames within {}, none below {} MB): {} below, {} missed for the first time (wait), {} missed again (asked), {} forgotten after one frame's miss, {} remembered",
+            a.filter.need,
+            a.filter.window,
+            a.filter.low >> 20,
+            s.miss_low,
+            s.miss_wait,
+            s.miss_again,
+            s.miss_once,
+            a.filter.seen.len(),
+        );
     }
     let (kept_out, kept_out_bytes) = crate::shadow::card_refused();
     tracing::info!(
@@ -1259,6 +1386,31 @@ pub(crate) mod tests {
         assert!(found.contains(&(0x0d72_27a4u64 << 8)), "{found:x?}");
         assert!(!found.iter().any(|&a| a == 5768 << 8 || a < 1 << 32), "small values are no addresses: {found:x?}");
         assert!(constant_addresses(&[1, 0x300, 0x400]).is_empty());
+    }
+
+    /// A missed page takes a slot once missed in two frames, never below
+    /// region 0's end; a page missed once is forgotten after the window;
+    /// with one frame needed every page above the lowest is taken.
+    #[test]
+    fn misses_take_pages_only_when_missed_again_and_above_region_0() {
+        let mut f = MissFilter::new(2, 8, 256 << 20);
+        let (pool, zero) = (0xdd000, 0x10);
+        assert_eq!(f.admit(zero, 1), Verdict::Low, "region 0: computed from zeros");
+        assert_eq!(f.admit(pool, 1), Verdict::Wait);
+        assert_eq!(f.admit(pool, 1), Verdict::Wait, "two submissions of one frame are one frame");
+        assert_eq!(f.admit(pool, 2), Verdict::Take);
+        assert_eq!(f.admit(pool, 3), Verdict::Take, "refused before: still taken");
+        assert_eq!(f.admit(pool + 1, 3), Verdict::Wait);
+        assert_eq!(f.prune(11), 0, "both still within 8 frames of 3");
+        assert_eq!(f.prune(12), 1, "pool + 1 was missed in one frame only");
+        assert!(f.seen.is_empty());
+        assert_eq!(f.admit(pool + 1, 12), Verdict::Wait, "forgotten: waits again");
+        let mut every = MissFilter::new(1, 8, 256 << 20);
+        assert_eq!(every.admit(pool, 1), Verdict::Take);
+        assert_eq!(every.admit(zero, 1), Verdict::Low);
+        assert!(every.seen.is_empty(), "nothing remembered when every miss is taken");
+        let mut none_low = MissFilter::new(1, 8, 0);
+        assert_eq!(none_low.admit(0, 1), Verdict::Take);
     }
 
     #[test]
