@@ -87,6 +87,8 @@ pub(crate) struct Parts<'a> {
     /// The widest host wave ([`super::host_wave_max`]): below 64, console
     /// wave64 programs that need their lane layout run split ([`Split`]).
     pub host_wave_max: u32,
+    /// The group id in x has the host's offset added (`Options`).
+    pub group_x_offset: bool,
 }
 
 enum Stop {
@@ -125,7 +127,7 @@ pub(super) fn synthetic_mark_dxil(view_mark: bool, bytes: u32, in_branch: bool) 
     let p = crate::ir::build(&native.code, false, 1).expect("ir");
     let st = crate::structure::structure(&p).expect("st");
     let (res, io) = (crate::resource::track(&p, &[], HwStage::Cs, Some(&st)).expect("res"), crate::io::raise(&p, &native).expect("io"));
-    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark, host_wave_max: 64 };
+    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark, host_wave_max: 64, group_x_offset: false };
     let bad = HashMap::new();
     let mut l = Lower::new(&parts, &bad);
     l.cur = l.s.entry;
@@ -1788,6 +1790,19 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if self.x.group_x_offset => {
+                let Val::I32(id) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let offset = self.user_at(UserData {
+                    index: super::GROUP_X_OFFSET_INDEX,
+                    slot: 0,
+                    root: RootType::Constants,
+                    dword: super::GROUP_X_OFFSET,
+                });
+                let entry = self.s.entry;
+                return Val::I32(self.s.m.bin(entry, Bin::Add, id, offset));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -11607,6 +11622,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
+            group_x_offset: false,
         })
         .map(|_| ())
     }
@@ -11659,6 +11675,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
+            group_x_offset: false,
         })
     }
 
@@ -11850,6 +11867,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
+            group_x_offset: false,
         })
         .unwrap();
 
@@ -12268,6 +12286,97 @@ mod tests {
         // UAV's.
         assert_eq!(l.heap_handles, 2);
         validate(&l);
+    }
+
+    /// Group id x (s5, after five user-data SGPRs) stored to the raw UAV a
+    /// table at s4 names, lowered with or without the host's group offset.
+    fn group_id_stored(group_x_offset: bool) -> Lowered {
+        let words: [u32; 8] = [
+            0x7E00_0205, // v_mov_b32 v0, s5 (group id x)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            S_ENDPGM,
+        ];
+        let param = |root, user_data, sgprs, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![param(RootType::Constants, 0, 4, 0), param(RootType::Table, 4, 1, 1)],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            // Five user-data SGPRs, then group id x.
+            io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 7, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+            host_wave_max: 64,
+            group_x_offset,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_group_offset_is_a_user_data_dword_only_where_asked_for() {
+        let offset = |l: &Lowered| {
+            l.user_data
+                .iter()
+                .find(|u| u.dword == super::super::GROUP_X_OFFSET)
+                .map(|u| (u.index, u.root))
+        };
+        let split = group_id_stored(true);
+        assert_eq!(
+            offset(&split),
+            Some((super::super::GROUP_X_OFFSET_INDEX, crate::native::RootType::Constants))
+        );
+        let plain = group_id_stored(false);
+        assert_eq!(offset(&plain), None);
+        // Nothing else differs in what the host passes.
+        let others = |l: &Lowered| {
+            let mut u: Vec<_> = l
+                .user_data
+                .iter()
+                .filter(|u| u.dword != super::super::GROUP_X_OFFSET)
+                .map(|u| (u.index, u.dword))
+                .collect();
+            u.sort_unstable();
+            u
+        };
+        assert_eq!(others(&split), others(&plain));
+        assert_ne!(split.dxil, plain.dxil);
     }
 
     #[test]

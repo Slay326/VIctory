@@ -870,3 +870,107 @@ mod tests {
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
 }
+
+/// `VICTORY_DUMP_AFTER=<hash>[,<hash>]` (shader hashes or prefixes): in a
+/// listed frame, the label for dumping what a draw or dispatch of a
+/// pipeline with one of them wrote right after it ran, for its first
+/// `VICTORY_DUMP_AFTER_MAX` (default 4) draws or dispatches in the frame.
+pub(crate) fn dump_after_wanted(pipeline: &str) -> Option<String> {
+    static LIST: std::sync::OnceLock<(Vec<String>, u32)> = std::sync::OnceLock::new();
+    static SEEN: std::sync::Mutex<Vec<(u64, String, u32)>> = std::sync::Mutex::new(Vec::new());
+    let (hashes, max) = LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_DUMP_AFTER").unwrap_or_default();
+        let max = std::env::var("VICTORY_DUMP_AFTER_MAX")
+            .ok()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(4);
+        let hashes = list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
+        (hashes.collect(), max)
+    });
+    if hashes.is_empty() || folder().is_none() {
+        return None;
+    }
+    let hash = hashes.iter().find(|h| pipeline.contains(h.as_str()))?;
+    // Lists are recorded ahead of the frame that submits them.
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        return None;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let k = match seen.iter_mut().find(|s| s.0 == frame && s.1 == *hash) {
+        Some(s) => {
+            s.2 += 1;
+            s.2
+        }
+        None => {
+            seen.push((frame, hash.clone(), 0));
+            0
+        }
+    };
+    (k < *max).then(|| format!("frame-{frame}-after-{hash}-{k}"))
+}
+
+/// Records copies of the 2D colour textures in `written` (each with the
+/// state to return it to) after what the list recorded last; once the list
+/// has run, saves each as `<label>-<i>-<resource>-<w>x<h>-f<format>.png`.
+pub(crate) fn dump_after(
+    list: &crate::host::HostList,
+    label: &str,
+    written: &[(crate::object::This, u32)],
+) {
+    let Some(host) = crate::host::host() else { return };
+    const COPY_SOURCE: u32 = 0x800;
+    for (i, &(resource, back)) in written.iter().enumerate() {
+        let Some(t) = crate::resource::host_resource(resource) else { continue };
+        // SAFETY: a live resource.
+        let d = unsafe { t.GetDesc() };
+        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || d.SampleDesc.Count > 1
+            || matches!(d.Format.0, 19..=22 | 39..=47)
+        {
+            continue;
+        }
+        // Every write of what ran before is done.
+        let all = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[all]) };
+        crate::list::ensure_state(list, resource, COPY_SOURCE);
+        let read = read_back(&host.device, &list.list, &t);
+        crate::list::ensure_state(list, resource, back);
+        let Some((buffer, f)) = read else { continue };
+        list.keep(&buffer);
+        struct Readback(ID3D12Resource);
+        // SAFETY: D3D12 objects are free-threaded.
+        unsafe impl Send for Readback {}
+        // SAFETY: as above.
+        unsafe impl Sync for Readback {}
+        let buffer = Readback(buffer);
+        let name = format!("{label}-{i:02}-{resource:?}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+        list.defer_after(move || {
+            let fp = f.Footprint;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the list has run; the mapping spans the footprint's rows.
+            unsafe {
+                if buffer.0.Map(0, None, Some(&mut data)).is_err() {
+                    return;
+                }
+                let pitch = fp.RowPitch as usize;
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * fp.Height as usize);
+                let (w, h) = (fp.Width as usize, fp.Height as usize);
+                match to_rgba(fp.Format.0 as u32, w, h, pitch, rows) {
+                    Some(rgba) => save_as(&name, fp.Width, fp.Height, w * 4, false, &rgba),
+                    None => tracing::info!(format = fp.Format.0, "{name} not dumped: format"),
+                }
+                buffer.0.Unmap(0, None);
+            }
+        });
+    }
+}

@@ -765,6 +765,12 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        // Set by the split dispatch's signature (`execute_indirect`).
+                        None if u.dword == victory_shader::emit::GROUP_X_OFFSET
+                            && u.root == RootType::Constants =>
+                        {
+                            0
+                        }
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
@@ -1098,6 +1104,8 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
+        #[cfg(feature = "diagnostics")]
+        self.dump_after(list, true);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1414,6 +1422,41 @@ impl State {
         }
     }
 
+    /// With `VICTORY_DUMP_AFTER` naming one of the bound pipeline's shader
+    /// hashes: the textures it renders to or writes through table views,
+    /// as they are right after this draw or dispatch (`crate::capture`).
+    #[cfg(feature = "diagnostics")]
+    fn dump_after(&self, list: &HostList, compute: bool) {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        let Some(label) = crate::capture::dump_after_wanted(&p.name) else {
+            return;
+        };
+        const RENDER_TARGET: u32 = 0x4;
+        const UNORDERED: u32 = 0x8;
+        let mut written: Vec<(This, u32)> = Vec::new();
+        if !compute {
+            written.extend(self.targets.iter().map(|&t| (t as This, RENDER_TARGET)));
+        }
+        for stage in &p.stages {
+            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Uav) {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                if let Some(View::Unordered(r, ..)) =
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                    && !written.iter().any(|w| w.0 == r as This)
+                {
+                    written.push((r as This, UNORDERED));
+                }
+            }
+        }
+        crate::capture::dump_after(list, &label, &written);
+    }
+
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it
     /// writes through a table, read back in the list itself (what the
     /// dispatch left there, before anything later in the frame).
@@ -1564,6 +1607,8 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.dump_after(list, false);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1659,6 +1704,8 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.dump_after(list, false);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1731,10 +1778,21 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        // A program that takes a group offset: its one record is split into
+        // dispatches of at most 65,535 groups in x, each with its offset.
+        let split = (kind == DISPATCH && max == 1 && counter.is_none())
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| group_offset(&p)))
+            .flatten();
+        let signature = match split {
+            Some((param, index)) => {
+                let p = crate::pipeline::host_pipeline(self.pipeline as This);
+                p.and_then(|p| split_signature(&p.root, param, index))
+            }
+            None => matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten(),
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -1772,7 +1830,12 @@ impl State {
                 (out, at)
             }
             None => {
-                let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+                let what = if split.is_some() {
+                    (crate::indirect::SPLIT_DISPATCH, stride, 1)
+                } else {
+                    (kind, stride, max)
+                };
+                let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), what) else {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
@@ -1823,7 +1886,7 @@ impl State {
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                if split.is_some() { crate::indirect::SPLIT_PARTS } else { max },
                 &clamped,
                 at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
@@ -1837,7 +1900,13 @@ impl State {
             let always = !crate::host::traced_shaders().is_empty()
                 && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
             if always || crate::capture::dump_on() {
-                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                // A dispatch has no count: its title record's first word
+                // (the group count in x before the clamp) is shown there.
+                let count = match &counter {
+                    Some((s, at)) => Some((&s.buffer, s.offset(*at))),
+                    None if kind == DISPATCH => Some((&args.buffer, args.offset(arguments))),
+                    None => None,
+                };
                 let name = crate::pipeline::shaders_of(pipeline);
                 crate::capture::read_indirect(list, (&clamped, at), count, (kind, stride, max), name, always);
             }
@@ -1871,6 +1940,71 @@ fn may_store(p: &crate::pipeline::host::HostPipeline) -> bool {
                 || !t.host.root_uavs.is_empty()
                 || t.used.iter().any(|u| u.kind == ResourceType::Uav)
         })
+}
+
+/// For a pipeline whose compute program takes a group offset
+/// (`victory_shader::emit::GROUP_X_OFFSET`): its user-data root parameter
+/// and the dword the offset goes in.
+fn group_offset(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    if !p.compute {
+        return None;
+    }
+    p.stages.iter().find_map(|s| {
+        let (param, _) = s.user_data?;
+        s.translated()
+            .host
+            .user_data
+            .iter()
+            .find(|u| u.dword == victory_shader::emit::GROUP_X_OFFSET && u.root == RootType::Constants)
+            .map(|u| (param, u.index))
+    })
+}
+
+/// The command signature of a split dispatch (`crate::indirect`): per
+/// record the group offset into root constant `index` of parameter `param`
+/// of root signature `root`, then the dispatch; made once per root
+/// signature.
+fn split_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> Option<ID3D12CommandSignature> {
+    static MADE: std::sync::Mutex<Vec<((usize, u32, u32), ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: index,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: crate::indirect::SPLIT_STRIDE,
+        NumArgumentDescs: 2,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of two arguments; the root signature they set
+    // a constant of.
+    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, root, &mut signature) };
+    if let Err(e) = result {
+        once!(error = %e, param, index, "split dispatch signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
+    Some(signature)
 }
 
 /// The host command signature for one argument of `kind` with records

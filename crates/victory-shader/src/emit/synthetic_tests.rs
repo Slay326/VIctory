@@ -138,6 +138,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         mesh_stride: 0,
         view_marks: false,
         host_wave_max: 64,
+        group_x_offset: false,
     })
 }
 

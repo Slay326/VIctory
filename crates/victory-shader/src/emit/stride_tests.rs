@@ -223,6 +223,7 @@ fn build(
         mesh_stride: 0,
         view_marks: false,
         host_wave_max: 64,
+        group_x_offset: false,
     })
     .expect("lower");
     let shader = HostShader {
