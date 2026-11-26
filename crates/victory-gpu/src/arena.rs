@@ -97,12 +97,17 @@ fn step_pages() -> usize {
 }
 
 /// Whether reserved memory with nothing committed gets (zero) pages
-/// (`VICTORY_BVH_ARENA_RESERVED=1`; off: run 20261126-125814 gave 12,019 of
-/// 16,384 pages to such addresses, computed from zeros, before the pools').
+/// (`VICTORY_BVH_ARENA_RESERVED`, on). On PC 2 the builder's pools are such
+/// memory (run 132102: 134,297 missed pages from 0x730000000 on, its root
+/// descriptors there too); committed pages are given first.
 fn reserved_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_BVH_ARENA_RESERVED").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_RESERVED").is_ok_and(|v| v.trim() == "0"))
 }
+
+/// Bytes around a builder address in reserved memory given up front (a
+/// 4 MiB window; the rest as shaders reach it).
+const RESERVED_AROUND: u64 = 4 << 20;
 
 fn refresh_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -479,17 +484,51 @@ fn memory_at(address: u64) -> Memory {
     Memory::Committed(info.AllocationBase as usize, watched)
 }
 
-/// The committed run of title memory around `address`: start and bytes.
+/// The committed run of title memory around `address`: start and bytes; in
+/// reserved memory, the [`RESERVED_AROUND`] window holding it (inside its
+/// allocation).
 fn committed_around(address: u64) -> Option<(u64, u64)> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data, all zeros is valid.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: plain data filled in by the query.
-    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-    if n == 0 || info.State != MEM_COMMIT || !matches!(memory_at(address), Memory::Committed(..)) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |at: u64| -> Option<MEMORY_BASIC_INFORMATION> {
+        // SAFETY: plain data, all zeros is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: plain data filled in by the query.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        (n != 0).then_some(info)
+    };
+    let info = query(address)?;
+    if info.State == MEM_FREE {
         return None;
     }
-    Some((info.BaseAddress as u64, info.RegionSize as u64))
+    let alloc = info.AllocationBase as u64;
+    let region_end = info.BaseAddress as u64 + info.RegionSize as u64;
+    if info.State != MEM_COMMIT {
+        if !reserved_on() {
+            return None;
+        }
+        let window = address & !(RESERVED_AROUND - 1);
+        let (from, to) = (window.max(alloc), (window + RESERVED_AROUND).min(region_end));
+        return Some((from, to - from));
+    }
+    if !matches!(memory_at(address), Memory::Committed(..)) {
+        return None;
+    }
+    // The committed regions of its allocation that touch it: from the
+    // allocation's start, the run holding `address`, then on while committed.
+    let (mut at, mut start) = (alloc, alloc);
+    while at <= address {
+        let r = query(at)?;
+        let end = r.BaseAddress as u64 + r.RegionSize as u64;
+        if r.State != MEM_COMMIT {
+            start = end;
+        }
+        at = end.max(at + 4096);
+    }
+    let mut end = at;
+    while let Some(r) = query(end).filter(|r| r.AllocationBase as u64 == alloc && r.State == MEM_COMMIT) {
+        end = r.BaseAddress as u64 + r.RegionSize as u64;
+    }
+    Some((start, end - start))
 }
 
 /// Whether any memory (reserved or committed) lies in 256 MiB region `l1`.
@@ -982,7 +1021,8 @@ pub(crate) mod tests {
         assert_eq!(committed_around(heap.as_ptr() as u64), None);
         // A pool: its committed run.
         assert_eq!(committed_around(committed + 16), Some((committed, PAGE)));
-        assert_eq!(committed_around(reserved), None);
+        // Reserved memory: a window around the address, inside its allocation.
+        assert_eq!(committed_around(reserved + PAGE + 8), Some((reserved, 2 * PAGE)));
         // SAFETY: ours.
         unsafe {
             VirtualFree(reserved as *mut _, 0, MEM_RELEASE);

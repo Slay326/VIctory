@@ -245,6 +245,42 @@ pub(crate) fn drop_withheld(address: usize, len: usize) {
     }
 }
 
+/// Values a held queue waits for that lie in `[from, from + len)` of `copy`,
+/// whose writes are held back from title memory: the copy's value goes into
+/// title memory, so that the queue runs (a fence value written by a shader
+/// of a list that missed memory otherwise holds it until the 10 s safety
+/// valve, twice in a row, and the title's 30 s watchdog ends the run:
+/// runs 100335, 112712, 125814, 132102). Only those 4 or 8 bytes.
+pub(crate) fn release_waited(copy: &Shadow, from: u64, len: u64) {
+    let waited = crate::queue::waited();
+    if waited.is_empty() {
+        return;
+    }
+    let (start, size) = copy.range();
+    for (at, bytes) in waited {
+        let (word, n) = (at & !3, if bytes > 4 { 2 } else { 1 });
+        if at < from || at >= from + len || word < start || word + 4 * n as u64 > start + size {
+            continue;
+        }
+        let v = copy.read_host(word, n);
+        let value = u64::from(v[0]) | v.get(1).map_or(0, |&h| u64::from(h) << 32);
+        let mut title = [0u8; 8];
+        let readable = crate::host::read_into(at as *const u8, &mut title[..usize::from(bytes.min(8))]);
+        if readable && u64::from_le_bytes(title) != value {
+            crate::queue::Written::Value(value).write(at as *mut u8, usize::from(bytes));
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                tracing::info!(
+                    address = format_args!("{at:#x}"),
+                    title = format_args!("{:#x}", u64::from_le_bytes(title)),
+                    copy = format_args!("{value:#x}"),
+                    "a value a queue waits for went to title memory from a copy whose writes are held back"
+                );
+            }
+        }
+    }
+}
+
 /// At a frame's end: what the frame withheld leaves the host copies, so
 /// that results computed from memory with no copy (garbage record arrays
 /// and node pointers of the BVH builder) do not feed later frames whose
@@ -693,7 +729,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // nor while any list using title memory misses ([`withholding`]).
         let mut withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
-            for (_, at) in writes.drain(..) {
+            for (k, at) in writes.drain(..) {
+                release_waited(&copies[k], at, 1 << 16);
                 drop_withheld(at as usize, 1 << 16);
             }
         } else if arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) {
@@ -704,6 +741,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let small = copies[k].range().1 <= crate::arena::BACK;
                 if !small {
                     withheld += 1;
+                    release_waited(&copies[k], at, 1 << 16);
                     drop_withheld(at as usize, 1 << 16);
                 }
                 small

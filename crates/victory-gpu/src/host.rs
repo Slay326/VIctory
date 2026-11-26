@@ -1479,6 +1479,7 @@ impl Host {
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
+                crate::memory::release_waited(shadow, address as u64, len as u64);
                 crate::memory::drop_withheld(address, len);
             }
         }
