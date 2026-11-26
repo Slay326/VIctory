@@ -298,6 +298,34 @@ fn a_gpu_write_is_in_title_memory_at_the_sync_point() {
     }
 }
 
+/// H-02 (night 2): a page written at computed addresses
+/// ([`Shadow::copy_back_page`]) where, in the same submission, the title
+/// wrote OTHER bytes of the same 64 KiB page (false sharing, no race on a
+/// byte): both writers' bytes belong in title memory at the sync point.
+///
+/// Expected red today: `copy_back_page` sees the title's write
+/// (`changed`, nothing saved) and keeps the whole page as the title has it,
+/// dropping the shaders' bytes (the documented shortcut in (b), logged once
+/// as "both wrote a page of title memory in one submission"). Ignored until
+/// the production fix (byte- or 4-KiB-exact copy-back of such a page,
+/// Fable's to write) makes it green; then drop the `#[ignore]`.
+#[test]
+#[ignore = "H-02: red today, copy_back_page drops the GPU's bytes of a page the title wrote elsewhere; fix is production copy-back (Fable)"]
+fn a_gpu_write_at_a_computed_address_survives_a_title_write_elsewhere_in_its_page() {
+    let Some(f) = Fixture::new(2, pattern) else {
+        return; // no host GPU here
+    };
+    // GPU writes offset A, the title offset B of the same page, B != A.
+    let (a, b) = (PAGE + 0x88, PAGE + 0x4000);
+    submission(&f, Back::Computed, 0, f.len, &[(a, 0x8e)], &[(b, 0xb1)]);
+    assert_eq!(f.title(b), 0xb1, "the title's byte at {b:#x} stays");
+    assert_eq!(
+        f.title(a),
+        0x8e,
+        "the GPU's byte at {a:#x} is in title memory (title wrote only {b:#x} of the page)"
+    );
+}
+
 // ---------------------------------------------------------------- (c) ---
 
 /// A step of a simulated schedule.
