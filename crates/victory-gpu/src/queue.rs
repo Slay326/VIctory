@@ -197,8 +197,17 @@ pub(crate) fn waited() -> Vec<(u64, u8)> {
 // shortcut: a safety valve against a wait nothing satisfies (a write we do
 // not make), which would hold the title's fences until its 30 s watchdog
 // ends the run; counted and logged, remove once runs show it never fires.
+// `VICTORY_HOLD_VALVE_MS` sets it (BVH builder runs: a compute queue waits
+// for a value the title never writes while the builder's results stay out
+// of title memory; two 10 s valves in a row reach the watchdog).
 #[cfg(windows)]
-const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
+fn valve() -> std::time::Duration {
+    static VALVE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *VALVE.get_or_init(|| {
+        let ms = std::env::var("VICTORY_HOLD_VALVE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms >= 100);
+        std::time::Duration::from_millis(ms.unwrap_or(10_000))
+    })
+}
 
 #[cfg(windows)]
 fn pump(held: &mut Holding, why: Why) {
@@ -211,7 +220,7 @@ fn pump(held: &mut Holding, why: Why) {
     // (`crate::memory::release_waited`).
     *WAITED.lock().unwrap_or_else(|e| e.into_inner()) =
         held.blocked(&read).into_iter().flat_map(|(_, _, _, waits)| waits).map(|w| (w.address, w.bytes)).collect();
-    for (queue, waits) in held.force_older_than(VALVE) {
+    for (queue, waits) in held.force_older_than(valve()) {
         account().forced += 1;
         // Whether a host copy holds what the title waits for (a write of
         // shaders held back from title memory).
@@ -226,7 +235,7 @@ fn pump(held: &mut Holding, why: Why) {
                 format!("{:#x}: title {:?}, {}", w.address, read(w.address, w.bytes), copy.unwrap_or_else(|| "no copy".into()))
             })
             .collect();
-        tracing::warn!(queue = kind(queue), ?waits, ?copies, "held work runs without its waits after {VALVE:?} (safety valve)");
+        tracing::warn!(queue = kind(queue), ?waits, ?copies, "held work runs without its waits after {:?} (safety valve)", valve());
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
