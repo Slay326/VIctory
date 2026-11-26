@@ -294,6 +294,13 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// For each of `pages` (page numbers): whether it shows memory another
+/// page shows too ([`title_memory_aliased`]).
+pub(crate) fn aliased(pages: &[usize]) -> Vec<bool> {
+    let g = guards();
+    pages.iter().map(|page| g.alias_of.contains_key(page)).collect()
+}
+
 /// Guards the other mappings of taken pages, returning those that still
 /// have an unguarded mapping (cannot be taken yet).
 fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
