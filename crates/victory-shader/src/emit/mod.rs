@@ -414,6 +414,12 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// The iterations after which this program's loops are left, instead of
+    /// [`loop_limit`] (the host sets it for programs that loop on data they
+    /// do not have yet: a BVH builder's stages, whose first run reads zeros
+    /// and loops to the limit for seconds). `None`: [`loop_limit`]; the
+    /// translation is then the same as before the option existed.
+    pub loop_limit: Option<u32>,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -539,6 +545,7 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
         host_wave_max: host_wave_max(),
+        loop_limit: options.loop_limit.map_or_else(loop_limit, |l| l.max(1)),
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

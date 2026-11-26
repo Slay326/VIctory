@@ -61,8 +61,29 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its code lies in the BVH builder's image: translated with the
+    /// builder's loop limit ([`builder_loop_limit`]), set before the first
+    /// translation.
+    builder: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// The loop limit of the BVH builder's stages (`VICTORY_BVH_LOOP_LIMIT`;
+/// unset: 4096 with `VICTORY_BVH_ARENA=1`, else none). Their first run reads
+/// zeros where earlier stages' writes were lost, and their loops ran to the
+/// default limit (2^20) for seconds: the host device was removed (PC 2, runs
+/// 131349-150500). Every other program keeps the default.
+#[cfg(windows)]
+pub(crate) fn builder_loop_limit() -> Option<u32> {
+    static LIMIT: OnceLock<Option<u32>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        match std::env::var("VICTORY_BVH_LOOP_LIMIT").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => std::env::var("VICTORY_BVH_ARENA").is_ok_and(|v| v.trim() == "1").then_some(4096),
+        }
+    })
 }
 
 impl std::fmt::Debug for Shader {
@@ -91,6 +112,7 @@ impl Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
+            builder: std::sync::atomic::AtomicBool::new(false),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -112,13 +134,15 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let limit = if self.builder.load(std::sync::atomic::Ordering::Relaxed) { builder_loop_limit() } else { None };
+                let (done, cached) = translate(&self.container, limit);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        loop_limit = ?limit,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         cached,
@@ -168,11 +192,11 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
+fn translate(container: &[u8], loop_limit: Option<u32>) -> (Result<Translated, String>, bool) {
     // The device first: it tells the translator (and the shader cache's
     // key) its widest wave.
     crate::host::host();
-    let (host, cached) = crate::shader_cache::host_shader(container);
+    let (host, cached) = crate::shader_cache::host_shader_with(container, loop_limit);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
@@ -375,7 +399,14 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     // SAFETY: the title passes `size` bytes of shader code.
-    code_of(code).map(|bytes| shader(stage, unsafe { &*bytes }))
+    let s = code_of(code).map(|bytes| shader(stage, unsafe { &*bytes }))?;
+    // The builder's stages, known by their code's place in its image (not
+    // by the callers: those would take in programs others create).
+    #[cfg(windows)]
+    if builder::in_image(code.code) {
+        s.builder.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(s)
 }
 
 /// The bytes a stage's bytecode names, if any.

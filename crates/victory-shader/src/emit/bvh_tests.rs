@@ -594,6 +594,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         mesh_stride: 0,
         view_marks: false,
         host_wave_max: 64,
+        loop_limit: super::loop_limit(),
     })
     .expect("lower");
     let shader = HostShader {

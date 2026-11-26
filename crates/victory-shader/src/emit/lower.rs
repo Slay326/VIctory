@@ -87,6 +87,9 @@ pub(crate) struct Parts<'a> {
     /// The widest host wave ([`super::host_wave_max`]): below 64, console
     /// wave64 programs that need their lane layout run split ([`Split`]).
     pub host_wave_max: u32,
+    /// Iterations after which a loop is left ([`LOOP_LIMIT`] unless
+    /// [`super::Options::loop_limit`] says otherwise).
+    pub loop_limit: u32,
 }
 
 enum Stop {
@@ -125,7 +128,7 @@ pub(super) fn synthetic_mark_dxil(view_mark: bool, bytes: u32, in_branch: bool) 
     let p = crate::ir::build(&native.code, false, 1).expect("ir");
     let st = crate::structure::structure(&p).expect("st");
     let (res, io) = (crate::resource::track(&p, &[], HwStage::Cs, Some(&st)).expect("res"), crate::io::raise(&p, &native).expect("io"));
-    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark, host_wave_max: 64 };
+    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark, host_wave_max: 64, loop_limit: super::loop_limit() };
     let bad = HashMap::new();
     let mut l = Lower::new(&parts, &bad);
     l.cur = l.s.entry;
@@ -10914,7 +10917,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(self.x.loop_limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -11607,6 +11610,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
+            loop_limit: super::loop_limit(),
         })
         .map(|_| ())
     }
@@ -11659,6 +11663,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
+            loop_limit: super::loop_limit(),
         })
     }
 
@@ -11850,6 +11855,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
+            loop_limit: super::loop_limit(),
         })
         .unwrap();
 

@@ -94,6 +94,7 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         mesh_stride: 0,
         view_marks: false,
         host_wave_max: 64,
+        loop_limit: super::loop_limit(),
     });
     let result = result?;
     let shader = HostShader {

@@ -65,6 +65,12 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_with(words, super::loop_limit())
+}
+
+/// [`build`] with loops left after `limit` iterations
+/// (`Options::loop_limit`).
+fn build_with(words: &[u32], limit: u32) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -98,7 +104,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let lowered = lowered(&native)?;
+    let lowered = lowered(&native, limit)?;
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -121,7 +127,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+fn lowered(native: &NativeProgram, limit: u32) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -138,7 +144,32 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         mesh_stride: 0,
         view_marks: false,
         host_wave_max: 64,
+        loop_limit: limit,
     })
+}
+
+/// The program of the test below: a uniform loop of two iterations.
+const LOOPING: [u32; 23] = [
+    0xBE84_0300, 0xBE85_0380, 0xF408_0A02, 0xFA00_0040, 0xBF8C_C07F, 0x3420_0082, 0x7D88_0098, 0x8706_7E6A, 0xBE87_0380,
+    0xD501_0004, 0x0019_0280, 0x9006_8406, 0x7E0A_0206, 0x7E0C_0505, 0x8007_8107, 0xBF0A_8207, 0xBF85_FFF8, 0x7E06_0206,
+    0xE070_1000, 0x800A_0310, 0xE070_1080, 0x800A_0410, 0xBF81_0000,
+];
+
+/// A per-program loop limit (`Options::loop_limit`, for the BVH builder's
+/// stages) changes only the program it is given: at the default limit the
+/// translation is byte for byte the one without the option (every other
+/// program's DXIL, and so the host's pipelines made from it, stay as they
+/// are), and a lower limit changes it.
+#[test]
+fn a_loop_limit_of_ones_own_changes_only_that_program() {
+    let default = build(&LOOPING).expect("lower").dxil;
+    let same = build_with(&LOOPING, super::loop_limit()).expect("lower").dxil;
+    let builder = build_with(&LOOPING, 4096).expect("lower").dxil;
+    assert_eq!(default, same, "the default limit is the translation without the option");
+    assert_ne!(default, builder, "the builder's limit is in its program");
+    // Programs without loops do not depend on it at all.
+    let flat = [0xBF81_0000u32];
+    assert_eq!(build(&flat).map(|s| s.dxil).ok(), build_with(&flat, 4096).map(|s| s.dxil).ok());
 }
 
 /// The first texel of a footprint (see `Lower::gather_first`).
@@ -686,14 +717,14 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
         },
         code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let l = lowered(&native(1 << 16)).expect("lower");
+    let l = lowered(&native(1 << 16), super::loop_limit()).expect("lower");
     assert!(l.rovs);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut l.dxil.clone())
             .expect("DXIL validation failed");
     }
     // Without the ordered mode the collision id is no value the host has.
-    let Err(crate::ShaderError::Unsupported { what, .. }) = lowered(&native(0)) else {
+    let Err(crate::ShaderError::Unsupported { what, .. }) = lowered(&native(0), super::loop_limit()) else {
         panic!("translated a collision id outside an ordered section");
     };
     assert_eq!(what, "a hardware SGPR input");

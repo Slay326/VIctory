@@ -130,9 +130,17 @@ fn host_build(build: &[u8; 32], views: u32, title: u32) -> [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    host_shader_with(container, None)
+}
+
+/// [`host_shader`] with loops left after `loop_limit` iterations if set
+/// (`victory_shader::emit::Options::loop_limit`; the BVH builder's stages,
+/// `crate::pipeline`): such entries are keyed apart, every other entry
+/// stays as it is.
+pub fn host_shader_with(container: &[u8], loop_limit: Option<u32>) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = victory_shader::emit::Options { view_marks: true, loop_limit };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     // The host first: making it says what its view heaps are like, which
     // translations depend on. Without a host they are as for most hosts.
@@ -141,10 +149,18 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         victory_shader::emit::heap_views(),
         victory_shader::emit::title_views(),
     );
+    let mut build = host_build(build(), views, title);
+    if let Some(limit) = loop_limit {
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"loop limit of the program's own");
+        h.update(&limit.to_le_bytes());
+        build = *h.finalize().as_bytes();
+    }
     match cache() {
         Some((cache, _)) => cached(
             cache,
-            &host_build(build(), views, title),
+            &build,
             container,
             translate,
         ),
