@@ -28,6 +28,13 @@ synchronously after it.
 bookkeeping (memclass stream records, PageNet, or a new table), and whether
 stage 4 starts with it or with the next block.
 
+**ANSWER (Fable, block 2):** owner: a new table in `victory-gpu`, keyed by
+submission number, fed by the hooks memclass already has. Not the memclass
+stream (diagnostics, may be off) and not PageNet (page state, no notion of
+a submission). Record format: open until stage 3 has run; stage 3 needs
+none (see the lock order answer: its sync point is the `submitted` lock).
+Order: see section 6.
+
 ## 2. Stage 1 findings (classification)
 
 Source: memclass streams of one 8-min run per PC (instrumented, so ms are
@@ -99,6 +106,16 @@ marked copy-back do not; title syscalls reading an armed page fail
 **DECISION (Fable):** arm also after declared/marked copy-back if the two
 target sections show few armed pages in the measure run.
 
+**ANSWER (Fable, block 2):** yes, done: `block1/pagenet` b777960. The run
+showed zero armed pages [M], computed pages never go back in the world.
+All three ways arm now; a marked page written through our own view arms the
+title's view and its aliases. A copy-back with nothing to put back closes
+its page again if it was closed (its own read opens it; without this every
+such copy-back left earlier GPU bytes open to uncounted reads). "Gaps of
+measure" above is outdated in its first clause. Left: reads in the
+microseconds between a copy-back's read and the re-arming are not counted,
+so zero reads means "very likely GPU-only"; the proof stays the net.
+
 ### copy_back_page_forced
 
 The net must not rely on the "written since take" path of copy_back_page.
@@ -112,6 +129,29 @@ a second view (with `VICTORY_BACK_OWN_VIEW=1`); private pools
 the guard lock across `on_fault`, and the submit thread holds `submitted`
 during execute and copy-back; host writes 4 and 5 (section 5) fault under
 `submitted`. Order of guard lock, `submitted` and fence wait to be fixed.
+
+**ANSWER (Fable, block 2):** order `submitted` -> guard -> PageNet, and no
+fence wait of its own in stage 3: no GPU work is in flight outside
+`submitted` today, so "holding `submitted`" is I2.
+1. Fault, under guard + PageNet: GpuOnlyArmed -> Syncing (this thread owns
+   the sync), then both locks are released. The guard is never held while
+   waiting for `submitted` (the submit thread takes the guard inside it).
+2. Other threads faulting on a Syncing page wait for its owner without any
+   lock (I5).
+3. The owner takes `submitted`, brings the page down (card fetch where the
+   copy is in GPU memory) and writes all of it through our own view
+   (`copy_back_page_forced`; the title's view stays closed, I1 makes the
+   whole page correct), then under the guard: Demoted, open, wake.
+4. The thread that holds `submitted` faulting itself (host writes 4/5, raw):
+   recognised by a named holder, as the guard lock's; it syncs without
+   taking the lock. Correct at any point of a submission: before execute
+   nothing is in flight, after it the fence was waited for.
+5. Kernel copies (site 1, reads 2/3/9/11) do not fault: they ask the net
+   first, as `host_touch` does in measure; in net mode that is a demotion
+   with sync, counted as a host access.
+Open, to be checked in code before c4: that no code under `submitted`
+waits for a title thread (then a title thread faulting while holding a
+title lock could deadlock). Assumed not; not verified.
 
 ### H-02 (copy_back_page drops GPU bytes)
 
@@ -133,6 +173,10 @@ write-fault case and before default on.
 
 **DECISION (Fable):** review of the prearm diff; whether it is pulled
 forward (only if the PC 2 intersection run ties H-02 to BVH zeros).
+
+**ANSWER (Fable, block 2):** no diff to review yet. Not pulled forward: the
+PC 1 stream shows no H-02 case with the fixed replayer [M]; it stays tied
+to the result of the PC 2 intersection run.
 
 ## 4. First block: the 744 MB section
 
@@ -167,6 +211,31 @@ stage 3 prediction (gate point 7), not a result.
 over the run on both PCs in measure mode), and the alias handling (arm all
 ~4.8 title addresses of a page together).
 
+**ANSWER (Fable, block 2):** not decided; it needs the measure run of
+b777960 and one more fact (below).
+- Criterion: per page, not per section. The section is the first block if,
+  on both PCs, the pages with a title read or write are a small part of its
+  armed pages and the faults per world frame fall to about zero after the
+  first seconds. "Zero read faults in the whole section" is not required:
+  the net demotes single pages. The threshold is set from the run's table
+  (script), not in advance.
+- Aliases: all title addresses of a page are armed together or the page is
+  not GPU-only (as measure does); one state per physical page; a fault at
+  any address demotes all of them.
+- NEW, a precondition the net does not cover (hypothesis, not verified):
+  the section has no CPU write but 39 MB per frame go up. If that is other
+  host copies of the same pages (the same address, or one of the ~4.8 alias
+  addresses) being refreshed from title memory after our copy-back marked
+  them changed, then title memory is how the GPU's bytes get from one copy
+  to another. Stop the copy-back and those copies go stale with no CPU
+  access involved: no fault, no demotion, wrong image. Rule for stage 3
+  either way: a page is GPU-only only while exactly one copy holds its
+  physical page (no other holder at its address or at an alias); else it
+  stays shared. Data needed first (Opus, script from the stream or a
+  counter): of the section's pages, how many are held by more than one
+  copy, and what share of its "up" bytes follows a copy-back's mark rather
+  than a title write.
+
 ## 5. Host write sites (c5)
 
 Copy steps write title memory today and the copy catches up at the next
@@ -188,6 +257,13 @@ the title not at all (or only at sync, through the second view).
 **DECISION (Fable):** for 1/4/5/10, write the copy directly and skip the
 title, or demote on any host write (simpler, costs speed).
 
+**ANSWER (Fable, block 2):** stage 3: demote on any host write to a
+GPU-only page (sync first, then the write goes as today), counted per site
+in the demotion log. Writing the copy directly comes only for a site the
+log shows in steady traffic. Sites 4/5 fault on the thread holding
+`submitted`, site 1 asks the net before its kernel copy (lock order
+answer, points 4 and 5); site 10 as site 1.
+
 ## 6. Migration stages
 
 - Stage 3, `VICTORY_MEMMODEL=1`, default OFF: stop mirroring and copying
@@ -198,6 +274,12 @@ title, or demote on any host write (simpler, costs speed).
   section (needs the read-fault table and a per-unit split, since 390 MB
   are shared), or per-submission bookkeeping as the first piece of flights.
   **DECISION (Fable):** which first.
+
+  **ANSWER (Fable, block 2):** provisional: the next block first (same
+  machinery and proof as stage 3), the bookkeeping as a design section here
+  in parallel, no code. Fixed only with the stage 3 result: if its gain on
+  PC 1 is well under the prediction, the time is in the synchronous wait
+  and bookkeeping goes first.
 
 ## 7. Risks
 
@@ -244,3 +326,10 @@ only, which section views lack), stale bytes for unwatched memory.
 
 **DECISION (Fable):** whether the stage 3 block lives in arena pages or in
 its existing copy with refresh/copy-back switched off.
+
+**ANSWER (Fable, block 2):** the existing copy, with refresh and copy-back
+switched off for GPU-only pages. A demoted page falls back to today's
+behaviour and needs that copy anyway; nothing moves, so a stage 3 result
+measures the sync alone. Consequence to write into the prediction: stage 3
+saves time, not RAM or VRAM (the CPU side of a copy in GPU memory stays
+allocated). Arena pages are a later stage with its own proof.
