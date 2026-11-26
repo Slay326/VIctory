@@ -1683,6 +1683,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
+            copy.unordered.store(true, std::sync::atomic::Ordering::Relaxed);
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.

@@ -818,6 +818,9 @@ pub(crate) struct HostTexture {
     used: std::sync::atomic::AtomicBool,
     /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
     pub(crate) viewed: std::sync::atomic::AtomicBool,
+    /// An unordered access view of it was made in a view heap: shaders may
+    /// write it through the heap without a list naming it ([`unwritten`]).
+    pub(crate) unordered: std::sync::atomic::AtomicBool,
     /// The memory it copies, for title textures fed from it.
     key: Option<MemoryKey>,
     /// Its range in a heap of textures (`crate::placement`), given back
@@ -852,6 +855,7 @@ impl HostTexture {
             bytes,
             used: false.into(),
             viewed: false.into(),
+            unordered: false.into(),
             key: None,
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
@@ -946,6 +950,25 @@ pub(crate) fn texture_census() -> [[u64; 3]; 2] {
         let gpu = usize::from(!crate::texture::title_written(&t.texture));
         let reach = if t.used.load(Relaxed) { 0 } else if t.viewed.load(Relaxed) { 1 } else { 2 };
         bytes[1 - gpu][reach] += t.bytes;
+    }
+    bytes
+}
+
+/// Bytes of the live host textures the GPU may write (render target,
+/// depth, unordered access) that no list used: those that may have been
+/// written otherwise (a heap slot's unordered view, a host copy, placed in
+/// a heap of textures), and those nothing wrote yet ([`unwritten`]; with
+/// `VICTORY_EVICT_UNWRITTEN` they may be given up).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn unwritten_census() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut bytes = [0; 2];
+    let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    for t in map.iter().flat_map(|m| m.values()).filter_map(std::sync::Weak::upgrade) {
+        if crate::texture::title_written(&t.texture) || t.used.load(Relaxed) {
+            continue;
+        }
+        bytes[usize::from(unwritten(&t))] += t.bytes;
     }
     bytes
 }
@@ -1633,6 +1656,26 @@ const SOON_FRAMES: u64 = 10;
 #[cfg(windows)]
 pub(crate) static EVICTIONS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Of [`EVICTIONS`]: host textures the GPU may write that nothing wrote
+/// yet ([`unwritten`]) given up, and their bytes.
+#[cfg(windows)]
+pub(crate) static UNWRITTEN_GIVEN_UP: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `VICTORY_EVICT_UNWRITTEN=1`: host textures the GPU may write (render
+/// target, depth, unordered access) that nothing wrote yet are given up as
+/// those fed from title memory are ([`unwritten`]). Off by default.
+#[cfg(windows)]
+pub(crate) fn evict_unwritten() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_EVICT_UNWRITTEN");
+        if on {
+            tracing::warn!("host textures the GPU may write but nothing wrote yet are given up when unused (VICTORY_EVICT_UNWRITTEN)");
+        }
+        on
+    })
+}
+
 /// Memories whose host texture was given up, with the frame it was.
 #[cfg(windows)]
 static GIVEN_UP: std::sync::Mutex<Option<std::collections::HashMap<MemoryKey, u64>>> = std::sync::Mutex::new(None);
@@ -1654,8 +1697,35 @@ fn remade(k: &MemoryKey) {
 /// memory alone (no render target, depth or unordered access, no host copy
 /// or resolve wrote it), so a texture made again has them back.
 #[cfg(windows)]
-fn evictable(t: &HostTexture) -> bool {
+fn evictable(t: &HostTexture, unwritten_too: bool) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+        || unwritten_too && unwritten(t)
+}
+
+/// Whether host texture `t` of a title texture's memory may be written by
+/// the GPU (render target, depth, unordered access) but nothing wrote it
+/// yet: no list named it (a list's first use of a texture marks it,
+/// whatever it records: draws, clears, copies, tables), no view heap slot
+/// views it for unordered access, no host copy or resolve wrote it. Its
+/// contents are still the zeros it was made with (committed: such textures
+/// are never placed in a heap of textures), so one made again has them
+/// too, and a null view read meanwhile reads zeros as well: giving it up
+/// loses nothing.
+/// shortcut: a title thread that took it for a list just before a pass
+/// gave it up writes the old one; a use while that list holds it finds it
+/// again (the memory's map), but once the list let go of it unused by
+/// others, what it wrote is gone (the next use makes zeros). The pass gives
+/// up only textures unused for a while, or the least recently used, and
+/// checks again right before ([`give_up`]).
+#[cfg(windows)]
+fn unwritten(t: &HostTexture) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    t.key.is_some()
+        && t.placement.is_none()
+        && !crate::texture::title_written(&t.texture)
+        && !t.used.load(Relaxed)
+        && !t.unordered.load(Relaxed)
+        && !t.host_written.load(Relaxed)
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
@@ -1694,7 +1764,7 @@ fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
     let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
+    evict_among(&candidates(evict_unwritten()), &read, frame, now, over)
 }
 
 /// [`evict`] among `candidates`, with `read` (raw pointers) the host
@@ -1720,14 +1790,15 @@ pub(crate) fn evict_among(
     give_up(&gone, frame)
 }
 
-/// The host textures that may be given up ([`evictable`]), each with the
+/// The host textures that may be given up ([`evictable`]; `unwritten_too`:
+/// those the GPU may write that nothing wrote yet as well), each with the
 /// title textures holding it.
 #[cfg(windows)]
-fn candidates() -> Vec<Owned> {
+fn candidates(unwritten_too: bool) -> Vec<Owned> {
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
     for &r in at.values().flatten() {
-        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
+        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t, unwritten_too)) {
             by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
         }
     }
@@ -1769,6 +1840,10 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
 #[cfg(windows)]
 fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    // Those the GPU may write are checked again: a list may have used one,
+    // or a heap slot viewed it for unordered access, since the candidates
+    // were listed.
+    let gone: Vec<&Owned> = gone.iter().filter(|(t, _)| crate::texture::title_written(&t.texture) || unwritten(t)).collect();
     if gone.is_empty() {
         return (0, 0);
     }
@@ -1783,7 +1858,11 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
     let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
-    for (t, owners) in gone {
+    for (t, _) in gone.iter().filter(|(t, _)| !crate::texture::title_written(&t.texture)) {
+        UNWRITTEN_GIVEN_UP[0].fetch_add(1, Relaxed);
+        UNWRITTEN_GIVEN_UP[1].fetch_add(t.bytes, Relaxed);
+    }
+    for &(t, owners) in &gone {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
@@ -1810,8 +1889,15 @@ pub(crate) fn give_up_now(this: This) -> bool {
 /// given up (tests: [`evict_among`] over textures of their own).
 #[cfg(all(windows, test))]
 pub(crate) fn owned(this: This) -> Option<Owned> {
+    owned_with(this, false)
+}
+
+/// [`owned`], with those the GPU may write that nothing wrote yet as well
+/// (`unwritten_too`, tests).
+#[cfg(all(windows, test))]
+pub(crate) fn owned_with(this: This, unwritten_too: bool) -> Option<Owned> {
     let t = made(resource(this))?;
-    candidates().into_iter().find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
+    candidates(unwritten_too).into_iter().find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
 }
 
 // The creation methods' own arguments, passed on.
@@ -2505,7 +2591,7 @@ mod tests {
         let read = place(0, &texture(64, 64, 28, 1));
         let target = place(1 << 18, &ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) });
         let (r, t) = (host_copy(read).unwrap(), host_copy(target).unwrap());
-        let listed = candidates();
+        let listed = candidates(false);
         assert!(listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &r)), "fed from title memory");
         assert!(!listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &t)), "the GPU writes it");
         let (weak_r, weak_t) = (std::sync::Arc::downgrade(&r), std::sync::Arc::downgrade(&t));
@@ -2521,6 +2607,56 @@ mod tests {
         assert!(t.upgrade().is_none(), "freed with its title texture");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// `VICTORY_EVICT_UNWRITTEN`: a host texture the GPU may write that
+    /// nothing wrote yet is given up and made again (zeros, as before);
+    /// one a list used, or one viewed for unordered access, never is; and
+    /// without the switch none of them is.
+    #[cfg(windows)]
+    #[test]
+    fn unwritten_gpu_textures_are_given_up_only_with_the_switch() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |offset: u64, desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, offset, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        let target = |offset| place(offset, &ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) });
+        let (idle, listed, unordered) = (target(0), target(1 << 18), target(2 << 18));
+        let copies = [idle, listed, unordered].map(|r| host_copy(r).unwrap());
+        assert!(copies.iter().all(|c| unwritten(c)), "nothing wrote them yet");
+        // A list names one (any first use marks it), a heap slot views
+        // another for unordered access.
+        let list = host.new_list().unwrap();
+        let _ = list.transition(listed, 0x4);
+        copies[2].unordered.store(true, Relaxed);
+        assert!(copies[1].used.load(Relaxed) && !unwritten(&copies[1]), "a list used it");
+        assert!(!unwritten(&copies[2]), "viewed for unordered access");
+        let without = candidates(false);
+        assert!(!without.iter().any(|(c, _)| copies.iter().any(|x| std::sync::Arc::ptr_eq(c, x))), "off: none");
+        let with = candidates(true);
+        let listed_as = |x: &std::sync::Arc<HostTexture>| with.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, x));
+        assert!(listed_as(&copies[0]) && !listed_as(&copies[1]) && !listed_as(&copies[2]));
+        drop((with, without));
+        let before = UNWRITTEN_GIVEN_UP[1].load(Relaxed);
+        assert!(!give_up_now(listed) && !give_up_now(unordered));
+        assert!(owned_with(idle, true).is_some_and(|o| give_up(&[o], crate::queue::presented()).0 == 1));
+        assert!(UNWRITTEN_GIVEN_UP[1].load(Relaxed) > before, "counted");
+        assert!(made(resource(idle)).is_none(), "given up");
+        drop(copies);
+        drop(list);
+        let again = host_copy(idle).expect("made again on its next use");
+        assert!(unwritten(&again), "made again with nothing written");
+        drop(again);
+        for r in [idle, listed, unordered, h] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
     }
 
     /// Placed textures asked for from several threads at once: one resource
