@@ -227,10 +227,49 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// The size reported when `VICTORY_DISPLAY_MODE` is not set: a Series X's
+/// 4K output (Grand Theft Auto VI then renders its scene at 2560x1440).
+const DEFAULT_MODE: (u32, u32) = (3840, 2160);
+
+/// `WIDTHxHEIGHT` within what a D3D12 texture may be (16384).
+fn parse_mode(value: &str) -> Option<(u32, u32)> {
+    let (width, height) = value.trim().split_once(['x', 'X'])?;
+    let (width, height): (u32, u32) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
+    let fits = |n: u32| (1..=16384).contains(&n);
+    (fits(width) && fits(height)).then_some((width, height))
+}
+
+/// The mode reported to the title: `VICTORY_DISPLAY_MODE=WIDTHxHEIGHT`
+/// (for example 1920x1080 or 1280x720), else [`DEFAULT_MODE`]. A title sizes
+/// its render targets and window by it; presentation scales whatever it
+/// presents to the window.
+fn display_mode() -> (u32, u32) {
+    static MODE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let Some(value) = std::env::var_os("VICTORY_DISPLAY_MODE") else {
+            return DEFAULT_MODE;
+        };
+        match value.to_str().and_then(parse_mode) {
+            Some((width, height)) => {
+                tracing::info!(width, height, "display mode reported to the title (VICTORY_DISPLAY_MODE)");
+                (width, height)
+            }
+            None => {
+                tracing::warn!(
+                    ?value,
+                    "ignoring invalid VICTORY_DISPLAY_MODE; expected WIDTHxHEIGHT, reporting 3840x2160"
+                );
+                DEFAULT_MODE
+            }
+        }
+    })
+}
+
+/// The console's mode list: one mode at 60 Hz, 4K unless
+/// `VICTORY_DISPLAY_MODE` says otherwise ([`display_mode`]; Grand Theft
+/// Auto VI looks for a 120 Hz one to allow 120 Hz frame intervals).
+/// shortcut: not the host display's mode; report the host's rates if a
+/// title paces by them.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -250,9 +289,10 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    let (width, height) = display_mode();
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -262,6 +302,45 @@ extern "system" fn modes(
     // SAFETY: checked non-null; room for `count` >= 1 modes.
     unsafe { out.write(mode) };
     S_OK
+}
+
+/// Diagnostics: render-target binds per size since the last log, to see
+/// whether the title follows the reported mode.
+#[cfg(feature = "diagnostics")]
+static TARGET_SIZES: std::sync::Mutex<Vec<((u32, u32), u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Diagnostics: a render target of `width` x `height` was bound.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_target_size(width: u32, height: u32) {
+    let mut sizes = TARGET_SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    match sizes.iter_mut().find(|(size, _)| *size == (width, height)) {
+        Some((_, n)) => *n += 1,
+        None => sizes.push(((width, height), 1)),
+    }
+}
+
+/// Diagnostics: logs the largest render target bound and the most bound
+/// sizes since the last call, per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_target_sizes(frames: f64) {
+    let mut sizes = std::mem::take(&mut *TARGET_SIZES.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(&((w, h), _)) = sizes
+        .iter()
+        .max_by_key(|((w, h), _)| u64::from(*w) * u64::from(*h))
+    else {
+        return;
+    };
+    sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    let most: Vec<String> = sizes
+        .iter()
+        .take(6)
+        .map(|((w, h), n)| format!("{w}x{h} {:.1}", *n as f64 / frames.max(1.0)))
+        .collect();
+    let (mw, mh) = display_mode();
+    tracing::info!(
+        "render targets: mode {mw}x{mh}, largest bound {w}x{h}; binds/frame by size: {}",
+        most.join(", ")
+    );
 }
 
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
@@ -323,6 +402,50 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn display_mode_parses_width_by_height() {
+        assert_eq!(parse_mode("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_mode(" 1280 X 720 "), Some((1280, 720)));
+        for bad in [
+            "",
+            "1920",
+            "0x1080",
+            "1920x0",
+            "-1x720",
+            "20000x1080",
+            "axb",
+            "1920x1080x2",
+        ] {
+            assert_eq!(parse_mode(bad), None, "{bad}");
+        }
+    }
+
+    /// The title asks for the count first, then the list; without the
+    /// variable (tests do not set it) the list holds the 4K mode.
+    #[test]
+    fn modes_lists_one_mode() {
+        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let list: Modes = modes;
+        let mut count = 0;
+        assert_eq!(
+            list(std::ptr::null(), 0, 0, &mut count, std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(count, 1);
+        let mut mode = std::mem::MaybeUninit::<Mode>::uninit();
+        assert_eq!(
+            list(std::ptr::null(), 0, 0, &mut count, mode.as_mut_ptr()),
+            S_OK
+        );
+        // SAFETY: written above.
+        let mode = unsafe { mode.assume_init() };
+        assert_eq!((mode.width, mode.height), display_mode());
+        if std::env::var_os("VICTORY_DISPLAY_MODE").is_none() {
+            assert_eq!((mode.width, mode.height), DEFAULT_MODE);
+        }
+        assert_eq!(mode.refresh, [60, 1]);
     }
 
     #[test]

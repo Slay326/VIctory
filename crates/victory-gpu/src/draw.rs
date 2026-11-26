@@ -430,7 +430,12 @@ impl State {
             }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(list, record.resource);
+            {
+                crate::capture::note_target(list, record.resource);
+                // SAFETY: a live resource.
+                let d = unsafe { texture.GetDesc() };
+                crate::dxgi::note_target_size(d.Width as u32, d.Height);
+            }
             rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;

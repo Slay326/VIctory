@@ -2986,6 +2986,7 @@ impl Meter {
                 );
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::frame::log();
+                crate::dxgi::log_target_sizes(frames);
                 log_gpu_times(copy_frames);
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
@@ -3062,7 +3063,10 @@ impl Host {
             *presenter = match retry
                 .attempt(Instant::now(), || self.presenter(width, height, format))?
             {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    tracing::info!(width, height, "swap chain made in the presented frame's size");
+                    Some(p)
+                }
                 Err((step, e)) => {
                     tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
                     return None;
@@ -3084,7 +3088,10 @@ impl Host {
                 }
             })?;
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    tracing::info!(width, height, "swap chain resized to the presented frame");
+                    (p.width, p.height, p.format) = (width, height, format);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
                     return None;
