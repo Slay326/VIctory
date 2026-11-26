@@ -11610,7 +11610,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
-            loop_limit: super::loop_limit(),
+            loop_limit: crate::emit::loop_limit(),
         })
         .map(|_| ())
     }
@@ -11663,7 +11663,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
-            loop_limit: super::loop_limit(),
+            loop_limit: crate::emit::loop_limit(),
         })
     }
 
@@ -11855,7 +11855,7 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
             host_wave_max: 64,
-            loop_limit: super::loop_limit(),
+            loop_limit: crate::emit::loop_limit(),
         })
         .unwrap();
 
