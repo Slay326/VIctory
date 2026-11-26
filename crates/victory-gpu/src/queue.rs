@@ -183,6 +183,16 @@ pub(crate) fn pump_held_if_free(why: Why) {
     let _ = why;
 }
 
+/// Values held queues wait for (address, bytes), as of the last pump.
+#[cfg(windows)]
+static WAITED: std::sync::Mutex<Vec<(u64, u8)>> = std::sync::Mutex::new(Vec::new());
+
+/// Values held queues wait for (address, bytes).
+#[cfg(windows)]
+pub(crate) fn waited() -> Vec<(u64, u8)> {
+    WAITED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// How long a queue's head may wait before it runs anyway.
 // shortcut: a safety valve against a wait nothing satisfies (a write we do
 // not make), which would hold the title's fences until its 30 s watchdog
@@ -197,9 +207,25 @@ fn pump(held: &mut Holding, why: Why) {
     }
     let Some(host) = crate::host::host() else { return };
     let read = read_value;
+    // What held queues wait for, for submissions run meanwhile
+    // (`crate::memory::release_waited`).
+    *WAITED.lock().unwrap_or_else(|e| e.into_inner()) =
+        held.blocked(&read).into_iter().flat_map(|(_, _, _, waits)| waits).map(|w| (w.address, w.bytes)).collect();
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
-        tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
+        // Whether a host copy holds what the title waits for (a write of
+        // shaders held back from title memory).
+        let copies: Vec<String> = waits
+            .iter()
+            .map(|w| {
+                let copy = crate::shadow::find(w.address & !3, 8).map(|c| {
+                    let v = c.read_host(w.address & !3, 2);
+                    format!("copy {:#x?} holds {:#x}", c.range(), u64::from(v[0]) | u64::from(v[1]) << 32)
+                });
+                format!("{:#x}: title {:?}, {}", w.address, read(w.address, w.bytes), copy.unwrap_or_else(|| "no copy".into()))
+            })
+            .collect();
+        tracing::warn!(queue = kind(queue), ?waits, ?copies, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
