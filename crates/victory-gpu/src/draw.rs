@@ -1612,6 +1612,8 @@ impl State {
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
             list.defer_host(move || {
+                // Title memory a copy-back landing now writes is its first.
+                crate::host::landing::touch(None, from, from + n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {

@@ -69,6 +69,7 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 mod card;
+pub(crate) mod landing;
 pub(crate) use card::card_fetch;
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -1053,6 +1054,9 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    /// What the list's commands may read until it has run, dropped when it
+    /// is reset (a title list's upload memory and descriptor slots).
+    alive: Vec<Box<dyn std::any::Any + Send>>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1180,10 +1184,26 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists and waits for them, and for their copy-back.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_with(runs, false);
+    }
+
+    /// [`Host::execute`] for the queues' held work: with `VICTORY_LANDING`
+    /// it returns once the GPU is done, and the copy-back lands on a thread
+    /// of its own ([`landing`]); what follows the submission (the queue's
+    /// fence Signals) goes through [`landing::after_landing`].
+    pub(crate) fn execute_landed(&self, runs: &[&HostList]) {
+        self.execute_with(runs, landing::on());
+    }
+
+    /// Runs closed lists and waits for them; the copy-back lands on its own
+    /// thread with `land` (where nothing in it needs this one).
+    pub(crate) fn execute_with(&self, runs: &[&HostList], land: bool) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        // (A landing copy-back may still run: steps that touch what it
+        // writes wait for it, `landing::touch`.)
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1378,7 +1398,9 @@ impl Host {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // passes declare the same big ranges dozens of times). The last
+        // submission's copy-back has landed first (they go in order).
+        landing::serial();
         let copying = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1443,12 +1465,50 @@ impl Host {
         if marks_sent {
             crate::shadow::marks_fetched(&card_marks);
         }
-        crate::shadow::copy_back_marks(&withheld, withholding);
-        // Texture views left null that shaders read: made for what follows.
+        let pages = crate::shadow::marked_pages(&withheld, withholding);
+        // Texture views left null that shaders read: made for what follows
+        // (before a landing starts: it touches no descriptors).
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        // The copy-back lands on its own thread unless it runs work of the
+        // lists (which may use the queue or our lock) or withholds ranges.
+        #[cfg(feature = "diagnostics")]
+        let listed = traced;
+        #[cfg(not(feature = "diagnostics"))]
+        let listed = false;
+        let apart = land && !listed && withheld.is_empty() && runs.iter().all(|l| l.deferred().after.is_empty());
+        if land && !apart {
+            landing::note_inline();
+        }
+        if apart {
+            let declared: Vec<_> = back.iter().map(|(s, a, n, _)| (s.clone(), *a, *n)).collect();
+            let set = landing::Set::of(&pages, &declared);
+            let writes: Vec<(usize, crate::queue::Written, usize)> =
+                runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
+            let work = move || {
+                crate::shadow::copy_back_pages(&pages);
+                for (shadow, address, len, _) in &back {
+                    let written = shadow.copy_back(*address, *len);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                }
+                // Then the title sees the submission done.
+                for &(at, what, bytes) in &writes {
+                    what.write(at as *mut u8, bytes);
+                }
+                release_later(Box::new((back, pages)));
+            };
+            landing::post(set, Box::new(work));
+            release_retired();
+            release_later(Box::new((batch, withheld, heaps)));
+            self.log_messages();
+            return;
+        }
+        crate::shadow::copy_back_pages(&pages);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1476,7 +1536,7 @@ impl Host {
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
+        release_later(Box::new((batch, back, withheld, heaps, pages)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
@@ -2181,6 +2241,11 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// Keeps `what` until the list is reset (it has run by then).
+    pub(crate) fn keep_until_reset(&self, what: Box<dyn std::any::Any + Send>) {
+        self.deferred().alive.push(what);
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -2379,6 +2444,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    // Title memory a landing writes is its first.
+                    landing::touch(None, src, src + len);
+                    landing::touch(None, dst, dst + len);
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
@@ -2389,6 +2457,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    landing::touch(None, src, src + len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -2403,6 +2472,8 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
+                        // It may write any title memory.
+                        landing::touch_all();
                         batch.title_written();
                     }
                     work();
@@ -2419,6 +2490,7 @@ impl HostList {
                     if !marked {
                         batch.flush();
                     }
+                    landing::touch(Some(std::sync::Arc::as_ptr(shadow) as usize), *address, *address + *len);
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
@@ -2465,6 +2537,9 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // The submission's shaders read the copy: a landing writing it (or
+        // the title memory there) goes first, even where nothing is copied.
+        landing::touch(Some(std::sync::Arc::as_ptr(shadow) as usize), address, address + len);
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
@@ -2932,6 +3007,7 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        landing::log(frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;

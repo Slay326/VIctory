@@ -207,14 +207,19 @@ fn pump(held: &mut Holding, why: Why) {
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
         let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
-        host.execute(&lists);
+        host.execute_landed(&lists);
         ran += at.elapsed();
         drop(lists);
         segments.into_iter().for_each(crate::list::recycle);
     };
+    // Behind the copy-back of the work before it, wherever that lands
+    // (`crate::host::landing`): the title sees the fence once title memory
+    // holds what the GPU wrote.
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+        crate::host::landing::after_landing(move || {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        });
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,

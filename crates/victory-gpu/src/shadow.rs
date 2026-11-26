@@ -1498,7 +1498,17 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+#[cfg(test)]
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    let pages = marked_pages(withheld, memory_withheld);
+    copy_back_pages(&pages);
+}
+
+/// The first half of [`copy_back_marks`], which needs the queue: the pages
+/// shaders marked (copy, page address), taken from the bitmaps (which are
+/// cleared), held-back marks dropped, and the marked pages of copies in the
+/// GPU's memory fetched to their CPU sides; pages in `withheld` left out.
+pub(crate) fn marked_pages(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) -> Vec<(Arc<Shadow>, usize)> {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -1545,7 +1555,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
     }
     if marked.is_empty() {
-        return;
+        return Vec::new();
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
@@ -1569,14 +1579,24 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         .collect();
     crate::host::card_fetch(&fetch);
     drop(fetch);
-    let pages: Vec<(Arc<Shadow>, usize)> = pages
+    pages
         .into_iter()
         .filter(|(copy, page)| {
             !withheld
                 .iter()
                 .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && *page < a + n)
         })
-        .collect();
+        .collect()
+}
+
+/// The second half of [`copy_back_marks`]: the marked pages go back (on
+/// the submitting thread or, with `VICTORY_LANDING`, the landing thread).
+pub(crate) fn copy_back_pages(pages: &[(Arc<Shadow>, usize)]) {
+    if pages.is_empty() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     let back = |(copy, page): &(Arc<Shadow>, usize)| {
         let written = copy.copy_back_marked(*page);
         #[cfg(feature = "diagnostics")]

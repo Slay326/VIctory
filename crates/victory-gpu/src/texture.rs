@@ -557,6 +557,8 @@ impl Staging {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        // Title memory a copy-back landing now writes is its first.
+        crate::host::landing::touch(None, start, start + size);
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
