@@ -11,6 +11,14 @@ agents (folder `scripts/memclass/` of the agent workspace), not in the repo
 
 ## Switches
 
+**Runs with `VICTORY_MEMCLASS` or `VICTORY_MEMCLASS_STREAM` give no valid
+performance numbers** (frame times, fps, memory): they are for classifying
+and capturing only. The log's `memclass on` line says so too. A/B/A and
+fps measurements run without both switches.
+
+The switches are read once when the host starts (`memclass::init`, at the
+start of `victory run`); hooks never read them.
+
 | Variable | Values | Meaning |
 |---|---|---|
 | `VICTORY_MEMCLASS` | `1` / anything else | Classification on. Off: every hook is one load of a flag; no memory, no atomics written, no stream. |

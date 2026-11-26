@@ -33,6 +33,25 @@ fn bit(flag: u16) -> usize {
     flag.trailing_zeros() as usize
 }
 
+/// Hooks never make the classifier: before `init` (and off) they do
+/// nothing, read no environment and allocate nothing (the guard handler is
+/// one of them). No test calls `init`.
+#[test]
+fn hooks_before_init_make_nothing() {
+    tag(f::CPU_W_TITLE, 0x1000, 1);
+    tag_units(f::GPU_R_TABLE, 0x1000, 1);
+    record(f::GPU_R_TABLE, 0x1000, 1);
+    sync(Sync::Up, 0x1000, 1, 1);
+    refresh_copied(1);
+    point(Point::GpuDone);
+    drop(submission(1));
+    frame_done();
+    allocated(0x1000, 1, true);
+    assert!(!on() && !first_in_frame(1));
+    assert!(GLOBAL.get().is_none(), "a hook made the classifier");
+    assert!(!ON.load(Relaxed));
+}
+
 /// Off unless `VICTORY_MEMCLASS` is exactly 1; the options parse.
 #[test]
 fn it_is_off_unless_asked_for() {

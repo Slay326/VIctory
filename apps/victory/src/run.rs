@@ -50,6 +50,9 @@ pub fn run(
     if execute {
         check_cpu_features()?;
     }
+    // Stage 1 classification (`VICTORY_MEMCLASS`): read once here, before
+    // any hook (the guard handler among them) can run.
+    victory_gpu::memclass_init();
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     if execute {

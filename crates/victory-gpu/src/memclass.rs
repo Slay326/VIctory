@@ -3,9 +3,15 @@
 //! anything about the copies changes. Measuring only: no hook here changes
 //! what is copied, guarded or written.
 //!
-//! `VICTORY_MEMCLASS=1` turns it on. Off, every hook is one load of a flag
-//! set once at start and nothing else (no array, no lock, no atomics
-//! written).
+//! `VICTORY_MEMCLASS=1` turns it on, read once by [`init`] when the host
+//! starts (before the title runs). Hooks never initialize: each is one load
+//! of a flag and nothing else while off or before `init` (no array, no
+//! lock, no atomics written, nothing allocated; the guard handler is one of
+//! them).
+//!
+//! Runs with `VICTORY_MEMCLASS` or `VICTORY_MEMCLASS_STREAM` are for
+//! classifying and capturing only: their frame times, fps and memory are no
+//! valid performance numbers.
 //!
 //! Each unit of title memory (`VICTORY_MEMCLASS_GRAN`: `64k`, the guards'
 //! page and the default, or `4k`) collects per frame which kinds of access
@@ -151,26 +157,33 @@ impl Config {
 static ON: AtomicBool = AtomicBool::new(false);
 static GLOBAL: OnceLock<Option<Classifier>> = OnceLock::new();
 
-/// The process's classifier, made at the first call from the environment.
+/// Reads the environment and makes the process's classifier if asked for:
+/// once, when the host starts, before any hook can run (a hook in the guard
+/// handler must not read the environment, allocate or log).
+pub fn init() {
+    let c = GLOBAL.get_or_init(|| {
+        let c = Config::from(|k| std::env::var(k).ok()).map(Classifier::new);
+        if let Some(c) = &c {
+            tracing::info!(
+                target: "victory_gpu::memclass",
+                "memclass on: unit {} KiB, stream {:?}; this run's frame times, fps and memory \
+                 are no valid performance numbers",
+                1usize << c.cfg.shift >> 10,
+                c.cfg.stream
+            );
+        }
+        c
+    });
+    ON.store(c.is_some(), Release);
+}
+
+/// The process's classifier, if [`init`] made one; never makes it.
+#[inline]
 fn global() -> Option<&'static Classifier> {
-    if !ON.load(Relaxed) && GLOBAL.get().is_some() {
+    if !ON.load(Acquire) {
         return None;
     }
-    GLOBAL
-        .get_or_init(|| {
-            let c = Config::from(|k| std::env::var(k).ok()).map(Classifier::new);
-            if let Some(c) = &c {
-                tracing::info!(
-                    target: "victory_gpu::memclass",
-                    "memclass on: unit {} KiB, stream {:?}",
-                    1usize << c.cfg.shift >> 10,
-                    c.cfg.stream
-                );
-            }
-            ON.store(c.is_some(), Relaxed);
-            c
-        })
-        .as_ref()
+    GLOBAL.get().and_then(Option::as_ref)
 }
 
 /// Hook: `flag` reached title memory `[at, at + len)`.
