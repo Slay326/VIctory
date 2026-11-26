@@ -866,6 +866,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed, mut on_card) = (0, 0, Vec::new(), 0);
         let mut wanted = Vec::new();
+        let mut shader_pages = Vec::new();
+        // With the arena, the builder's writes to title buffers that do not
+        // go back stay in the copies (`crate::arena::keep_builder_writes`):
+        // taken back from title memory they were lost before the next
+        // submission's stages read them (runs 152953-161111: G headers in
+        // copies invalid, those in arena pages valid).
+        let keep = arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) && crate::arena::keep_builder_writes();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             if *mark == 0 {
@@ -889,6 +896,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 // Arena pages: what shaders wrote stays on the card.
                 if l.in_arena(entry) {
                     on_card += 1;
+                    shader_pages.push(at);
                     continue;
                 }
                 match owner.get(entry) {
@@ -906,6 +914,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         if on_card > 0 {
             crate::arena::note_writes(on_card);
+            crate::arena::note_shader_pages(&shader_pages);
         }
         crate::arena::want_pages(&wanted);
         // What shaders computed from memory with no copy (read as zeros) is
@@ -916,7 +925,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         if withheld > 0 {
             for (k, at) in writes.drain(..) {
                 release_waited(&copies[k], at, 1 << 16);
-                drop_withheld(at as usize, 1 << 16);
+                if !keep {
+                    drop_withheld(at as usize, 1 << 16);
+                }
             }
         } else if arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) {
             // With the arena, the builder's writes go back only into small
@@ -927,7 +938,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 if !small {
                     withheld += 1;
                     release_waited(&copies[k], at, 1 << 16);
-                    drop_withheld(at as usize, 1 << 16);
+                    if !keep {
+                        drop_withheld(at as usize, 1 << 16);
+                    }
                 }
                 small
             });
