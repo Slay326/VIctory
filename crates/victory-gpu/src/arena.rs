@@ -1162,8 +1162,13 @@ pub(crate) mod tests {
         assert_eq!(committed_around(heap.as_ptr() as u64), None);
         // A pool: its committed run.
         assert_eq!(committed_around(committed + 16), Some((committed, PAGE)));
-        // Reserved memory: a window around the address, inside its allocation.
-        assert_eq!(committed_around(reserved + PAGE + 8), Some((reserved, 2 * PAGE)));
+        // Reserved memory: nothing by default (VICTORY_BVH_ARENA_RESERVED=1:
+        // a window around the address, inside its allocation).
+        if !reserved_on() {
+            assert_eq!(committed_around(reserved + PAGE + 8), None);
+        } else {
+            assert_eq!(committed_around(reserved + PAGE + 8), Some((reserved, 2 * PAGE)));
+        }
         // SAFETY: ours.
         unsafe {
             VirtualFree(reserved as *mut _, 0, MEM_RELEASE);
