@@ -1675,13 +1675,126 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+    let memory = crate::host::video_memory();
+    let over = memory.map_or(0, |[(used, budget), _]| {
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
+    // Past the budget itself (free room in the heaps counted), a heap of
+    // textures is emptied (`VICTORY_TEXTURE_HEAPS_LEAN`).
+    if crate::placement::lean() && memory.is_some_and(|[(used, budget), _]| used > budget) {
+        compact(frame);
+    }
+}
+
+/// Title textures moved off a heap being emptied ([`compact`]): their
+/// host textures, made again elsewhere, and bytes; and the new host
+/// textures with their staging, uploaded at the next submission before
+/// anything reads them (`crate::bindless::uploads`).
+#[cfg(windows)]
+pub(crate) static MOVES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(windows)]
+type Moved = (std::sync::Arc<crate::texture::Staging>, std::sync::Arc<HostTexture>);
+#[cfg(windows)]
+static MOVED: std::sync::Mutex<Vec<Moved>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether [`compact`] made host textures not uploaded yet.
+#[cfg(windows)]
+pub(crate) fn moves_pending() -> bool {
+    !MOVED.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// The host textures [`compact`] made since the last call, to upload in
+/// full before the submission's lists run.
+#[cfg(windows)]
+pub(crate) fn take_moved() -> Vec<Moved> {
+    std::mem::take(&mut *MOVED.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Lean heaps of textures (`crate::placement::lean`), once per pass past
+/// the card's budget: the least used heap whose textures may all be made
+/// again elsewhere ([`crate::placement::choose_drain`]) is emptied. Each
+/// texture fed from title memory there that was uploaded before is made
+/// again in another heap (best fit) for every title texture holding it,
+/// the heap slots viewing the old one are made again on the new one at
+/// once (no slot is left null, so no read misses it), and the new one is
+/// uploaded in full from title memory by the next submission's upload list
+/// before its lists run ([`take_moved`]). Lists recorded before keep the
+/// old one until reset; then the heap is empty and released.
+/// shortcut: a title thread that took the old one just before (a list, a
+/// slot it writes) keeps it: the slot views the old texture (up to date
+/// as of the move) until the title rewrites it, and the heap stays until
+/// then ([`crate::placement::choose_drain`] tries another after a while).
+#[cfg(windows)]
+fn compact(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let movable: Vec<Owned> = candidates(false)
+        .into_iter()
+        .filter(|(t, _)| t.placement.is_some() && t.staging.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        .collect();
+    let mut by_heap: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    for (t, _) in &movable {
+        if let Some(p) = t.placement {
+            by_heap.entry(p.heap()).or_default().push(p.size());
+        }
+    }
+    let Some(heap) = crate::placement::choose_drain(&by_heap, frame) else {
+        return;
+    };
+    let mut old = std::collections::HashSet::new();
+    for (t, owners) in movable.iter().filter(|(t, _)| t.placement.is_some_and(|p| p.heap() == heap)) {
+        if let Some(new) = move_texture(t, owners) {
+            use windows::core::Interface;
+            old.insert(t.texture.as_raw() as usize);
+            MOVES[0].fetch_add(1, Relaxed);
+            MOVES[1].fetch_add(t.bytes, Relaxed);
+            MOVED.lock().unwrap_or_else(|e| e.into_inner()).push(new);
+        }
+    }
+    crate::descriptor::rebind(&old);
+}
+
+/// Makes host texture `t` again (elsewhere: `crate::placement` keeps new
+/// textures out of the heap being emptied) for the title textures `owners`
+/// holding it, which hold the new one from now on: the new one with its
+/// staging, or `None` if it could not be made (the owners then make one
+/// on their next use, as after [`give_up`]).
+#[cfg(windows)]
+fn move_texture(t: &std::sync::Arc<HostTexture>, owners: &[usize]) -> Option<Moved> {
+    {
+        // The memory's map names the new one from now on (`shared_texture`
+        // would hand out the old one while anything holds it).
+        let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(map), Some(k)) = (map.as_mut(), t.key)
+            && map.get(&k).and_then(std::sync::Weak::upgrade).is_some_and(|x| std::sync::Arc::ptr_eq(&x, t))
+        {
+            map.remove(&k);
+        }
+    }
+    let live: Vec<usize> = {
+        let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let all: std::collections::HashSet<usize> = at.values().flatten().copied().collect();
+        owners.iter().copied().filter(|r| all.contains(r)).collect()
+    };
+    let mut first = None;
+    for &r in &live {
+        {
+            let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
+                *h = None;
+            }
+        }
+        let made = resource(r as This).host();
+        if first.is_none() {
+            first = made.map(|m| (r, m));
+        }
+    }
+    let (r, new) = first?;
+    let staging = crate::texture::staging(r as This, &new.texture)?;
+    Some((staging, new))
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -1810,6 +1923,22 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     EVICTIONS[0].fetch_add(gone.len() as u64, Relaxed);
     EVICTIONS[1].fetch_add(bytes, Relaxed);
     (gone.len() as u64, bytes)
+}
+
+/// Moves `this`'s host texture as [`compact`] would (tests): the new one,
+/// queued for upload; `None` if it may not move.
+#[cfg(all(windows, test))]
+pub(crate) fn move_now(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    let (t, owners) = owned(this)?;
+    let (staging, new) = move_texture(&t, &owners)?;
+    MOVED.lock().unwrap_or_else(|e| e.into_inner()).push((staging, new.clone()));
+    Some(new)
+}
+
+/// Whether `t` lies in a heap of textures (tests).
+#[cfg(all(windows, test))]
+pub(crate) fn placed_in_heap(t: &HostTexture) -> Option<u64> {
+    t.placement.map(|p| p.heap())
 }
 
 /// Gives up `this`'s host texture as [`evict`] would (tests); false if it

@@ -972,6 +972,35 @@ impl HostHeap {
         }
     }
 
+    /// Slots viewing one of the host textures `textures` (raw pointers) are
+    /// made again from their records at once: their resources hold other
+    /// host textures now (`crate::resource::compact`). The old ones are
+    /// retired until the running submission has run.
+    pub(crate) fn rebind(&self, textures: &std::collections::HashSet<usize>) {
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            (0..kept.len() as u32)
+                .filter(|&i| {
+                    kept[i as usize]
+                        .as_ref()
+                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                })
+                .collect()
+        };
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for index in slots {
+            let key = made.get(index as usize).copied().unwrap_or(0);
+            let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+                continue;
+            };
+            self.make_at(index, &view);
+            if index < self.count && !self.sampler {
+                let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some();
+                self.viewed.set(index, Some(&view), kept);
+            }
+        }
+    }
+
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());

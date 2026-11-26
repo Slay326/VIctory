@@ -276,6 +276,25 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
     }
 }
 
+/// Every shader-visible view heap's slots viewing one of the host textures
+/// `textures` (raw pointers) are made again from their records, on the
+/// host textures their resources hold now (`crate::resource::compact`
+/// made those textures again elsewhere).
+#[cfg(windows)]
+pub(crate) fn rebind(textures: &std::collections::HashSet<usize>) {
+    if textures.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.rebind(textures);
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
