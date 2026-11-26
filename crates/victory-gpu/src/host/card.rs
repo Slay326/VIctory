@@ -164,6 +164,24 @@ impl Host {
         })
     }
 
+    /// The process's video memory budget and use in the host GPU's own
+    /// memory, asked now (`crate::arena`); `None` where they cannot be
+    /// asked.
+    pub(crate) fn card_usage(&self) -> Option<(u64, u64)> {
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries; the out pointer is a live local.
+        let asked = unsafe {
+            (|| -> windows::core::Result<(u64, u64)> {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+                let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(self.device.GetAdapterLuid())?;
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)?;
+                Ok((info.Budget, info.CurrentUsage))
+            })()
+        };
+        asked.ok().filter(|&(budget, _)| budget > 0)
+    }
+
     fn make_work(&self) -> windows::core::Result<Work> {
         let list = || -> windows::core::Result<OwnList> {
             // SAFETY: plain object creation; the list is closed until used.
@@ -304,6 +322,38 @@ impl Host {
             .collect();
         card_fetch(&ranges);
     }
+}
+
+/// Records `record` into a list of ours and runs it now, waiting for it
+/// (`crate::arena`); false if it could not. Only while no submission is on
+/// the GPU.
+pub(crate) fn run_now(record: impl FnOnce(&ID3D12GraphicsCommandList)) -> bool {
+    let Some(host) = host() else { return false };
+    if !host.card_ready() {
+        return false;
+    }
+    let Some(mut work) = work() else { return false };
+    work.sent += 1;
+    let (allocator, list) = &work.fetch;
+    // SAFETY: the list's last run finished (each is waited for); the fence
+    // and event are ours.
+    let ran = unsafe {
+        (|| -> windows::core::Result<()> {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            record(list);
+            list.Close()?;
+            host.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+            host.queue.Signal(&work.fence, work.sent)?;
+            work.fence.SetEventOnCompletion(work.sent, work.event)?;
+            WaitForSingleObject(work.event, INFINITE);
+            Ok(())
+        })()
+    };
+    if let Err(e) = &ran {
+        tracing::warn!(error = %e, "a list of ours did not run");
+    }
+    ran.is_ok()
 }
 
 /// Copies the ranges (copy, offsets from and to) of copies in the GPU's

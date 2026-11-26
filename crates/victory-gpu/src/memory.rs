@@ -27,6 +27,10 @@
 //! Memory no copy holds reads 0 and takes no writes (null views,
 //! bounds-checked); shaders mark such pages (or 256 MiB regions with no
 //! block) in the bitmap and [`log_frame`] counts them.
+//! With `VICTORY_BVH_ARENA=1` pages no copy holds get pages of their own in
+//! the GPU's memory once shaders reach them (`crate::arena`); tables name
+//! them where no copy holds the page, and what shaders write there stays on
+//! the card.
 //! shortcut: a page two copies share without either holding all of it is
 //! the larger one's.
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
@@ -60,9 +64,19 @@ pub(crate) struct Map {
     /// Ranges that go back byte for byte instead (root UAVs, see
     /// [`Map::precise`]).
     precise: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// The BVH builder ran in the list with the arena on
+    /// ([`Map::note_builder`]).
+    builder: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Map {
+    /// The BVH builder runs in the list with the arena on: what shaders
+    /// write through the page table into title buffers larger than
+    /// [`crate::arena::BACK`] stays out of title memory.
+    pub(crate) fn note_builder(&self) {
+        self.builder.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Shaders write `[address, address + len)` through a root UAV, which
     /// goes back by its bytes before and after the run
     /// ([`Shadow::gpu_writes`]): the marked pages it touches are left to
@@ -88,6 +102,15 @@ struct Layout {
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
+    /// Entries naming an arena page (`crate::arena`): what shaders write
+    /// there stays on the card, and reaching it is no miss.
+    arena: Vec<bool>,
+}
+
+impl Layout {
+    fn in_arena(&self, entry: usize) -> bool {
+        self.arena.get(entry).copied().unwrap_or(false)
+    }
 }
 
 /// A view heap's page table, shared by every list using title memory with
@@ -105,6 +128,10 @@ struct Shared {
     pairs: HashMap<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
+    /// The arena chunks' view pairs, by chunk, and the arena's generation
+    /// it names ([`crate::arena::generation`]).
+    arena_pairs: Vec<u32>,
+    arena_generation: u64,
     layout: Arc<Layout>,
 }
 
@@ -236,6 +263,7 @@ fn retake_dropped() {
 pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
+    crate::arena::log_frame();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
@@ -273,7 +301,30 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// bytes), copy k's view pair at heap index `pairs[k]`, `null` the null
 /// pair: the table's dwords, the level-1 index of each block, and the copy
 /// each entry names. At most [`CAPACITY`] blocks besides the null one.
+#[cfg(test)]
 fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
+    let (dwords, blocks, owner, _) = table_with(copies, pairs, null, &Extra::default());
+    (dwords, blocks, owner)
+}
+
+/// What a page table names besides the copies (`crate::arena`): arena
+/// pages, each its title address, its chunk's view pair and its byte offset
+/// in the chunk; and 256 MiB regions that get a block with no page named in
+/// them yet (so that shaders' marks there name pages).
+#[derive(Default)]
+struct Extra {
+    pages: Vec<(u64, u32, u32)>,
+    regions: Vec<usize>,
+}
+
+/// [`table`] with arena pages where no copy holds the page, after the
+/// copies: also whether each entry names an arena page.
+fn table_with(
+    copies: &[(u64, u64)],
+    pairs: &[u32],
+    null: u32,
+    extra: &Extra,
+) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>, Vec<bool>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
     let mut level1 = vec![0u32; LEVEL1];
@@ -310,15 +361,57 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
     }
+    // Arena pages, where no copy holds the page (regions first: a region
+    // wanted alone gets its block as a page's region does).
+    let mut arena: Vec<Option<(u32, u32)>> = Vec::new();
+    let block_of = |l1: usize, level1: &mut [u32], blocks: &mut Vec<usize>, owner: &mut Vec<Option<(usize, bool)>>| -> bool {
+        if level1[l1] == 0 {
+            if blocks.len() > CAPACITY {
+                return false;
+            }
+            level1[l1] = blocks.len() as u32;
+            blocks.push(l1);
+            owner.resize(owner.len() + BLOCK, None);
+        }
+        true
+    };
+    let mut arena_full = false;
+    for &l1 in &extra.regions {
+        if l1 < LEVEL1 && !block_of(l1, &mut level1, &mut blocks, &mut owner) {
+            arena_full = true;
+        }
+    }
+    for &(at, pair, offset) in &extra.pages {
+        let page = at >> 16;
+        let l1 = (page >> 12) as usize;
+        if l1 >= LEVEL1 || !block_of(l1, &mut level1, &mut blocks, &mut owner) {
+            arena_full |= l1 < LEVEL1;
+            continue;
+        }
+        let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
+        if owner[entry].is_none() {
+            arena.resize(owner.len(), None);
+            // The shader's byte offset is the address's low dword minus the
+            // entry's: the page's offset in its chunk.
+            arena[entry] = Some((pair, (at as u32).wrapping_sub(offset)));
+        }
+    }
+    if arena_full {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(CAPACITY, "arena pages in more 256 MiB regions than a page table has room for: the rest read as missing"));
+    }
+    arena.resize(owner.len(), None);
     let mut dwords = level1;
-    for o in &owner {
-        let entry = match *o {
-            Some((k, _)) => [pairs[k], copies[k].0 as u32],
-            None => [null, 0],
+    for (o, a) in owner.iter().zip(&arena) {
+        let entry = match (*o, *a) {
+            (Some((k, _)), _) => [pairs[k], copies[k].0 as u32],
+            (None, Some(a)) => [a.0, a.1],
+            (None, None) => [null, 0],
         };
         dwords.extend(entry);
     }
-    (dwords, blocks, owner.into_iter().map(|o| o.map(|o| o.0)).collect())
+    let backed = arena.iter().map(Option::is_some).collect();
+    (dwords, blocks, owner.into_iter().map(|o| o.map(|o| o.0)).collect(), backed)
 }
 
 impl Shared {
@@ -340,6 +433,8 @@ impl Shared {
             null,
             pairs: HashMap::new(),
             generation: u64::MAX,
+            arena_pairs: Vec::new(),
+            arena_generation: 0,
             layout: Arc::default(),
         })
     }
@@ -379,7 +474,28 @@ impl Shared {
             slots.push(slot);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
+        // Arena pages, through a view pair per chunk.
+        let mut extra = Extra::default();
+        if crate::arena::enabled() {
+            let view = crate::arena::view();
+            for chunk in &view.chunks[self.arena_pairs.len().min(view.chunks.len())..] {
+                let Some(slot) = heap.pair() else {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("no descriptor slots for a BVH arena chunk's views: its pages read as missing"));
+                    break;
+                };
+                heap.raw_pair_at(slot, Some(chunk), crate::arena::CHUNK_BYTES);
+                self.arena_pairs.push(slot);
+            }
+            extra.pages = view
+                .pages
+                .iter()
+                .filter_map(|&(at, s)| Some((at, *self.arena_pairs.get(s.chunk())?, s.offset() as u32)))
+                .collect();
+            extra.regions = view.regions;
+            self.arena_generation = view.generation;
+        }
+        let (dwords, blocks, owner, arena) = table_with(&ranges, &slots, self.null, &extra);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
@@ -389,6 +505,7 @@ impl Shared {
             copies: named,
             blocks,
             owner,
+            arena,
         });
         self.generation = now;
         stats(|s| s.tables += 1);
@@ -415,7 +532,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
-        if s.generation != now {
+        if s.generation != now || (crate::arena::enabled() && s.arena_generation != crate::arena::generation()) {
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -466,6 +583,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
+    let builder: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let ran_builder = builder.clone();
     let data = data as usize;
     // `VICTORY_BVH_GT`: the marked pages as `defer_after` below finds them,
     // read before it clears the bitmap.
@@ -489,6 +608,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                         continue;
                     };
                     let at = l1 << 28 | page << 16;
+                    if l.in_arena(entry) {
+                        m.arena.push(at);
+                        continue;
+                    }
                     match l.owner.get(entry) {
                         Some(Some(k)) => m.owned.push((l.copies[*k].clone(), at)),
                         _ => {
@@ -510,16 +633,21 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         marks.iter().enumerate().any(|(w, &mark)| {
             (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
                 let entry = w * 32 + b;
-                entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none())
+                entry / BLOCK == 0
+                    || l.blocks.get(entry / BLOCK).is_none()
+                    || l.owner.get(entry).is_none_or(|o| o.is_none()) && !l.in_arena(entry)
             })
         })
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let l = layout(key);
+        let Layout { copies, blocks, owner, .. } = &*l;
+        let arena = crate::arena::enabled();
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        let (mut pages, mut regions, mut missed, mut on_card) = (0, 0, Vec::new(), 0);
+        let mut wanted = Vec::new();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
@@ -531,31 +659,58 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    if arena {
+                        crate::arena::want_region(entry);
+                    }
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
+                // Arena pages: what shaders wrote stays on the card.
+                if l.in_arena(entry) {
+                    on_card += 1;
+                    continue;
+                }
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) => writes.push((*k, at)),
                     _ => {
                         pages += 1;
                         missed.push(at);
+                        if arena {
+                            wanted.push(at);
+                        }
                     }
                 }
             }
         }
+        if on_card > 0 {
+            crate::arena::note_writes(on_card);
+        }
+        crate::arena::want_pages(&wanted);
         // What shaders computed from memory with no copy (read as zeros) is
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
-        let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        let mut withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
-            for &(_, at) in &writes {
+            for (_, at) in writes.drain(..) {
                 drop_withheld(at as usize, 1 << 16);
             }
+        } else if arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) {
+            // With the arena, the builder's writes go back only into small
+            // title buffers (the results the title reads); the rest stays in
+            // the copies for the GPU until the frame's end.
+            writes.retain(|&(k, at)| {
+                let small = copies[k].range().1 <= crate::arena::BACK;
+                if !small {
+                    withheld += 1;
+                    drop_withheld(at as usize, 1 << 16);
+                }
+                small
+            });
         }
         let mut written = 0;
-        for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
+        for &(k, at) in &writes {
             let n = copies[k].copy_back_page(at as usize);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
@@ -578,6 +733,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         table,
         dirty,
         precise,
+        builder,
     })
 }
 
@@ -647,6 +803,61 @@ mod tests {
         assert_eq!(dwords.len(), LEVEL1 + (CAPACITY + 1) * BLOCK * 2);
         assert_eq!(look_up(&dwords, (CAPACITY as u64 + 1) << 28).0, pairs[CAPACITY + 1]);
         assert_eq!(look_up(&dwords, 0).0, 4, "the smallest copy is left out");
+    }
+
+    /// Arena pages (`crate::arena`) are named where no copy holds the page,
+    /// at their offset in their chunk's view; a region wanted alone gets a
+    /// block; copies keep their pages.
+    #[test]
+    fn arena_pages_fill_what_no_copy_holds() {
+        let copies = [(0xdd_0000_0000, 0x2_0000)];
+        let extra = Extra {
+            pages: vec![
+                // In the copy's region, beside it.
+                (0xdd_0002_0000, 200, 0x3_0000),
+                // Under the copy: the copy keeps it.
+                (0xdd_0001_0000, 200, 0x4_0000),
+                // In a region of its own, in another chunk.
+                (0xe5_1234_0000, 202, 0),
+            ],
+            regions: vec![0xe8f],
+        };
+        let (dwords, blocks, owner, arena) = table_with(&copies, &[102], 100, &extra);
+        assert_eq!(look_up(&dwords, 0xdd_0002_0010), (200, 0x3_0010));
+        assert_eq!(look_up(&dwords, 0xdd_0002_fffc), (200, 0x3_fffc));
+        assert_eq!(look_up(&dwords, 0xdd_0001_0004), (102, 0x1_0004), "the copy's page");
+        assert_eq!(look_up(&dwords, 0xe5_1234_8000), (202, 0x8000));
+        // The pages around stay missing (null pair), as the wanted region.
+        assert_eq!(look_up(&dwords, 0xe5_1235_0000).0, 100);
+        assert_eq!(look_up(&dwords, 0xe8_f000_0000).0, 100);
+        assert_eq!(blocks.len(), 4, "null, the copy's region, 0xe51, the wanted 0xe8f");
+        assert!(blocks.contains(&0xe8f));
+        let entry = |a: u64| blocks.iter().position(|&l| l == (a >> 28) as usize).unwrap() * BLOCK + (a >> 16 & 0xFFF) as usize;
+        assert!(arena[entry(0xdd_0002_0000)] && arena[entry(0xe5_1234_0000)]);
+        assert!(!arena[entry(0xdd_0001_0000)] && owner[entry(0xdd_0001_0000)] == Some(0));
+        assert!(!arena[entry(0xe5_1235_0000)]);
+        assert_eq!(arena.len(), owner.len());
+        // Without arena pages, the table is the copies' alone.
+        let (plain, _, _) = table(&copies, &[102], 100);
+        let (with_none, _, _, none) = table_with(&copies, &[102], 100, &Extra::default());
+        assert_eq!(plain, with_none);
+        assert!(none.iter().all(|&a| !a));
+    }
+
+    /// Arena pages past the table's room read as missing; the table fits
+    /// its buffer.
+    #[test]
+    fn arena_pages_past_the_room_read_as_missing() {
+        let copies: Vec<(u64, u64)> = (0..CAPACITY as u64).map(|k| (k << 28, 0x1_0000)).collect();
+        let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 10 + 2 * k).collect();
+        let extra = Extra {
+            pages: vec![(0xff_f000_0000, 7, 0), (0xa0_0000_0000, 7, 0x1_0000)],
+            regions: vec![],
+        };
+        let (dwords, blocks, _, _) = table_with(&copies, &pairs, 4, &extra);
+        assert_eq!(blocks.len(), CAPACITY + 1);
+        assert_eq!(dwords.len(), LEVEL1 + (CAPACITY + 1) * BLOCK * 2);
+        assert_eq!(look_up(&dwords, 0xff_f000_0000).0, 4);
     }
 
     /// Reads 4 dwords of title memory at (`lo`, `hi`) through the page
@@ -1126,5 +1337,133 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::shadow::unregister(at, at as u64);
         }
         drop(copies);
+    }
+
+    /// V2 of the test above with the arena (`crate::arena`): Q and P are
+    /// private memory with no copy, as the builder's pools. The first
+    /// submissions miss (the regions get blocks, then the pages arena pages,
+    /// Q filled from title memory, P too); from then on the stage reads the
+    /// structure from Q's arena page and writes it into P's, and readers
+    /// see it (i) in the same list, (ii) in the next submission, (iii) after
+    /// the frame's end, while title memory at P keeps its older bytes
+    /// (nothing goes back). G, P's arena page fetched as `crate::bvh_gt`
+    /// does, passes the validator; the readers' lists miss nothing.
+    ///
+    /// `cargo test --release -p victory-gpu --features diagnostics with_the_arena -- --ignored --test-threads=1 --nocapture`
+    #[test]
+    #[ignore = "needs a D3D12 GPU; run alone with --ignored --test-threads=1 --nocapture"]
+    fn with_the_arena_a_bvh_built_from_pages_with_no_copy_reaches_its_readers() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const OLD: u32 = 0x1111_1111;
+        crate::arena::tests::FORCED.with(|f| f.set(Some(true)));
+        let host = crate::host::host().expect("no D3D12 device: this test must not pass without a GPU");
+        let views = heap().expect("no view heap for title memory");
+        let (root, pso) = pipeline(BUILD);
+        let (result, result_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let result_gpu = unsafe { result.GetGPUVirtualAddress() };
+        // Write-watched private memory below 2^40 (as the pools), no copy.
+        let page = |from: u64| -> usize {
+            (0..256u64)
+                .map(|k| from + (k << 28))
+                // SAFETY: a fresh allocation where nothing is mapped, or none.
+                .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+                .find(|&p| p != 0)
+                .expect("memory below 2^40")
+        };
+        let (p, q) = (page(0x78_0000_0000), page(0x7c_0000_0000));
+        let bvh = crate::bvh_gt::mini_bvh();
+        let (base, input) = (p + 0x100, q + 0x100);
+        let write = |at: usize, words: &[u32]| {
+            for (k, &w) in words.iter().enumerate() {
+                // SAFETY: our pages.
+                unsafe { (at as *mut u32).add(k).write_volatile(w) };
+            }
+        };
+        // SAFETY: our page.
+        let title = || -> Vec<u32> { (0..64).map(|k| unsafe { (base as *const u32).add(k).read_volatile() }).collect() };
+        write(base, &[OLD; 64]);
+        write(input, &bvh);
+        let list = host.new_list().unwrap();
+        // One submission: the stage if `build`, a UAV barrier, the reader;
+        // what the reader saw and whether the list missed memory.
+        let submit = |build: bool| -> (Vec<u32>, bool) {
+            let map = bind(&list, OURS).expect("a page table");
+            let constants = |mode: u32| [base as u32, (base >> 32) as u32, input as u32, (input >> 32) as u32, mode, 0, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                list.list.SetComputeRootUnorderedAccessView(3, result_gpu);
+                list.list.SetPipelineState(&pso);
+            }
+            for mode in [0, 1].into_iter().filter(|&m| build || m == 1) {
+                let c = constants(mode);
+                // SAFETY: as above.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstants(4, c.len() as u32, c.as_ptr().cast(), 0);
+                    list.list.Dispatch(1, 1, 1);
+                }
+                crate::list::global_uav_barrier(&list);
+            }
+            list.close();
+            let misses = || stats(|s| s.missed_pages + s.missed_regions);
+            let before = misses();
+            host.execute(&[&list]);
+            let missed = misses() != before;
+            list.reset();
+            // SAFETY: the mapped output, the GPU done with it.
+            ((0..64).map(|k| unsafe { result_cpu.cast::<u32>().add(k).read_volatile() }).collect(), missed)
+        };
+        log_frame();
+        log_frame();
+        let mut rounds = 0;
+        let mut i = Vec::new();
+        for round in 1..=6 {
+            let missed;
+            (i, missed) = submit(true);
+            println!(
+                "arena round {round}: (i) {}, list missed {missed}",
+                if i == bvh { "the structure" } else if i.iter().all(|&x| x == 0) { "zeros" } else { "something else" }
+            );
+            if i == bvh {
+                rounds = round;
+                break;
+            }
+        }
+        let cpu = title();
+        let (ii, ii_missed) = submit(false);
+        log_frame();
+        let (iii, iii_missed) = submit(false);
+        let g = crate::arena::fetch(&[p as u64]);
+        let g_words: Vec<u32> = g
+            .first()
+            .map(|(_, b)| b[0x100..0x200].as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect())
+            .unwrap_or_default();
+        let read = |at: u64| g_words.get(at.checked_sub(0x1000)? as usize / 4).copied();
+        let g_valid = crate::bvh_gt::check(&read, 0x1000).valid;
+        let view = crate::arena::view();
+        println!(
+            "with the arena: structure after {rounds} submissions; CPU {}; (ii) {}; (iii) {}; G valid {g_valid}; arena {} pages, {} regions",
+            if cpu == vec![OLD; 64] { "the older bytes" } else { "something else" },
+            ii == bvh,
+            iii == bvh,
+            view.pages.len(),
+            view.regions.len()
+        );
+        crate::arena::tests::FORCED.with(|f| f.set(None));
+        assert!(rounds > 0, "the stage never read the structure through the arena");
+        assert!(rounds <= 3, "regions, then pages, then backed: at most 3 submissions");
+        assert!(view.pages.iter().any(|&(a, _)| a == p as u64) && view.pages.iter().any(|&(a, _)| a == q as u64));
+        assert_eq!(i, bvh, "V2 with the arena: (i) the structure");
+        assert_eq!(ii, bvh, "(ii) the next submission reads it from the arena");
+        assert_eq!(iii, bvh, "(iii) so does the next frame");
+        assert_eq!(cpu, vec![OLD; 64], "nothing goes back into title memory");
+        assert!(g_valid, "G from the arena passes the validator");
+        assert!(!ii_missed && !iii_missed, "readers of arena pages miss nothing");
     }
 }
