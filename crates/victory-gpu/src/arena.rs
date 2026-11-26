@@ -656,9 +656,9 @@ pub(crate) fn provide() {
         }
         // A copy holds it (asked first: the walk below is not free): a title
         // buffer the builder reads, scanned below.
-        let copy = crate::shadow::find(address, 1);
-        if let Some(c) = &copy {
-            a.inputs.insert(c.range());
+        let copy = crate::shadow::holding(address);
+        if let Some(range) = copy {
+            a.inputs.insert(range);
         }
         let in_copy = copy.is_some();
         let Some((start, len)) = (!in_copy).then(|| committed_around(address)).flatten() else {
@@ -688,7 +688,7 @@ pub(crate) fn provide() {
                 if a.dir.get(p).is_some() || a.nothing.contains(&p) || a.not_title.contains(&p) {
                     break;
                 }
-                if crate::shadow::find(p * PAGE, 1).is_some() {
+                if crate::shadow::holding(p * PAGE).is_some() {
                     a.not_title.insert(p);
                     break;
                 }

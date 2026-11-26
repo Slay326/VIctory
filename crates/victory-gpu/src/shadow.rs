@@ -1736,6 +1736,28 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// The title buffer holding `address`, or the 4 MiB window of a copy made
+/// for memory outside buffers that does: its range. Unlike [`find`] it makes
+/// nothing (`crate::arena` asks it for every address it looks at; through
+/// `find` that made a 4 MiB window for each, thousands a frame, until the
+/// shared memory ran out: runs 135658, 140104, 140946).
+pub(crate) fn holding(address: u64) -> Option<(u64, u64)> {
+    let in_buffer = buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end > address)
+        .map(|(k, e)| (k.0, e.end - k.0));
+    in_buffer.or_else(|| {
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .find(|&&(start, len)| start <= address && address < start + len)
+            .copied()
+    })
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
