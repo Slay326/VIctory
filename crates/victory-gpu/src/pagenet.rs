@@ -30,6 +30,7 @@
 //! - I8: an access by a host thread is never counted as the title's.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// The tracked and protected unit (as `crate::watch::PAGE`).
@@ -129,7 +130,7 @@ pub struct Stats {
 /// clean run compares equal to an idle one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Oddities {
-    /// Faults of host threads on armed pages (opened, not counted, I8).
+    /// Accesses of the host to armed pages (opened, not counted, I8).
     pub host_faults: u64,
     /// Armed pages whose protection someone else replaced before the
     /// fault or the opening: the arming was lost, nothing was counted.
@@ -176,6 +177,8 @@ struct Inner {
     oddities: Oddities,
     demotions: Vec<Demotion>,
     host: BTreeSet<u32>,
+    /// How often each page was armed.
+    arms: BTreeMap<usize, u64>,
 }
 
 /// The fault bookkeeping of title pages (see the module).
@@ -185,6 +188,9 @@ pub struct PageNet<B: Protect> {
     inner: Mutex<Inner>,
     /// Signalled when a sync ends.
     synced: Condvar,
+    /// Pages armed now: lets the paths that only matter for armed pages
+    /// leave without the lock.
+    armed: AtomicUsize,
 }
 
 impl<B: Protect> PageNet<B> {
@@ -195,6 +201,7 @@ impl<B: Protect> PageNet<B> {
             backend,
             inner: Mutex::new(Inner::default()),
             synced: Condvar::new(),
+            armed: AtomicUsize::new(0),
         }
     }
 
@@ -233,6 +240,12 @@ impl<B: Protect> PageNet<B> {
                 inner.stats.arm_noops += 1;
                 return;
             }
+            // Someone else's protection replaced ours since: the arming
+            // is gone, and the page is armed afresh.
+            Some(State::ArmedMeasure) if self.backend.get(page) != Prot::NoAccess => {
+                inner.oddities.overridden += 1;
+                self.armed.fetch_sub(1, Ordering::Relaxed);
+            }
             Some(State::ArmedMeasure | State::GpuOnlyArmed | State::Syncing) => return,
             Some(State::Shared) | None => {}
         }
@@ -246,13 +259,23 @@ impl<B: Protect> PageNet<B> {
             return;
         }
         inner.pages.insert(page, Entry { state, from });
+        *inner.arms.entry(page).or_default() += 1;
+        self.armed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A thread `tid` faulted reading (or writing, `is_write`) `addr`.
+    /// A thread `tid` faulted reading (or writing, `is_write`) `addr`: the
+    /// host's if `tid` was named by [`Self::host_thread`].
+    pub fn on_fault(&self, addr: usize, is_write: bool, tid: u32) -> Fault {
+        let host = self.lock().host.contains(&tid);
+        self.on_fault_from(addr, is_write, host)
+    }
+
+    /// A thread faulted reading (or writing, `is_write`) `addr`, in the
+    /// host's own code (`host`) or the title's.
     ///
     /// `Handled` means the access can be retried: the page was armed and is
     /// open now, or it was opened by another thread in the meantime.
-    pub fn on_fault(&self, addr: usize, is_write: bool, tid: u32) -> Fault {
+    pub fn on_fault_from(&self, addr: usize, is_write: bool, host: bool) -> Fault {
         if self.mode == Mode::Off {
             return Fault::NotOurs;
         }
@@ -264,7 +287,7 @@ impl<B: Protect> PageNet<B> {
         };
         match entry.state {
             State::ArmedMeasure => {
-                let host = inner.host.contains(&tid);
+                self.armed.fetch_sub(1, Ordering::Relaxed);
                 inner.pages.insert(
                     page,
                     Entry {
@@ -291,7 +314,7 @@ impl<B: Protect> PageNet<B> {
                 Fault::Handled
             }
             State::GpuOnlyArmed => {
-                let host = inner.host.contains(&tid);
+                self.armed.fetch_sub(1, Ordering::Relaxed);
                 inner.pages.insert(
                     page,
                     Entry {
@@ -370,6 +393,50 @@ impl<B: Protect> PageNet<B> {
         }
     }
 
+    /// The host is about to read or write `page` itself, by a path that
+    /// fails on a closed page instead of faulting (a copy in the kernel):
+    /// a page armed for measuring is opened first, not counted (I8). True
+    /// if it was armed.
+    ///
+    /// A page armed as GPU-only is left alone: there the host's access has
+    /// to sync like the title's, which is the fault path's business.
+    pub fn host_access(&self, page: usize) -> bool {
+        if !self.any_armed() {
+            return false;
+        }
+        let mut inner = self.lock();
+        let Some(entry) = inner.pages.get(&page).copied() else {
+            return false;
+        };
+        if entry.state != State::ArmedMeasure {
+            return false;
+        }
+        self.armed.fetch_sub(1, Ordering::Relaxed);
+        inner.pages.insert(
+            page,
+            Entry {
+                state: State::Shared,
+                ..entry
+            },
+        );
+        if self.backend.swap(page, Prot::NoAccess, entry.from) {
+            inner.oddities.host_faults += 1;
+        } else {
+            inner.oddities.overridden += 1;
+        }
+        true
+    }
+
+    /// Whether any page is armed now (no lock taken).
+    pub fn any_armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed) != 0
+    }
+
+    /// How often each page was armed so far.
+    pub fn armed_counts(&self) -> BTreeMap<usize, u64> {
+        self.lock().arms.clone()
+    }
+
     /// Whether `page` is treated as GPU-only right now.
     pub fn is_gpu_only(&self, page: usize) -> bool {
         self.state(page) == State::GpuOnlyArmed
@@ -398,6 +465,7 @@ impl<B: Protect> PageNet<B> {
                 }
                 State::Demoted => return,
                 State::ArmedMeasure | State::GpuOnlyArmed => {
+                    self.armed.fetch_sub(1, Ordering::Relaxed);
                     if !self.backend.swap(page, Prot::NoAccess, entry.from) {
                         inner.oddities.overridden += 1;
                     }

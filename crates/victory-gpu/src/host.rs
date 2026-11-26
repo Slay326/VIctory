@@ -2696,6 +2696,10 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // Pages closed to measure the title's accesses are opened first: the
+    // kernel would fail on them (no cost unless that is switched on).
+    crate::watch::net::host_touch(src as usize, len);
+    crate::watch::net::host_touch(dst as usize, len);
     let mut done = 0;
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
@@ -3200,6 +3204,7 @@ impl Meter {
         self.frames += 1;
         crate::memory::log_frame();
         crate::descriptor::sweep();
+        crate::watch::net::frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         self.report_frames += 1;

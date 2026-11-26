@@ -571,6 +571,9 @@ impl Shadow {
         // Our write is not the title's: the copy takes the page as it is.
         if let Some(t) = &self.tracked {
             self.take_and_read(t, page, from, to);
+            // The GPU wrote the page: whether the title's CPU code touches
+            // it from here on is what `VICTORY_PAGENET=measure` counts.
+            crate::watch::net::arm(page / PAGE);
         }
         to - from
     }

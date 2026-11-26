@@ -38,6 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod net;
+
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
@@ -215,9 +217,47 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
+/// The thread holding the guard lock (0: none). The page net's fault path
+/// (`net`) must not wait for a lock its own thread holds.
+static GUARD_OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn this_thread() -> u32 {
+    // SAFETY: no arguments, no failure.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
 #[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> Held {
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    GUARD_OWNER.store(this_thread(), Ordering::Relaxed);
+    Held(guard)
+}
+
+/// The guard lock, held; [`GUARD_OWNER`] names the thread meanwhile.
+#[cfg(not(feature = "diagnostics"))]
+struct Held(std::sync::MutexGuard<'static, Guards>);
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Before the lock is released (the field drops after this).
+        GUARD_OWNER.store(0, Ordering::Relaxed);
+    }
 }
 
 /// The guard lock, timed while held by the line that took it
@@ -227,6 +267,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    GUARD_OWNER.store(this_thread(), Ordering::Relaxed);
     Held(Some(guard), std::time::Instant::now(), line)
 }
 
@@ -259,6 +300,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let us = self.1.elapsed().as_micros() as u64;
+        GUARD_OWNER.store(0, Ordering::Relaxed);
         drop(self.0.take());
         let line = u64::from(self.2);
         if let Some(slot) = HELD
@@ -822,6 +864,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // Our own address of what it showed is no longer its address (taken
     // before the guards, never under them: see `Own`).
     forget_views(at, at.saturating_add(len));
+    net::remapped(first, last);
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
@@ -1131,14 +1174,21 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let at = r.ExceptionInformation[1];
+        let (kind, at) = (r.ExceptionInformation[0], r.ExceptionInformation[1]);
+        // A page closed to measure its accesses (`net`) is asked for first:
+        // looked at here first, the guard would open such a page for a
+        // write and the access would go uncounted.
+        if (kind == READ || kind == WRITE) && net::fault(at, kind == WRITE, r.ExceptionAddress as usize) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if kind != WRITE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
         // Held across both checks: another thread may have opened the block

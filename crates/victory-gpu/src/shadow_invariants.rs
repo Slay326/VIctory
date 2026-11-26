@@ -566,3 +566,50 @@ fn a_demoted_page_is_never_gpu_only_again() {
 fn a_wrong_gpu_only_class_costs_speed_not_correctness() {
     todo!("stage 3: class the fixture GPU-only, run run_schedule over 64 seeds, assert Ok and the demotion count");
 }
+
+/// Three submissions writing pages 0 to 2 at computed addresses, with the
+/// title reading page 0, writing page 1 and leaving page 2 alone between
+/// them; returns title memory and the copy at the end, and what `probe`
+/// saw after the first submission.
+fn measured_sequence<T>(f: &Fixture, probe: impl Fn(&Fixture) -> T) -> (Vec<u8>, Vec<u8>, T) {
+    let gpu = |k: u8| [(10, 0xa0 + k), (PAGE + 5000, 0xb0 + k), (2 * PAGE + 9000, 0xc0 + k)];
+    submission(f, Back::Computed, 0, f.len, &gpu(1), &[(3 * PAGE + 7, 0x71)]);
+    let seen = probe(f);
+    assert_eq!(f.title(10), 0xa1, "the title reads what the GPU wrote");
+    f.title_write(PAGE + 5001, 0x51);
+    submission(f, Back::Computed, 0, f.len, &gpu(2), &[]);
+    f.title_write(8200, 0x52);
+    assert_eq!(f.title(2 * PAGE + 9000), 0xc2);
+    submission(f, Back::Computed, 0, f.len, &gpu(3), &[(3 * PAGE + 8, 0x72)]);
+    f.copy().update(f.p, f.len);
+    (f.title_bytes(0, f.len), f.copy_bytes(0, f.len), seen)
+}
+
+/// Measuring the title's accesses (`VICTORY_PAGENET=measure`) changes no
+/// byte of title memory or of the copy over a run of copy-backs with title
+/// reads and writes between them, and it does measure: each page the GPU
+/// wrote is closed after its copy-back, the title's first read and write
+/// after it are counted at their 4 KiB blocks, the engine's own accesses
+/// (the next copy-back's) are not.
+#[test]
+fn measuring_the_titles_accesses_changes_no_byte() {
+    use crate::watch::net::{TEST_ON, tests::seen};
+    let Some(plain) = Fixture::new(4, pattern) else {
+        return; // no host GPU here
+    };
+    let (title, copy, ()) = measured_sequence(&plain, |_| ());
+    let f = Fixture::new(4, pattern).expect("as above");
+    TEST_ON.set(true);
+    let (title_measured, copy_measured, closed) =
+        measured_sequence(&f, |f| [0, 1, 2, 3].map(|page| seen(f.p + page * PAGE).1));
+    TEST_ON.set(false);
+    assert_eq!(closed, [true, true, true, false], "closed after their copy-backs; page 3 had none");
+    assert!(title == title_measured, "no byte of title memory differs");
+    assert!(copy == copy_measured, "nor of the copy");
+    TEST_ON.set(true);
+    assert_eq!(seen(f.p + 10).0, (2, 0), "page 0: the title's read, and this test's of the whole at the end");
+    assert_eq!(seen(f.p + PAGE + 5001).0, (0, 1), "its write to page 1");
+    assert_eq!(seen(f.p + 8200).0, (0, 1), "and to page 0, after the second copy-back");
+    assert_eq!(seen(f.p + 2 * PAGE + 9000).0, (1, 0), "page 2: only the read after the second");
+    TEST_ON.set(false);
+}

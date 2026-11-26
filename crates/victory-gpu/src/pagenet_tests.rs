@@ -828,9 +828,91 @@ fn t8_net_host_fault_and_unmapped_arm() {
     mock.st().prot.insert(0x52, Prot::NoAccess);
     let net = PageNet::new(Mode::Net, mock.clone());
     net.arm(0x52, Reason::GpuOnly);
-    assert_eq!(net.state(0x52), State::Shared, "closed by someone else: not ours to open");
+    assert_eq!(
+        net.state(0x52),
+        State::Shared,
+        "closed by someone else: not ours to open"
+    );
     assert_eq!(
         net.on_fault(at(0x52, 0, 0), false, TITLE_TID),
         Fault::NotOurs
     );
+}
+
+/// t9 (I7, I8): the host's own access opens a measured page uncounted.
+///
+/// Input: Measure; pages A = 0x60 and B = 0x61 armed after a copy-back.
+/// Run: `host_access(A)` (the host is about to copy A in the kernel, which
+/// fails on a closed page instead of faulting); then a title read of A and
+/// one of B.
+/// Expected: `host_access` says A was armed and A is read-only again (what
+/// it was armed from: the host's copy then runs as without the net); A's
+/// title read faults nowhere and counts nothing; B's is counted; nothing is
+/// armed afterwards (`any_armed`), each page was armed once; a second
+/// `host_access(A)` and one of a page never armed do nothing.
+#[test]
+fn t9_host_access_opens_uncounted() {
+    let (a, b) = (0x60, 0x61);
+    let mock = Mock::new(&[a, b]);
+    let net = PageNet::new(Mode::Measure, mock.clone());
+    assert!(!net.any_armed());
+    net.arm(a, Reason::AfterCopyBack);
+    net.arm(b, Reason::AfterCopyBack);
+    assert!(net.any_armed());
+    assert!(net.host_access(a), "A was armed");
+    assert_eq!(mock.prot(a), Prot::ReadOnly, "I7: as it was before arming");
+    assert_eq!(net.state(a), State::Shared);
+    access(&net, &mock, at(a, 1, 0), None, TITLE_TID);
+    assert!(net.any_armed(), "B still is");
+    access(&net, &mock, at(b, 2, 0), None, TITLE_TID);
+    assert!(!net.any_armed());
+    assert!(!net.host_access(a) && !net.host_access(0x62));
+    let stats = net.stats();
+    assert_eq!(
+        stats.reads,
+        BTreeMap::from([((b, 2), 1)]),
+        "I8: only the title's read"
+    );
+    assert!(stats.writes.is_empty());
+    assert_eq!(
+        net.oddities(),
+        Oddities {
+            host_faults: 1,
+            ..Oddities::default()
+        }
+    );
+    assert_eq!(net.armed_counts(), BTreeMap::from([(a, 1), (b, 1)]));
+}
+
+/// t10 (measure): an arming lost to someone else's protection is renewed.
+///
+/// Input: Measure; page P = 0x70 armed; the engine opens it (a kernel
+/// write) and takes it again (refresh, copy-back): read-only, no fault
+/// came, the net still has it as armed.
+/// Run: the next copy-back arms P again; a title read.
+/// Expected: P is closed again by that arm (left as it was, no later
+/// access of the page would ever be counted); the read is counted; one
+/// override noted; P was armed twice and nothing is armed at the end.
+#[test]
+fn t10_lost_arming_is_renewed() {
+    const P: usize = 0x70;
+    let mock = Mock::new(&[P]);
+    let net = PageNet::new(Mode::Measure, mock.clone());
+    net.arm(P, Reason::AfterCopyBack);
+    mock.st().prot.insert(P, Prot::ReadWrite);
+    mock.engine_copy_back(P);
+    assert_eq!(net.state(P), State::ArmedMeasure, "no fault came");
+    net.arm(P, Reason::AfterCopyBack);
+    assert_eq!(mock.prot(P), Prot::NoAccess, "armed afresh");
+    access(&net, &mock, at(P, 4, 0), None, TITLE_TID);
+    assert_eq!(net.stats().reads, BTreeMap::from([((P, 4), 1)]));
+    assert_eq!(
+        net.oddities(),
+        Oddities {
+            overridden: 1,
+            ..Oddities::default()
+        }
+    );
+    assert_eq!(net.armed_counts(), BTreeMap::from([(P, 2)]));
+    assert!(!net.any_armed());
 }
