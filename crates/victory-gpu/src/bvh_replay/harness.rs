@@ -59,6 +59,15 @@ pub struct Options {
     /// Run an incomplete capture anyway, for its output; the verdict stays
     /// CAPTURE INVALID.
     pub diagnose: bool,
+    /// Fill every byte no capture filled with this byte instead of
+    /// [`POISON`] (A2 separation test: undefined content vs. a race).
+    pub fill: Option<u8>,
+}
+
+/// The word that fills what no capture filled: [`POISON`], or `fill` in
+/// every byte.
+pub fn fill_word(fill: Option<u8>) -> u32 {
+    fill.map_or(POISON, |b| u32::from_ne_bytes([b; 4]))
 }
 
 impl Options {
@@ -72,6 +81,7 @@ impl Options {
             warp: false,
             dump: None,
             diagnose: false,
+            fill: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -82,6 +92,11 @@ impl Options {
                 "--card" => o.card_only = true,
                 "--warp" => o.warp = true,
                 "--diagnose" => o.diagnose = true,
+                "--fill" => {
+                    let v = it.next().context("--fill needs a byte (0x00..0xff)")?;
+                    let v = v.trim_start_matches("0x");
+                    o.fill = Some(u8::from_str_radix(v, 16).context("--fill: a hex byte")?);
+                }
                 "--dump" => {
                     o.dump = Some(PathBuf::from(it.next().context("--dump needs a folder")?))
                 }
@@ -91,7 +106,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--fill <hex byte>]"
             );
         }
         Ok(o)
@@ -472,7 +487,8 @@ fn run_once(gpu: &mut Gpu, l: &mut Loaded, o: &Options) -> anyhow::Result<RunRes
     const STAGE: u64 = 64 << 20;
     let upload = gpu.buffer(STAGE, D3D12_HEAP_TYPE_UPLOAD, false)?;
     let up = Gpu::map(&upload)?;
-    let fill = |words: &mut [u32]| words.fill(POISON);
+    let word = fill_word(o.fill);
+    let fill = |words: &mut [u32]| words.fill(word);
     // SAFETY: the mapped upload buffer, STAGE bytes.
     fill(unsafe { std::slice::from_raw_parts_mut(up.cast::<u32>(), (STAGE / 4) as usize) });
     let seg_list: Vec<(u32, u64)> = segs
@@ -863,6 +879,7 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
     );
     let mut gpu = Gpu::new(o.warp)?;
     println!("harness gpu: {}", super::adapter_text(&gpu.device));
+    println!("fill outside the captured pages: {:#010x}", fill_word(o.fill));
     println!("capture gpu: {}", c.meta("gpu").unwrap_or("?"));
     let why = unsupported(&c, o.all);
     if !why.is_empty() {
@@ -1143,4 +1160,25 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         started.elapsed().as_secs_f64()
     );
     Ok(if reproduced { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A2 separation test: `--fill` replaces the poison in every byte, and
+    /// without it the poison stays.
+    #[test]
+    fn the_fill_byte_replaces_the_poison_in_every_byte() {
+        assert_eq!(fill_word(None), POISON);
+        assert_eq!(fill_word(Some(0x00)), 0);
+        assert_eq!(fill_word(Some(0xcd)), 0xcdcd_cdcd);
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = Options::parse(&args(&["cap", "--fill", "0xcd"])).unwrap();
+        assert_eq!(o.fill, Some(0xcd));
+        let o = Options::parse(&args(&["cap", "--fill", "00"])).unwrap();
+        assert_eq!(o.fill, Some(0));
+        assert_eq!(Options::parse(&args(&["cap"])).unwrap().fill, None);
+        assert!(Options::parse(&args(&["cap", "--fill", "0x1ff"])).is_err());
+    }
 }
