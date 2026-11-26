@@ -2026,6 +2026,12 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
+/// Invariants of the copies (CPU and GPU writes, interleaved submissions),
+/// tested without game data.
+#[cfg(test)]
+#[path = "shadow_invariants.rs"]
+mod invariants;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
