@@ -218,9 +218,10 @@ fn pump(held: &mut Holding, why: Why) {
         let copies: Vec<String> = waits
             .iter()
             .map(|w| {
-                let copy = crate::shadow::find(w.address & !3, 8).map(|c| {
-                    let v = c.read_host(w.address & !3, 2);
-                    format!("copy {:#x?} holds {:#x}", c.range(), u64::from(v[0]) | u64::from(v[1]) << 32)
+                let copy = crate::shadow::find(w.address & !3, 8).and_then(|c| {
+                    let v = c.host_dwords(w.address & !3, 2, false)?;
+                    let side = if c.carded() { "CPU side" } else { "copy" };
+                    Some(format!("copy {:#x?} ({side}) holds {:#x}", c.range(), u64::from(v[0]) | u64::from(v[1]) << 32))
                 });
                 format!("{:#x}: title {:?}, {}", w.address, read(w.address, w.bytes), copy.unwrap_or_else(|| "no copy".into()))
             })

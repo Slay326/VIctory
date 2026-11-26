@@ -508,6 +508,22 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// `n` dwords of the copy at title address `address` as its CPU side
+    /// holds them (of a copy in the GPU's memory, what went up or came down
+    /// last), or, with `fetch`, as shaders left them (fetched from the GPU's
+    /// side first: only while no submission is on the GPU).
+    pub(crate) fn host_dwords(&self, address: u64, n: usize, fetch: bool) -> Option<Vec<u32>> {
+        let at = address.checked_sub(self.start)? as usize;
+        if at + 4 * n > self.len as usize {
+            return None;
+        }
+        if fetch {
+            crate::host::card_fetch(&[(self, at, at + 4 * n)]);
+        }
+        // SAFETY: inside the mapping (checked).
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() })
+    }
+
     /// `n` dwords of the copy at title address `address` (tests).
     #[cfg(test)]
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
