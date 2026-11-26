@@ -74,7 +74,7 @@ pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use memclass::{allocated as memclass_allocated, init as memclass_init};
+pub use memclass::{allocated as memclass_allocated, finish as memclass_finish, init as memclass_init};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped, title_memory_section,

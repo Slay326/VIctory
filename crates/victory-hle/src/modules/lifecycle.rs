@@ -586,6 +586,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // The memclass stream's END record and its last bytes (VICTORY_MEMCLASS).
+    #[cfg(windows)]
+    victory_gpu::memclass_finish();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }

@@ -288,6 +288,15 @@ pub(crate) fn frame_done() {
     }
 }
 
+/// The process ends (the title ended itself): the stream gets its END
+/// record (the last frame), what it holds goes to the file and the file
+/// closes. Again, or with classifying off: nothing.
+pub fn finish() {
+    if let Some(c) = global() {
+        c.finish();
+    }
+}
+
 /// Hook: the runtime allocated `[at, at + len)` (`watched`: write-watched,
 /// so the guards see the title's writes there).
 pub fn allocated(at: usize, len: usize, watched: bool) {
@@ -771,6 +780,14 @@ impl Classifier {
         r.cut(at, at.saturating_add(len), |m| m.kind == Kind::Section);
     }
 
+    /// See [`finish`].
+    pub(crate) fn finish(&self) {
+        if let Some(s) = &self.stream {
+            let frame = self.state.lock().unwrap_or_else(|e| e.into_inner()).frame;
+            s.finish(frame);
+        }
+    }
+
     /// Folds the frame's units into their regions (and logs, by time).
     pub(crate) fn frame_done(&self, now: std::time::Instant) {
         let shift = self.cfg.shift;
@@ -1123,6 +1140,31 @@ impl Stream {
 
     /// Ends frame `frame`: its records go to the file; past the frames
     /// asked for, the stream ends.
+    /// Ends the stream after frame `frame` (once: an ended stream stays
+    /// as it is).
+    fn finish(&self, frame: u32) {
+        if !self.on.swap(false, Relaxed) {
+            return;
+        }
+        let out = {
+            let mut b = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+            b.0.push(rec::END);
+            varint(&mut b.0, u64::from(frame));
+            std::mem::take(&mut b.0)
+        };
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut fh) = file.take() {
+            match fh.write_all(&out).and_then(|()| fh.flush()) {
+                Ok(()) => {
+                    self.written.fetch_add(out.len() as u64, Relaxed);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "victory_gpu::memclass", %error, "memclass stream: END not written");
+                }
+            }
+        }
+    }
+
     fn frame(&self, frame: u32, counters: [u64; 4]) {
         if !self.on.load(Relaxed) {
             return;

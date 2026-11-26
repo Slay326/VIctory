@@ -96,7 +96,7 @@ read as varints.
 | 4 | SYNC | `kind` u8 (0 up: title memory -> host copy; 1 back: GPU bytes -> title memory), `at` varint (absolute), `len` varint (bytes), `us` varint |
 | 5 | FRAME | `frame` varint (1, 2, ...; a presented frame ends here) |
 | 6 | REGION | `kind` u8 (0 virtual unwatched, 1 virtual watched, 2 section, 3 view), 4 varints: virtual `at, len, 0, 0`; section `handle, bytes, 0, 0`; view `at, len, section handle, offset` |
-| 7 | END | `frame` varint; the last record |
+| 7 | END | `frame` varint (the last frame); the last record. Written after `VICTORY_MEMCLASS_STREAM_FRAMES` frames, or when the title ends itself (`memclass::finish` in the runtime's process end, before TerminateProcess). A crash or kill leaves no END |
 | 8 | COUNTERS | follows every FRAME: 4 varints, totals since the stream began: `refreshes` (copystat `Refreshes`), `faults` (copystat `GuardFaults`), `copied` (bytes the submission refreshes copied, the part of the host line's "copies MB" that is not copy steps), `copy_steps` (copystat `CopyBytes`: copy/fill steps). copystat values are 0 in builds without `diagnostics`. |
 
 ### Ordering and meaning

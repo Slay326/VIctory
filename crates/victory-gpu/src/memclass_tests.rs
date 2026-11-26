@@ -407,6 +407,41 @@ fn decode(bytes: &[u8]) -> (u8, Vec<Record>) {
     }
 }
 
+/// A stream without a frame limit ends with END (the last frame) when the
+/// process ends; again, nothing changes and later records do not come.
+#[test]
+fn finish_ends_the_stream_once() {
+    let dir = std::env::temp_dir().join(format!("memclass-fin-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.vmcs");
+    let a = 0x13_0000_0000usize;
+    let c = Classifier::new(Config { stream: Some(path.clone()), stream_frames: 0, ..config(16) });
+    c.tag(f::GPU_W_MARK, a, K64);
+    frame(&c);
+    c.tag(f::CPU_W_TITLE, a, 1);
+    frame(&c);
+    c.tag(f::GPU_R_HEAP, a, 8);
+    c.finish();
+    let once = std::fs::read(&path).unwrap();
+    c.finish();
+    c.tag(f::GPU_W_MARK, a, K64);
+    frame(&c);
+    c.finish();
+    let bytes = std::fs::read(&path).unwrap();
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(bytes, once, "a second finish and later records change nothing");
+    let (_, records) = decode(&bytes);
+    let records = without_copystat(records);
+    assert_eq!(records.last(), Some(&Record::End(2)));
+    assert_eq!(
+        records.iter().rev().nth(1),
+        Some(&Record::Access { flag: f::GPU_R_HEAP, seq: 0, at: a as u64, len: 8 }),
+        "what was buffered after the last frame is written before END"
+    );
+    assert_eq!(records.iter().filter(|r| matches!(r, Record::End(_))).count(), 1);
+}
+
 /// The counters a frame record carries in this build: copystat's only in
 /// diagnostics builds (where other tests move them too: not compared).
 fn counters(copied: u64) -> [u64; 4] {
