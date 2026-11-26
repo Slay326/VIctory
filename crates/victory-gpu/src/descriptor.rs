@@ -473,9 +473,12 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 /// in them are what keeps resource-less views alive ([`sweep`]).
 static VIEW_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// `Views::touched` of a free entry (reused entries are touched anew).
+const FREE: u32 = u32::MAX;
+
 /// The frame stamp for `Views::touched`.
 fn frame_now() -> u32 {
-    crate::queue::presented() as u32
+    (crate::queue::presented() as u32).min(FREE - 1)
 }
 
 impl Views {
@@ -521,7 +524,10 @@ fn reclaim(views: &mut Views, live: &[u64], now: u32, grace: u32) -> usize {
     let mut freed = 0;
     let len = views.list.len().min(live.len() * 64);
     for i in 0..len {
-        if live[i / 64] >> (i % 64) & 1 != 0 || now.wrapping_sub(views.touched[i]) <= grace {
+        let touched = views.touched[i];
+        // Free entries are skipped without a lookup: with millions of them
+        // a sweep took 1-2 s under the lock (runs 20261126-130420, -132034).
+        if touched == FREE || live[i / 64] >> (i % 64) & 1 != 0 || now.wrapping_sub(touched) <= grace {
             continue;
         }
         let view = &views.list[i].0;
@@ -531,6 +537,7 @@ fn reclaim(views: &mut Views, live: &[u64], now: u32, grace: u32) -> usize {
         let view = view.clone();
         views.index.remove(&view);
         views.list[i].1 = views.list[i].1.wrapping_add(1).max(1);
+        views.touched[i] = FREE;
         views.free.push(i as u32);
         freed += 1;
     }
@@ -663,6 +670,9 @@ pub(crate) fn forget(resource: usize) {
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
+        if let Some(t) = views.touched.get_mut(i as usize) {
+            *t = FREE;
+        }
         views.free.push(i);
     }
 }
@@ -1038,6 +1048,7 @@ pub(crate) mod tests {
         assert_eq!(freed, 2, "entries 0 and 3: unnamed memory views, idle");
         assert_eq!(views.free, [0, 3]);
         assert_eq!(views.list[0].1, 2, "a new generation: old records go stale");
+        assert_eq!(views.touched[0], FREE, "marked free: later sweeps skip it without a lookup");
         assert_eq!(views.list[1].1, 1, "named by a heap");
         assert_eq!(views.list[2].1, 1, "a resource's view ends with the resource");
         assert_eq!(views.list[4].1, 1, "used within the grace");
@@ -1046,6 +1057,11 @@ pub(crate) mod tests {
         // Swept again: nothing more, freed entries are not freed twice.
         assert_eq!(reclaim(&mut views, &live, 200, 20), 1, "entry 4 idle by now");
         assert_eq!(reclaim(&mut views, &live, 300, 20), 0);
+        // Even with its view back in the index under another entry, a free
+        // entry is not freed again.
+        views.index.insert(placed(0), 0);
+        assert_eq!(reclaim(&mut views, &live, 400, 20), 0);
+        views.index.remove(&placed(0));
         assert_eq!(views.free, [0, 3, 4]);
     }
 
