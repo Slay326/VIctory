@@ -92,24 +92,25 @@ pub(crate) struct Shadow {
     slice: Option<Slice>,
 }
 
-/// Snapshot segments (offset, bytes) and the pieces compared.
+/// Snapshot segments (offset, bytes; sorted, disjoint, possibly touching)
+/// and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
+/// Snapshot memory kept for reuse (already touched, so no page faults),
+/// largest first.
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
+/// An empty buffer with room for `n` bytes, from the pool if it has one
+/// (the smallest that fits).
 fn pooled(n: usize) -> Vec<u8> {
+    if n < POOLED_LEAST {
+        return Vec::with_capacity(n);
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+    let fits = pool.partition_point(|v| v.capacity() >= n);
+    let mut v = match fits {
+        0 => Vec::with_capacity(n),
+        i => pool.remove(i - 1),
     };
     v.clear();
     v
@@ -119,18 +120,68 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
+    if v.capacity() < POOLED_LEAST {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let at = pool.partition_point(|p| p.capacity() >= v.capacity());
+    pool.insert(at, v);
     let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    let keep = pool
+        .iter()
+        .take_while(|v| {
+            total += v.capacity();
+            total <= POOL_BYTES
+        })
+        .count();
+    pool.truncate(keep);
+}
+
+/// Whether the snapshot kept every byte of `[from, to)` (offsets in the
+/// copy), in one segment or in touching ones.
+fn covered(segments: &[(usize, Vec<u8>)], from: usize, to: usize) -> bool {
+    let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+    let mut next = from;
+    while next < to {
+        let Some((at, bytes)) = segments.get(i).filter(|(at, _)| *at <= next) else {
+            return false;
+        };
+        next = at + bytes.len();
+        i += 1;
+    }
+    true
+}
+
+/// The snapshot's bytes `[from, to)` (offsets in the copy): a slice of the
+/// segment holding them, or put together in `scratch` from touching
+/// segments. None where a byte of it was not kept ([`covered`]).
+fn kept<'a>(segments: &'a [(usize, Vec<u8>)], from: usize, to: usize, scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+    let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+    let (at, bytes) = segments.get(i)?;
+    if *at > from {
+        return None;
+    }
+    if to <= at + bytes.len() {
+        return Some(&bytes[from - at..to - at]);
+    }
+    scratch.clear();
+    let mut next = from;
+    while next < to {
+        let (at, bytes) = segments.get(i).filter(|(at, _)| *at <= next)?;
+        let end = (at + bytes.len()).min(to);
+        scratch.extend_from_slice(&bytes[next - at..end - at]);
+        next = end;
+        i += 1;
+    }
+    Some(scratch)
 }
 
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
+
+/// Snapshot buffers smaller than this come from the allocator and do not
+/// go to the pool (small segments would take its big buffers).
+const POOLED_LEAST: usize = 64 << 10;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -340,34 +391,43 @@ impl Shadow {
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
-        // The segments the range overlaps or touches.
-        let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
-            && *at <= from
-            && to <= at + bytes.len()
-        {
+        // Only the parts no segment holds yet are taken from the copy, each
+        // as a segment of its own; what segments hold stays as it was taken
+        // (merging them into one copied the kept bytes again at each grown
+        // range: the world declares a 64 MiB copy piece by piece, 215 MB of
+        // snapshots per frame for it).
+        let first = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+        let mut gaps = Vec::new();
+        let mut at = from;
+        for (taken, bytes) in &segments[first..] {
+            if *taken >= to {
+                break;
+            }
+            if at < *taken {
+                gaps.push((at, *taken));
+            }
+            at = at.max(taken + bytes.len());
+        }
+        if at < to {
+            gaps.push((at, to));
+        }
+        if gaps.is_empty() {
             return;
         }
-        let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::SnapshotBytes, (end - start) as u64);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        let mut at = start;
-        for (taken, bytes) in segments.drain(first..last) {
-            grown.extend_from_slice(host(at, taken));
-            grown.extend_from_slice(&bytes);
-            at = taken + bytes.len();
-            give_back(bytes);
+        let mut index = first;
+        for (a, b) in gaps {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::SnapshotBytes, (b - a) as u64);
+                crate::copystat::snapshot(self.start, self.len, (b - a) as u64);
+            }
+            let mut bytes = pooled(b - a);
+            bytes.extend_from_slice(host(a, b));
+            index += segments[index..].partition_point(|(taken, _)| *taken < a);
+            segments.insert(index, (a, bytes));
         }
-        grown.extend_from_slice(host(at, end));
-        segments.insert(first, (start, grown));
     }
 
     /// `[address, address + len)` expanded outward to 64 KiB page
@@ -411,11 +471,11 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
+        let mut scratch = Vec::new();
+        if back
             && from < to
+            && covered(segments, from, to)
         {
-            let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -429,7 +489,6 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -438,6 +497,10 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                let Some(old) = kept(segments, at, at + n, &mut scratch) else {
+                    at += n;
+                    continue;
+                };
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -1460,7 +1523,7 @@ pub(crate) mod tests {
         copy.writing(p + PAGE, 2 * PAGE, false);
         copy.writing(p + PAGE, PAGE, false);
         copy.writing(p + 80, 8, false);
-        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "merged where they overlap or touch");
+        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "only the parts not kept yet");
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
@@ -1472,6 +1535,49 @@ pub(crate) mod tests {
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
+        assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
+        unregister(p, p as u64);
+    }
+
+    /// A range grown over parts kept before takes only the bytes not kept
+    /// yet (no byte twice, however often ranges grow), keeps the earlier
+    /// parts as they were taken, and goes back across the touching
+    /// segments as one range would.
+    #[test]
+    fn growing_ranges_keep_each_byte_once_and_go_back_across_segments() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let segments = |s: &Shadow| s.before.lock().unwrap().0.len();
+        copy.writing(p + 100, 100, false);
+        copy.writing(p + 300, 100, false);
+        copy.writing(p, PAGE + 50, false);
+        copy.writing(p + 50, 2 * PAGE - 50, false);
+        assert_eq!(bytes(&copy), 2 * PAGE, "each byte once");
+        assert_eq!(segments(&copy), 6, "the parts taken, apart");
+        // The GPU writes in several segments of each page.
+        copy.write_host((p + 10) as u64, &[1]);
+        copy.write_host((p + 150) as u64, &[2]);
+        copy.write_host((p + 250) as u64, &[3]);
+        copy.write_host((p + PAGE - 1) as u64, &[4]);
+        copy.write_host((p + PAGE + 100) as u64, &[5]);
+        assert_eq!(copy.copy_back(p, PAGE + 50), PAGE, "the first page written");
+        assert_eq!(copy.copy_back(p + 100, 100), 0, "compared once");
+        assert_eq!(copy.copy_back(p + 300, 100), 0);
+        // The second page's piece starts in a part of the first range.
+        assert_eq!(copy.copy_back(p + 50, 2 * PAGE - 50), PAGE, "the second page written");
+        // SAFETY: our pool.
+        let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        assert_eq!(
+            [title(p + 10), title(p + 150), title(p + 250), title(p + PAGE - 1), title(p + PAGE + 100)],
+            [1, 2, 3, 4, 5]
+        );
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
     }
