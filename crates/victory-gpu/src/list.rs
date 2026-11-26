@@ -584,6 +584,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }) {
             host.push(UAV_BARRIER);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::capture::enabled() && host.iter().any(|b| b.kind == 2) {
+            list.note_bvh_barrier();
+        }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());

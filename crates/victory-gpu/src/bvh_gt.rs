@@ -84,11 +84,14 @@ pub(crate) fn reader_target() -> Option<&'static str> {
 struct Last {
     submission: u64,
     headers: Vec<u64>,
+    /// Each header's validity in G and the class of its first reason
+    /// ([`why_class`]), for the two-point check in [`reader_check`].
+    g: Vec<(bool, String)>,
     /// Copy (none: an arena page), page, where its bytes start.
     pages: Vec<(Option<Arc<Shadow>>, usize, usize)>,
 }
 
-static LAST: std::sync::Mutex<Last> = std::sync::Mutex::new(Last { submission: 0, headers: Vec::new(), pages: Vec::new() });
+static LAST: std::sync::Mutex<Last> = std::sync::Mutex::new(Last { submission: 0, headers: Vec::new(), g: Vec::new(), pages: Vec::new() });
 static READER_CHECKS: AtomicU64 = AtomicU64::new(0);
 
 /// What kind of structure a header's dword 0 names: still packed, a top
@@ -104,6 +107,12 @@ fn kind(d0: u32, bounds_start: bool) -> &'static str {
     } else {
         "bottom"
     }
+}
+
+/// The kind of the structure whose header is at `at` ([`kind`]).
+pub(crate) fn header_kind(read: &dyn Fn(u64) -> Option<u32>, at: u64) -> &'static str {
+    let start = (4..10).any(|i| read(at + 4 * i).is_some_and(|w| f32::from_bits(w).abs() == f32::MAX));
+    kind(read(at).unwrap_or(0), start)
 }
 
 /// After submission `submission`, whose lists bound the reader program: the
@@ -123,7 +132,11 @@ pub(crate) fn reader_check(submission: u64) {
     let mut by_kind: std::collections::BTreeMap<&str, (u32, u32)> = std::collections::BTreeMap::new();
     let mut first = Vec::new();
     let (mut outside, mut origin) = (0u32, 0u32);
-    for &at in &last.headers {
+    // Two-point check of bottom-level structures (by kind in the readers'
+    // bytes): valid or not in G and for the readers, and whether an invalid
+    // one fails for the same class of reason at both points.
+    let mut pair = [0u32; 5];
+    for (n, &at) in last.headers.iter().enumerate() {
         let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
         if !is_header(d0, d1) {
             let e = by_kind.entry("gone").or_default();
@@ -136,6 +149,13 @@ pub(crate) fn reader_check(submission: u64) {
         if k == "bottom" {
             outside += c.outside;
             origin += c.origin;
+            if let Some((g_valid, g_class)) = last.g.get(n) {
+                let i = usize::from(!*g_valid) * 2 + usize::from(!c.valid);
+                pair[i] += 1;
+                if !*g_valid && !c.valid && *g_class == why_class(c.why.as_deref()) {
+                    pair[4] += 1;
+                }
+            }
         }
         let e = by_kind.entry(k).or_default();
         e.0 += 1;
@@ -175,6 +195,32 @@ pub(crate) fn reader_check(submission: u64) {
         kinds.join(", "),
         first.join(", "),
     );
+    let mut total = TWO_POINT.lock().unwrap_or_else(|e| e.into_inner());
+    for (t, p) in total.iter_mut().zip(pair) {
+        *t += u64::from(p);
+    }
+    tracing::info!(
+        target: "victory_gpu::bvh_gt",
+        "BVH GT two-point s{submission} (builder s{}): bottom G valid -> reader valid {}, G valid -> reader invalid {}, G invalid -> reader valid {}, G invalid -> reader invalid {} (same class {}); run so far {} / {} / {} / {} (same class {})",
+        last.submission,
+        pair[0], pair[1], pair[2], pair[3], pair[4],
+        total[0], total[1], total[2], total[3], total[4],
+    );
+}
+
+/// Two-point totals of the run ([`reader_check`]): G valid and reader
+/// valid, G valid and reader invalid, G invalid and reader valid, both
+/// invalid, both invalid for the same class of reason.
+static TWO_POINT: std::sync::Mutex<[u64; 5]> = std::sync::Mutex::new([0; 5]);
+
+/// The class of a validator reason: its words without the numbers and
+/// addresses in it ("child box of outside 's", "root (size", ...).
+pub(crate) fn why_class(why: Option<&str>) -> String {
+    why.unwrap_or("")
+        .split_whitespace()
+        .filter(|w| !w.chars().any(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `VICTORY_BVH_GT_DUMPS` (3): invalid headers per submission whose raw
@@ -268,6 +314,7 @@ impl Gt {
         if reader_target().is_some() && !g.headers.is_empty() {
             let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
             last.headers = g.headers.iter().map(|(at, _)| *at).collect();
+            last.g = g.headers.iter().map(|(_, c)| (c.valid, why_class(c.why.as_deref()))).collect();
             last.pages = pages.iter().map(|p| (p.copy.clone(), p.page, p.from)).collect();
             last.submission = submission;
         }
@@ -525,7 +572,7 @@ impl Scan {
 }
 
 /// Dwords at title addresses from `pages` (start, bytes).
-fn reader<'a, B: AsRef<[u8]>>(pages: &'a [(usize, B)]) -> impl Fn(u64) -> Option<u32> + 'a {
+pub(crate) fn reader<'a, B: AsRef<[u8]>>(pages: &'a [(usize, B)]) -> impl Fn(u64) -> Option<u32> + 'a {
     move |at: u64| {
         let at = at as usize;
         pages.iter().find_map(|(from, b)| {
@@ -775,6 +822,17 @@ mod tests {
 
     fn read_of(words: &[u32], base: u64) -> impl Fn(u64) -> Option<u32> + '_ {
         move |at| words.get(at.checked_sub(base)? as usize / 4).copied()
+    }
+
+    #[test]
+    fn a_reasons_class_drops_its_addresses_and_numbers() {
+        let a = why_class(Some("child box of 0x1234 outside 0x40's"));
+        let b = why_class(Some("child box of 0x99 outside 0x80's"));
+        assert_eq!(a, b);
+        assert_eq!(a, "child box of outside");
+        assert_ne!(a, why_class(Some("child 0x12 of 0x40 past the size")));
+        assert_eq!(why_class(Some("root +48 0xa4c (size 0x5240)")), "root (size");
+        assert_eq!(why_class(None), "");
     }
 
     #[test]

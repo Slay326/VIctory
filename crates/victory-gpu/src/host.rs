@@ -1164,6 +1164,14 @@ struct Deferred {
     /// builder wrote through views of title buffers larger than
     /// [`crate::arena::BACK`]: they stay out of title memory.
     on_card: Vec<(usize, usize, usize)>,
+    /// With `VICTORY_BVH_CAPTURE`: the list's dispatches as recorded, and
+    /// its page bitmaps' set bits once it has run (`crate::bvh_replay`).
+    #[cfg(feature = "diagnostics")]
+    bvh: Vec<crate::bvh_replay::capture::Recorded>,
+    #[cfg(feature = "diagnostics")]
+    bvh_bitmaps: Vec<Box<dyn Fn() -> (usize, Vec<u32>) + Send>>,    /// A UAV barrier was recorded since the last recorded dispatch.
+    #[cfg(feature = "diagnostics")]
+    bvh_barrier: bool,
 }
 
 impl Host {
@@ -1409,6 +1417,30 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // `VICTORY_BVH_CAPTURE`: a submission to capture runs in two parts,
+        // up to the builder's first list (with its prelude) and the rest;
+        // the pages are taken between them (`crate::bvh_replay::capture`).
+        #[cfg(feature = "diagnostics")]
+        let capture_at = if timing() {
+            None
+        } else {
+            crate::bvh_replay::capture::due(runs).map(|first| (first, firsts.get(first + 1).copied().unwrap_or(lists.len()) - 1))
+        };
+        #[cfg(feature = "diagnostics")]
+        let mut capture_pending = None;
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = match capture_at {
+            Some((first, 0)) => {
+                capture_pending = crate::bvh_replay::capture::pre(runs, first, *submitted + 1);
+                groups
+            }
+            Some((_, k)) => vec![&lists[..k], &lists[k..]],
+            None => groups,
+        };
+        #[cfg(feature = "diagnostics")]
+        let split = matches!(capture_at, Some((_, k)) if k > 0);
+        #[cfg(not(feature = "diagnostics"))]
+        let split = false;
         let mut removed_in = None;
         // Whether the bitmaps were fetched from the GPU's memory (not
         // without groups: timing a submission of no lists).
@@ -1443,13 +1475,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
+            if groups.len() > 1 && !split {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if groups.len() > 1 && !split && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -1459,10 +1491,16 @@ impl Host {
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            if groups.len() > 1 && !split && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 removed_in = Some(i);
             }
-            let _ = (i, started);
+            #[cfg(feature = "diagnostics")]
+            if split && i == 0
+                && let Some((first, _)) = capture_at
+            {
+                capture_pending = crate::bvh_replay::capture::pre(runs, first, *submitted);
+            }
+            let _ = (i, started, split);
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
@@ -1498,6 +1536,11 @@ impl Host {
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         // Ranges the BVH builder wrote that stay on the card (`crate::arena`).
         let mut kept_on_card: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
+        // `VICTORY_BVH_CAPTURE`: G of the marked pages, before anything goes back.
+        #[cfg(feature = "diagnostics")]
+        if let Some(pending) = capture_pending {
+            crate::bvh_replay::capture::post(pending, runs);
+        }
         // With `VICTORY_BVH_GT`: G of the pages the named program's lists
         // wrote, before anything goes back.
         let gt_target = crate::bvh_gt::target();
@@ -2345,6 +2388,68 @@ impl HostList {
     /// once the list has run, before the copy-backs clear it.
     pub(crate) fn defer_gt(&self, marks: impl Fn() -> crate::bvh_gt::Marks + Send + 'static) {
         self.deferred().gt.push(Box::new(marks));
+    }
+
+    /// With `VICTORY_BVH_CAPTURE`: a dispatch as recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn push_bvh(&self, record: crate::bvh_replay::capture::Recorded) {
+        self.deferred().bvh.push(record);
+    }
+
+    /// With `VICTORY_BVH_CAPTURE`: `read` gives a page bitmap's heap key and
+    /// set bits once the list has run, before the copy-backs clear it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_bvh_bitmap(&self, read: impl Fn() -> (usize, Vec<u32>) + Send + 'static) {
+        self.deferred().bvh_bitmaps.push(Box::new(read));
+    }
+
+    /// With `VICTORY_BVH_CAPTURE`: a UAV barrier was recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_bvh_barrier(&self) {
+        self.deferred().bvh_barrier = true;
+    }
+
+    /// Whether a UAV barrier came since the last call.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn take_bvh_barrier(&self) -> bool {
+        std::mem::take(&mut self.deferred().bvh_barrier)
+    }
+
+    /// The dispatches [`HostList::push_bvh`] recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bvh_records(&self) -> Vec<crate::bvh_replay::capture::Recorded> {
+        self.deferred().bvh.clone()
+    }
+
+    /// What the bitmaps [`HostList::defer_bvh_bitmap`] named hold now.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bvh_bitmaps(&self) -> Vec<(usize, Vec<u32>)> {
+        self.deferred().bvh_bitmaps.iter().map(|f| f()).collect()
+    }
+
+    /// The view heaps whose page tables the list reads (`crate::memory`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn memory_keys(&self) -> Vec<usize> {
+        self.deferred()
+            .copies
+            .iter()
+            .filter_map(|s| match s {
+                Step::Memory(key) => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Title ranges (address, bytes) the list's refreshes brought up to date.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn refreshed_ranges(&self) -> Vec<(u64, u64)> {
+        self.deferred().refreshed.iter().map(|&(_, a, n)| (a as u64, n as u64)).collect()
+    }
+
+    /// The texts [`HostList::note_op`] kept (with device-removed data on).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_texts(&self) -> Vec<String> {
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(t, _)| t.clone()).collect()
     }
 
     /// Whether the list bound a pipeline whose name holds `part` (a shader
