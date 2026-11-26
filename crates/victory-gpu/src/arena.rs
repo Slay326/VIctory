@@ -564,10 +564,10 @@ pub(crate) fn want_region(l1: usize) {
 
 /// Whether the builder's writes to title buffers that do not go back stay
 /// in their copies instead of taking title memory's bytes again
-/// (`VICTORY_BVH_ARENA_KEEP`, on with the arena).
+/// (`VICTORY_BVH_ARENA_KEEP=1`; off by default: run 162252 crashed the title\r\n/// after 217 s reading 0xffffffffffffffff, kept builder bytes went back with\r\n/// later copy-backs of the same pages, and misses rose to 54,517).
 pub(crate) fn keep_builder_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    enabled() && *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_KEEP").is_ok_and(|v| v.trim() == "0"))
+    enabled() && *ON.get_or_init(|| std::env::var("VICTORY_BVH_ARENA_KEEP").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Arena pages shaders wrote (by title address): the title's writes there
