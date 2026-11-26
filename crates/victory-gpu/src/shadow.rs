@@ -1489,7 +1489,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     // Pages on their own go back on several threads at once (each is read,
     // compared and written apart from the others: ~25 us a page, ~70 ms of
     // a world frame on one thread, run 20261125-231403). A page two of the
-    // marked copies hold, or one that shows elsewhere too
+    // marked copies hold, or one whose memory another marked page shows too
     // (`crate::watch::title_memory_aliased`), goes back after them, in the
     // order it had: a copy-back there is seen by the other copy's.
     let alone = pages_alone(&pages.iter().map(|(_, page)| page / PAGE).collect::<Vec<_>>());
@@ -1542,14 +1542,18 @@ fn back_threads() -> usize {
 }
 
 /// For each of `pages` (page numbers): whether no other of them is the same
-/// page and the page shows nowhere else.
+/// page or shows the same memory at another address.
 fn pages_alone(pages: &[usize]) -> Vec<bool> {
     let mut count: std::collections::HashMap<usize, u32> = std::collections::HashMap::with_capacity(pages.len());
     for &page in pages {
         *count.entry(page).or_default() += 1;
     }
-    let aliased = crate::watch::aliased(pages);
-    pages.iter().zip(aliased).map(|(page, aliased)| !aliased && count[page] == 1).collect()
+    let elsewhere = crate::watch::shown_elsewhere(pages);
+    pages
+        .iter()
+        .zip(elsewhere)
+        .map(|(page, elsewhere)| count[page] == 1 && !elsewhere.iter().any(|other| count.contains_key(other)))
+        .collect()
 }
 
 struct Entry {
@@ -1892,15 +1896,16 @@ pub(crate) mod tests {
     use super::*;
 
     /// Marked pages go back on several threads only where each is on its
-    /// own: not a page two marked copies hold, nor one that shows elsewhere.
+    /// own: not a page two marked copies hold, nor two showing one memory.
     #[test]
     fn pages_two_copies_hold_or_shown_elsewhere_go_back_in_order() {
         // Page numbers no test's memory has (addresses past user space).
         let base = 0x7fff_0000_0000usize;
         let (a, b, c, d, e) = (base, base + 1, base + 2, base + 3, base + 4);
         crate::watch::title_memory_aliased(d * PAGE, &[e * PAGE]);
-        assert_eq!(pages_alone(&[a, b, a, c, d]), [false, true, false, true, false]);
-        assert_eq!(pages_alone(&[e, c]), [false, true]);
+        assert_eq!(pages_alone(&[a, b, a, c, d]), [false, true, false, true, true]);
+        assert_eq!(pages_alone(&[e, c]), [true, true]);
+        assert_eq!(pages_alone(&[d, c, e]), [false, true, false]);
         crate::watch::title_memory_remapped(d * PAGE, PAGE);
         assert_eq!(pages_alone(&[d, e]), [true, true]);
     }

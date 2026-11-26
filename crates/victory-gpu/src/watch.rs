@@ -251,11 +251,11 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// For each of `pages` (page numbers): whether it shows memory another
-/// page shows too ([`title_memory_aliased`]).
-pub(crate) fn aliased(pages: &[usize]) -> Vec<bool> {
+/// For each of `pages` (page numbers): the other pages showing the same
+/// memory ([`title_memory_aliased`]).
+pub(crate) fn shown_elsewhere(pages: &[usize]) -> Vec<Vec<usize>> {
     let g = guards();
-    pages.iter().map(|page| g.alias_of.contains_key(page)).collect()
+    pages.iter().map(|page| g.alias_of.get(page).cloned().unwrap_or_default()).collect()
 }
 
 /// Guards the other mappings of taken pages.
