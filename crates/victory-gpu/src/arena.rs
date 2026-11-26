@@ -83,6 +83,13 @@ fn most_pages() -> u32 {
     (number("VICTORY_BVH_ARENA_MB", 2048) << 20).div_ceil(PAGE).min(u64::from(u32::MAX)) as u32
 }
 
+/// The most bytes of one builder pool given whole ([`want_around`];
+/// `VICTORY_BVH_ARENA_AROUND_MB`, 4096).
+fn around_most() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_ARENA_AROUND_MB", 4096) << 20)
+}
+
 /// The most new pages a submission gives (`VICTORY_BVH_ARENA_STEP`, 4096).
 fn step_pages() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
@@ -90,10 +97,11 @@ fn step_pages() -> usize {
 }
 
 /// Whether reserved memory with nothing committed gets (zero) pages
-/// (`VICTORY_BVH_ARENA_RESERVED`, on).
+/// (`VICTORY_BVH_ARENA_RESERVED=1`; off: run 20261126-125814 gave 12,019 of
+/// 16,384 pages to such addresses, computed from zeros, before the pools').
 fn reserved_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("VICTORY_BVH_ARENA_RESERVED").is_ok_and(|v| v.trim() == "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_ARENA_RESERVED").is_ok_and(|v| v.trim() == "1"))
 }
 
 fn refresh_on() -> bool {
@@ -213,6 +221,11 @@ struct Stats {
     fill_us: u64,
     refresh_us: u64,
     asked: u64,
+    /// Pages at committed addresses of the host's memory (not given).
+    host: u64,
+    /// Builder pools given whole before their first run, and their pages.
+    around_runs: u64,
+    around: u64,
 }
 
 struct Arena {
@@ -220,6 +233,10 @@ struct Arena {
     chunks: Vec<ID3D12Resource>,
     /// Pages (numbers) and regions asked for since the last [`provide`].
     wanted: BTreeSet<u64>,
+    /// Root descriptor addresses of the builder whose runs are wanted whole
+    /// ([`want_around`]), and the runs already given (start).
+    around: BTreeSet<u64>,
+    around_done: HashSet<u64>,
     wanted_regions: BTreeSet<usize>,
     /// Pages with no memory at their address when asked (not asked again).
     nothing: HashSet<u64>,
@@ -250,6 +267,8 @@ fn new_arena() -> Arena {
         dir: Directory::new(most_pages()),
         chunks: Vec::new(),
         wanted: BTreeSet::new(),
+        around: BTreeSet::new(),
+        around_done: HashSet::new(),
         wanted_regions: BTreeSet::new(),
         nothing: HashSet::new(),
         watched: BTreeMap::new(),
@@ -338,6 +357,22 @@ pub(crate) fn want_pages(addresses: &[u64]) {
     });
 }
 
+/// The BVH builder is recorded with a root descriptor at `address`, which
+/// no copy holds: the committed run of title memory around it (its pool)
+/// gets arena pages before the submission runs, so its first run reads the
+/// pool's bytes instead of zeros (with zeros its bottom-up stage loops on
+/// parent links 0 for seconds: runs 125619/125814, 24-25 s submissions).
+pub(crate) fn want_around(address: u64) {
+    if !enabled() {
+        return;
+    }
+    with(|a| {
+        if a.dir.get(address / PAGE).is_none() {
+            a.around.insert(address);
+        }
+    });
+}
+
 /// A list reached memory in 256 MiB region `l1`, which has no block.
 pub(crate) fn want_region(l1: usize) {
     with(|a| {
@@ -379,6 +414,8 @@ pub(crate) fn view() -> View {
 enum Memory {
     Free,
     Reserved,
+    /// Committed, but the host's (not the title's).
+    Host,
     /// Committed; the allocation's base and whether the page is
     /// write-watched.
     Committed(usize, bool),
@@ -399,7 +436,25 @@ fn memory_at(address: u64) -> Memory {
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
     // SAFETY: room for one answer; no reset, so nothing changes.
     let watched = unsafe { GetWriteWatch(0, address as *const _, PAGE as usize, (&raw mut found).cast(), &mut count, &mut granularity) == 0 };
+    // The title's memory: its private allocations are write-watched, its
+    // physical pages mapped views; the host's own (heaps, images) is neither.
+    if !watched && info.Type != windows_sys::Win32::System::Memory::MEM_MAPPED {
+        return Memory::Host;
+    }
     Memory::Committed(info.AllocationBase as usize, watched)
+}
+
+/// The committed run of title memory around `address`: start and bytes.
+fn committed_around(address: u64) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data, all zeros is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: plain data filled in by the query.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    if n == 0 || info.State != MEM_COMMIT || !matches!(memory_at(address), Memory::Committed(..)) {
+        return None;
+    }
+    Some((info.BaseAddress as u64, info.RegionSize as u64))
 }
 
 /// Whether any memory (reserved or committed) lies in 256 MiB region `l1`.
@@ -453,8 +508,24 @@ pub(crate) fn provide() {
         }
     }
     let started = std::time::Instant::now();
-    let wanted = std::mem::take(&mut a.wanted);
+    let mut wanted = std::mem::take(&mut a.wanted);
     let mut fills: Vec<(Slot, u64)> = Vec::new();
+    // The builder's pools first, whole and in this submission.
+    let mut first: Vec<(u64, Memory)> = Vec::new();
+    for address in std::mem::take(&mut a.around) {
+        let Some((start, len)) = committed_around(address) else { continue };
+        if !a.around_done.insert(start) {
+            continue;
+        }
+        let len = len.min(around_most());
+        a.stats.around_runs += 1;
+        for page in start / PAGE..(start + len).div_ceil(PAGE) {
+            if a.dir.get(page).is_none() {
+                wanted.remove(&page);
+                first.push((page, memory_at(page * PAGE)));
+            }
+        }
+    }
     // Committed memory first, then reserved (zero pages): addresses computed
     // from zeros land in reservations too, and must not take the budget
     // before the pools' pages do.
@@ -467,15 +538,15 @@ pub(crate) fn provide() {
             a.stats.refused += 1;
             continue;
         }
-        if looked >= 4 * step_pages() {
-            a.wanted.insert(page);
-            continue;
-        }
         looked += 1;
         match memory_at(page * PAGE) {
             Memory::Free => {
                 a.nothing.insert(page);
                 a.stats.nothing += 1;
+            }
+            Memory::Host => {
+                a.nothing.insert(page);
+                a.stats.host += 1;
             }
             Memory::Reserved if !reserved_on() => {
                 a.nothing.insert(page);
@@ -485,9 +556,11 @@ pub(crate) fn provide() {
             m @ Memory::Committed(..) => committed.push((page, m)),
         }
     }
+    let _ = looked;
+    let around_pages = first.len();
     let mut given = 0;
-    for (page, memory) in committed.into_iter().chain(reserved) {
-        if given >= step_pages() {
+    for (k, (page, memory)) in first.into_iter().chain(committed).chain(reserved).enumerate() {
+        if k >= around_pages && given >= step_pages() {
             a.wanted.insert(page);
             continue;
         }
@@ -515,7 +588,11 @@ pub(crate) fn provide() {
         }
         match a.dir.add(page) {
             Ok((slot, _)) => {
-                given += 1;
+                if k < around_pages {
+                    a.stats.around += 1;
+                } else {
+                    given += 1;
+                }
                 a.generation += 1;
                 if let Memory::Committed(base, watched) = memory {
                     if watched {
@@ -718,15 +795,18 @@ pub(crate) fn log_frame() {
     let mut guard = arena();
     let Some(a) = guard.as_mut() else { return };
     let s = std::mem::take(&mut a.stats);
-    if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed == 0 {
+    if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs == 0 {
         return;
     }
     let (kept_out, kept_out_bytes) = crate::shadow::card_refused();
     tracing::info!(
         target: "victory_gpu::arena",
-        "BVH arena this frame: pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, no memory there {}, \
+        "BVH arena this frame: builder pools given whole {} ({} pages); pages asked {} -> new {} ({} from title memory, {} zero, {:.1} ms), refused {}{}, \
+         no memory there {}, host memory {}, \
          regions given a block {}; arena pages written by shaders {} (stay on the card); title writes sent up {} pieces ({:.1} ms); \
          total {} pages = {} MB in {} chunks of {} MB budget, {} regions, {} waiting; title buffer copies kept in system memory by the cap {} ({} MB)",
+        s.around_runs,
+        s.around,
         s.asked,
         s.filled + s.zero,
         s.filled,
@@ -735,6 +815,7 @@ pub(crate) fn log_frame() {
         s.refused,
         a.stopped.as_deref().map(|w| format!(" (stopped: {w})")).unwrap_or_default(),
         s.nothing,
+        s.host,
         s.regions,
         s.writes,
         s.refreshed,
@@ -825,6 +906,14 @@ pub(crate) mod tests {
         assert_eq!(memory_at(reserved), Memory::Reserved);
         assert_eq!(memory_at(committed), Memory::Committed(committed as usize, true));
         assert!(region_has_memory((reserved >> 28) as usize));
+        // The host's own memory (not write-watched, not a view) is no
+        // title memory.
+        let heap = Box::new([0u8; 1 << 17]);
+        assert_eq!(memory_at(heap.as_ptr() as u64), Memory::Host);
+        assert_eq!(committed_around(heap.as_ptr() as u64), None);
+        // A pool: its committed run.
+        assert_eq!(committed_around(committed + 16), Some((committed, PAGE)));
+        assert_eq!(committed_around(reserved), None);
         // SAFETY: ours.
         unsafe {
             VirtualFree(reserved as *mut _, 0, MEM_RELEASE);

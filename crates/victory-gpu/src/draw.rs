@@ -751,7 +751,19 @@ impl State {
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
+                // `VICTORY_BVH_ARENA`: the builder's root descriptors into
+                // memory no copy holds (its pools) get arena pages before
+                // this submission runs.
+                let builder_pools = crate::arena::enabled() && crate::pipeline::is_builder(self.pipeline as This);
                 for u in &t.host.user_data {
+                    if builder_pools
+                        && u.root == RootType::Descriptor
+                        && u.dword == 0
+                        && let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot))
+                        && crate::shadow::find(*address, 1).is_none()
+                    {
+                        crate::arena::want_around(*address);
+                    }
                     if u.root == RootType::Descriptor
                         && u.dword == 0
                         && let Some(Root::View(address)) =
