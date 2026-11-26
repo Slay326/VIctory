@@ -286,6 +286,9 @@ struct Arena {
     faults: u64,
     /// A builder dispatch was recorded since the last [`provide`].
     builder_now: bool,
+    /// Input scans so far, and when each input buffer was last scanned.
+    scans: u64,
+    scanned_at: BTreeMap<(u64, u64), u64>,
     /// Title buffers (copies) the builder's root views point into: its
     /// input lists, scanned for structure addresses before it runs.
     inputs: BTreeSet<(u64, u64)>,
@@ -321,6 +324,8 @@ fn new_arena() -> Arena {
         capped: false,
         faults: 0,
         builder_now: false,
+        scans: 0,
+        scanned_at: BTreeMap::new(),
         inputs: BTreeSet::new(),
         stage: None,
         stats: Stats::default(),
@@ -634,7 +639,8 @@ pub(crate) fn provide() {
         // shared memory on a 12 GB card, run 140104).
         a.capped = true;
         if let Some((local, ..)) = host.memory_usage() {
-            a.dir.most = a.dir.most.min((local / 8 / PAGE) as u32);
+            let share = number("VICTORY_BVH_ARENA_SHARE", 8).max(1);
+            a.dir.most = a.dir.most.min((local / share / PAGE) as u32);
         }
         tracing::info!(target: "victory_gpu::arena", pages = a.dir.most, "BVH arena budget: {} MB", (u64::from(a.dir.most) * PAGE) >> 20);
     }
@@ -866,7 +872,21 @@ fn chunk_refused(host: &crate::host::Host, k: usize) -> Option<String> {
 fn scan_inputs(a: &mut Arena) -> BTreeSet<u64> {
     let mut found = BTreeSet::new();
     let mut buffer = vec![0u8; 4 << 20];
-    for &(start, len) in &a.inputs {
+    // Input lists, not every big buffer a root view lands in (run 145457
+    // scanned 3.6 GB a frame), each again only every 32nd scan.
+    a.scans += 1;
+    let scans = a.scans;
+    let due: Vec<(u64, u64)> = a
+        .inputs
+        .iter()
+        .copied()
+        .filter(|&(_, len)| len <= 128 << 20)
+        .filter(|range| a.scanned_at.get(range).is_none_or(|&at| scans - at >= 32))
+        .collect();
+    for &range in &due {
+        a.scanned_at.insert(range, scans);
+    }
+    for &(start, len) in &due {
         let mut at = start;
         while at < start + len && found.len() < 1 << 16 {
             let n = (start + len - at).min(buffer.len() as u64) as usize;
