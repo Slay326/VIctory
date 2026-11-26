@@ -72,16 +72,19 @@ static COMPARED: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct Marks {
     /// Pages a copy holds: the copy and the page's title address.
     pub(crate) owned: Vec<(Arc<Shadow>, usize)>,
+    /// Pages in the BVH arena (`crate::arena`): their title addresses.
+    pub(crate) arena: Vec<usize>,
     pub(crate) missed_pages: u64,
     pub(crate) missed_regions: u64,
     pub(crate) first_missed: Vec<u64>,
 }
 
-/// A page compared: where its bytes start, its copy and page, G.
+/// A page compared: where its bytes start, its copy (none for an arena
+/// page) and page, G.
 struct Page {
     from: usize,
     page: usize,
-    copy: Arc<Shadow>,
+    copy: Option<Arc<Shadow>>,
     g: Vec<u8>,
 }
 
@@ -90,6 +93,9 @@ pub(crate) struct Gt {
     submission: u64,
     lists: usize,
     marked: usize,
+    /// Arena pages written, and of them compared.
+    arena_marked: usize,
+    arena_compared: usize,
     pages: Vec<Page>,
     missed_pages: u64,
     missed_regions: u64,
@@ -109,8 +115,10 @@ impl Gt {
             return None;
         }
         let (mut owned, mut missed_pages, mut missed_regions, mut first_missed) = (Vec::new(), 0, 0, Vec::new());
+        let mut arena = Vec::new();
         for m in marks {
             owned.extend(m.owned);
+            arena.extend(m.arena);
             missed_pages += m.missed_pages;
             missed_regions += m.missed_regions;
             first_missed.extend(m.first_missed.into_iter().take(3usize.saturating_sub(first_missed.len())));
@@ -118,19 +126,28 @@ impl Gt {
         owned.sort_by_key(|(c, page)| (*page, Arc::as_ptr(c) as usize));
         owned.dedup_by_key(|(c, page)| (*page, Arc::as_ptr(c) as usize));
         let marked = owned.len();
-        let pages: Vec<Page> = owned
+        arena.sort_unstable();
+        arena.dedup();
+        let arena_marked = arena.len();
+        // Arena pages first: with the arena on, the builder's structures
+        // are there.
+        let wanted: Vec<u64> = arena.iter().take(most_pages()).map(|&p| p as u64).collect();
+        let mut pages: Vec<Page> = crate::arena::fetch(&wanted)
             .into_iter()
-            .take(most_pages())
-            .filter_map(|(copy, page)| {
-                let (from, g) = copy.gpu_bytes(page)?;
-                Some(Page { from, page, copy, g })
-            })
+            .map(|(at, g)| Page { from: at as usize, page: at as usize, copy: None, g })
             .collect();
+        let arena_compared = pages.len();
+        pages.extend(owned.into_iter().take(most_pages().saturating_sub(arena_compared)).filter_map(|(copy, page)| {
+            let (from, g) = copy.gpu_bytes(page)?;
+            Some(Page { from, page, copy: Some(copy), g })
+        }));
         let g = scan(&pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>());
         Some(Gt {
             submission,
             lists,
             marked,
+            arena_marked,
+            arena_compared,
             pages,
             missed_pages,
             missed_regions,
@@ -155,12 +172,20 @@ impl Gt {
         let mut c = Compare::default();
         let mut t_pages: Vec<(usize, Vec<u8>)> = Vec::with_capacity(self.pages.len());
         for p in &self.pages {
+            // An arena page goes nowhere by design: only its headers count.
+            if p.copy.is_none() {
+                c.arena += 1;
+            }
             let mut t = vec![0u8; p.g.len()];
             if !crate::host::read_into(p.from as *const u8, &mut t) {
                 c.unreadable += 1;
                 continue;
             }
             let mut differs = false;
+            if p.copy.is_none() {
+                t_pages.push((p.from, t));
+                continue;
+            }
             for (i, (g, t)) in p.g.as_chunks::<4>().0.iter().zip(t.as_chunks::<4>().0).enumerate() {
                 if g != t {
                     differs = true;
@@ -173,7 +198,7 @@ impl Gt {
             }
             if differs {
                 c.differing += 1;
-                if p.copy.title_changed(p.page) == Some(true) {
+                if p.copy.as_ref().and_then(|c| c.title_changed(p.page)) == Some(true) {
                     c.title_changed += 1;
                 }
             } else {
@@ -207,6 +232,7 @@ impl Gt {
             (true, false, _, _) => "A2",
             (false, _, true, true) => "B",
             (false, _, true, false) => "T!=G,not-held",
+            (false, _, false, _) if self.arena_compared > 0 => "G valid,arena",
             (false, _, false, _) => "G=T,valid",
         }
     }
@@ -218,11 +244,13 @@ impl Gt {
         let addrs = |v: &[u64]| v.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ");
         tracing::info!(
             target: "victory_gpu::bvh_gt",
-            "BVH GT s{s} {hash}: case {}; lists {}, pages written with a copy {} (compared {}), missed {} pages + {} regions (first: {}); list missed {}, withholding {}",
+            "BVH GT s{s} {hash}: case {}; lists {}, pages written with a copy {} (compared {}), in the arena {} (compared {}), missed {} pages + {} regions (first: {}); list missed {}, withholding {}",
             self.case(),
             self.lists,
             self.marked,
-            self.pages.len(),
+            self.pages.len() - self.arena_compared,
+            self.arena_marked,
+            self.arena_compared,
             self.missed_pages,
             self.missed_regions,
             addrs(&self.first_missed),
@@ -256,11 +284,12 @@ impl Gt {
             let first: Vec<String> = t.first.iter().map(|(a, g, t)| format!("{a:#x} G={g:#010x} T={t:#010x}")).collect();
             tracing::info!(
                 target: "victory_gpu::bvh_gt",
-                "BVH GT s{s} T{}: pages T=G {} T!=G {} (title wrote/retaken {}), unreadable {}, dwords differing {} (first: {}); G headers valid in T {}/{}; {}",
+                "BVH GT s{s} T{}: pages T=G {} T!=G {} (title wrote/retaken {}), arena pages (not compared, stay on the card) {}, unreadable {}, dwords differing {} (first: {}); G headers valid in T {}/{}; {}",
                 k + 1,
                 t.equal,
                 t.differing,
                 t.title_changed,
+                t.arena,
                 t.unreadable,
                 t.dwords,
                 first.join(", "),
@@ -278,6 +307,7 @@ struct Compare {
     equal: usize,
     differing: usize,
     title_changed: usize,
+    arena: usize,
     unreadable: usize,
     dwords: u64,
     first: Vec<(u64, u32, u32)>,

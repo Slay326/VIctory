@@ -618,6 +618,7 @@ impl State {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        let _builder = list.writer_is_builder(crate::arena::enabled() && crate::pipeline::is_builder(self.pipeline as This));
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1147,6 +1148,14 @@ impl State {
         // writes of every dispatch before them in the list.
         if crate::bvh_gt::uav_barrier() && crate::pipeline::is_builder(self.pipeline as This) {
             crate::list::global_uav_barrier(list);
+        }
+        // `VICTORY_BVH_ARENA`: the builder's writes through the page table
+        // go back only to small title buffers.
+        if crate::arena::enabled()
+            && crate::pipeline::is_builder(self.pipeline as This)
+            && let Some((_, map)) = &self.memory
+        {
+            map.note_builder();
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };

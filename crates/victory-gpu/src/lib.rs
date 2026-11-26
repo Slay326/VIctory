@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod arena;
+#[cfg(windows)]
 mod bindless;
 #[cfg(windows)]
 mod bvh_gt;

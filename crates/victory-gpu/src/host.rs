@@ -72,7 +72,7 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 mod card;
-pub(crate) use card::card_fetch;
+pub(crate) use card::{card_fetch, run_now};
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -933,6 +933,9 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
+    /// The draw or dispatch being recorded runs the BVH builder and the
+    /// arena is on ([`HostList::writer_is_builder`]).
+    builder_writer: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -1157,6 +1160,10 @@ struct Deferred {
     /// With `VICTORY_BVH_GT`: what the list's bitmap marked, asked once the
     /// list has run, before anything goes back (`crate::bvh_gt`).
     gt: Vec<Box<dyn Fn() -> crate::bvh_gt::Marks + Send>>,
+    /// With `VICTORY_BVH_ARENA`: ranges (copy, address, bytes) the BVH
+    /// builder wrote through views of title buffers larger than
+    /// [`crate::arena::BACK`]: they stay out of title memory.
+    on_card: Vec<(usize, usize, usize)>,
 }
 
 impl Host {
@@ -1264,6 +1271,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
+                builder_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
@@ -1300,6 +1308,9 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        // `VICTORY_BVH_ARENA`: pages asked for after the last submission,
+        // before the page tables are brought up to date below.
+        crate::arena::provide();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1519,7 +1530,7 @@ impl Host {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
-                    let goes_back = !(missed && *memory);
+                    let goes_back = !(missed && *memory) && !deferred.on_card.contains(&key);
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= goes_back,
                         None => {
@@ -2076,6 +2087,20 @@ impl HostList {
         Reset(&self.memory_writer)
     }
 
+    /// What the list's shaders write from now until the guard goes is
+    /// written by the BVH builder with the arena on (`is`): views of title
+    /// buffers larger than [`crate::arena::BACK`] keep it on the card.
+    pub(crate) fn writer_is_builder(&self, is: bool) -> impl Drop + '_ {
+        struct Reset<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        self.builder_writer.store(is, Ordering::Relaxed);
+        Reset(&self.builder_writer)
+    }
+
     /// A copy of ours replaced the compute root signature and pipeline.
     pub(crate) fn need_rebind(&self) {
         self.rebind.store(true, Ordering::Relaxed);
@@ -2266,7 +2291,11 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
+        let mut deferred = self.deferred();
+        if self.builder_writer.load(Ordering::Relaxed) && shadow.range().1 > crate::arena::BACK {
+            deferred.on_card.push((std::sync::Arc::as_ptr(shadow) as usize, address, len));
+        }
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
@@ -2907,6 +2936,11 @@ impl Host {
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         self.mapped_buffer(size, false)
+    }
+
+    /// A buffer in readback memory, mapped, in the copy-destination state.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, true)
     }
 
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
