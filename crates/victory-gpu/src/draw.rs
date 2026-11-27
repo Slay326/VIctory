@@ -1075,6 +1075,20 @@ impl State {
                     .as_ref()
                     .and_then(crate::descriptor::host::buffer_range)
                     .map_or(0, |(a, _)| a);
+                // An acceleration structure view (dimension 11, no resource):
+                // its location, as the view addresses hold it since
+                // fix/as-srv-address (unless VICTORY_AS_SRV_ADDRESS=0).
+                let words: Option<&[u32]> = match view.as_ref() {
+                    Some(View::Shader(_, Some(d))) => Some(&d[..]),
+                    Some(View::Placed(false, _, d)) => Some(&d[..]),
+                    _ => None,
+                };
+                if let Some(d) = words
+                    && d.get(1) == Some(&11)
+                    && std::env::var_os("VICTORY_AS_SRV_ADDRESS").is_none_or(|v| v != "0")
+                {
+                    tv.title = u64::from(d[4]) | u64::from(d[5]) << 32;
+                }
                 if let Some(plan) = view.as_ref().and_then(crate::descriptor::host::buffer_plan) {
                     tv.title = plan.title;
                     tv.address = plan.address();
