@@ -62,6 +62,13 @@ pub struct Options {
     /// Stage dumps (T4): replay only the first k builder dispatches for
     /// each cut k and check the structures after it.
     pub cuts: Option<Cuts>,
+    /// T4 coherence test: a file with the title's shader containers
+    /// (`XboxBvhBuilder.dll`); the pipelines of [`Options::only`] get their
+    /// DXIL translated afresh from it (`VICTORY_SHADER_COHERENT=1`: with
+    /// `victory_shader::emit::set_coherent`).
+    pub retranslate: Option<PathBuf>,
+    /// Shader hash prefixes to translate afresh (default 5552dac6).
+    pub only: Vec<String>,
 }
 
 /// Where the stage dumps cut the builder's dispatches.
@@ -124,6 +131,8 @@ impl Options {
             dump: None,
             diagnose: false,
             cuts: None,
+            retranslate: None,
+            only: vec!["5552dac6".to_string()],
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -134,6 +143,20 @@ impl Options {
                 "--card" => o.card_only = true,
                 "--warp" => o.warp = true,
                 "--diagnose" => o.diagnose = true,
+                "--retranslate" => {
+                    o.retranslate = Some(PathBuf::from(
+                        it.next().context("--retranslate needs a file")?,
+                    ))
+                }
+                "--only" => {
+                    o.only = it
+                        .next()
+                        .context("--only needs hash prefixes")?
+                        .split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                }
                 "--cuts" => {
                     o.cuts = Some(Cuts::parse(
                         it.next().context("--cuts needs stages, each or a list")?,
@@ -148,7 +171,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..] [--retranslate <dll> [--only h,h]]"
             );
         }
         Ok(o)
@@ -938,6 +961,12 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
         o.capture.display(),
         c.meta("submission").unwrap_or("?")
     );
+    // T4: translate only, no device (32 lanes, as NVIDIA): the fresh DXIL
+    // next to the captured one for a diff (`VICTORY_RETRANSLATE_OUT`).
+    if let (Some(file), Ok(_)) = (&o.retranslate, std::env::var("VICTORY_RETRANSLATE_OUT")) {
+        retranslate(&mut l, file, &o.only, 32, 1_000_000)?;
+        return Ok(0);
+    }
     let mut gpu = Gpu::new(o.warp)?;
     println!("harness gpu: {}", super::adapter_text(&gpu.device));
     {
@@ -958,6 +987,14 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
             o1.WaveLaneCountMax,
             if ok.is_ok() { "ok" } else { "failed" }
         );
+        if let Some(file) = &o.retranslate {
+            let lanes = if ok.is_ok() { o1.WaveLaneCountMax } else { 32 };
+            // The view heap size the game's host translates for (NVIDIA:
+            // 1,000,000 slots), as `crate::host` finds it.
+            let views =
+                victory_shader::emit::host::Host::from_device(gpu.device.clone()).view_heap_limit();
+            retranslate(&mut l, file, &o.only, lanes, views)?;
+        }
     }
     println!("capture gpu: {}", c.meta("gpu").unwrap_or("?"));
     let why = unsupported(&c, o.all);
@@ -1446,4 +1483,90 @@ mod tests {
         assert_eq!(Cuts::Each.points(&p), vec![1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(Cuts::List(vec![4, 0, 99, 4]).points(&p), vec![1, 4, 7]);
     }
+}
+
+/// T4 coherence test: translates the pipelines whose shader hash starts
+/// with one of `only` afresh from the containers in `file`, as the game
+/// does for the BVH builder (write marks, loop limit 4096 with the arena,
+/// the device's wave width), with the coherence diagnostics when
+/// `VICTORY_SHADER_COHERENT=1`; prints whether the result is the captured
+/// DXIL byte for byte, and replays with it.
+fn retranslate(
+    l: &mut Loaded,
+    file: &Path,
+    only: &[String],
+    lanes: u32,
+    views: u32,
+) -> anyhow::Result<()> {
+    let coherent = std::env::var("VICTORY_SHADER_COHERENT").is_ok_and(|v| v.trim() == "1");
+    let data = std::fs::read(file).with_context(|| format!("{}", file.display()))?;
+    let mut found: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut at = 0;
+    while let Some(k) = data[at..].windows(4).position(|w| w == b"DXBC") {
+        let start = at + k;
+        at = start + 4;
+        let Some(total) = data
+            .get(start + 0x18..start + 0x1c)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize)
+        else {
+            break;
+        };
+        let Some(bytes) = data.get(start..start + total) else {
+            continue;
+        };
+        if total < 32 {
+            continue;
+        }
+        let hash = blake3::hash(bytes).to_hex()[..16].to_string();
+        if only.iter().any(|h| hash.starts_with(h.as_str())) {
+            found.insert(hash, bytes.to_vec());
+        }
+    }
+    victory_shader::emit::set_host_wave_max(lanes);
+    crate::descriptor::host::host_views(views);
+    victory_shader::emit::set_coherent(coherent);
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        group_x_offset: false,
+        loop_limit: crate::pipeline::builder_loop_limit().or(Some(4096)),
+    };
+    let mut done = 0;
+    for p in &mut l.capture.pipelines {
+        if !only.iter().any(|h| p.hash.starts_with(h.as_str())) {
+            continue;
+        }
+        let Some(container) = found.get(&p.hash) else {
+            println!(
+                "retranslate {}: container not found in {}",
+                p.hash,
+                file.display()
+            );
+            continue;
+        };
+        let host = victory_shader::emit::translate_with(container, options)
+            .map_err(|e| anyhow::anyhow!("translating {}: {e}", p.hash))?;
+        println!(
+            "retranslate {}: coherent {coherent}, wave lanes {lanes}, view heap {views}, {} bytes, captured {} bytes, byte-equal to the captured DXIL: {}",
+            p.hash,
+            host.dxil.len(),
+            p.dxil.len(),
+            if host.dxil == p.dxil { "YES" } else { "NO" }
+        );
+        if let Ok(dir) = std::env::var("VICTORY_RETRANSLATE_OUT") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("{}-captured.dxil", p.hash)), &p.dxil)?;
+            std::fs::write(
+                dir.join(format!("{}-fresh-coherent-{coherent}.dxil", p.hash)),
+                &host.dxil,
+            )?;
+        }
+        p.dxil = host.dxil;
+        done += 1;
+    }
+    victory_shader::emit::set_coherent(false);
+    if done == 0 {
+        bail!("no pipeline of {only:?} retranslated");
+    }
+    Ok(())
 }

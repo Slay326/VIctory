@@ -1114,3 +1114,84 @@ fn dirty_mark_width_and_branch_hoisting() {
         bc.verify_dirty_marks(bitmap, want, view_mark.then_some(usize::from(bytes > 1)));
     }
 }
+
+/// A refit's hand-off as the BVH builder's 5552dac6 does it: a `glc dlc`
+/// load of title memory, a plain load, `s_waitcnt_vscnt null, 0`, then an
+/// atomic add with the loaded value, lowered with the coherence diagnostics
+/// off and on (`super::set_coherent`, T4 local test branch).
+fn refit_handoff(coherent: bool) -> lower::Lowered {
+    const GLC: u32 = 1 << 16;
+    const DLC: u32 = 1 << 12;
+    let mut w = vec![v_mov_b32(1, ZERO)];
+    let [a, b] = global(0x0C, 2, 1, 0, 0, 0); // global_load_dword v2, v1, s[0:1]
+    w.extend([a | GLC | DLC, b]);
+    w.extend(global(0x0C, 3, 1, 0, 0, 8)); // global_load_dword v3, v1, s[0:1] offset:8
+    w.push(0xBBFD_0000); // s_waitcnt_vscnt null, 0
+    w.push(S_WAITCNT_ALL);
+    w.extend(global(0x32, 0, 1, 2, 0, 4)); // global_atomic_add v1, v2, s[0:1] offset:4
+    w.extend(global(0x32, 0, 1, 3, 0, 12)); // global_atomic_add v1, v3, s[0:1] offset:12
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    super::set_coherent(coherent);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: true,
+        host_wave_max: 32,
+        group_x_offset: false,
+        loop_limit: super::loop_limit(),
+    });
+    super::set_coherent(false);
+    l.expect("lower")
+}
+
+#[test]
+fn coherence_diagnostics_off_change_nothing_and_on_make_glc_loads_coherent_and_fence_at_vscnt() {
+    let off = refit_handoff(false);
+    let again = refit_handoff(false);
+    assert_eq!(off.dxil, again.dxil, "the translation is deterministic");
+    assert_eq!(off.coherent, (0, 0), "off: nothing coherent, no fence");
+    let on = refit_handoff(true);
+    // The glc dlc load only: the plain load and the atomics without glc
+    // stay as they are.
+    assert_eq!(on.coherent, (1, 1), "on: one coherent load, one fence at vscnt");
+    assert_ne!(on.dxil, off.dxil);
+    assert!(!super::coherent(), "the switch is reset for the thread");
+    #[cfg(windows)]
+    if let Some(text) = super::tests_dump_dxil(&on.dxil) {
+        assert!(text.contains("@dx.op.barrier(i32 80, i32 2)"), "a device-wide UAV fence");
+        assert!(text.contains("ResourceProperties { i32 20491, i32 0 }"), "a globally coherent raw UAV");
+        let plain = super::tests_dump_dxil(&off.dxil).expect("dxc");
+        assert!(!plain.contains("dx.op.barrier"));
+        assert!(!plain.contains("i32 20491"));
+    }
+}

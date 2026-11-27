@@ -437,6 +437,49 @@ pub struct Options {
     pub loop_limit: Option<u32>,
 }
 
+thread_local! {
+    static COHERENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Diagnostics (T4, local test branch): translations made on this thread
+/// after `set_coherent(true)` read and write title memory coherently where
+/// the console asks for it (`glc`/`dlc` loads, stores and atomics: through
+/// the page's globally coherent UAV, not its SRV) and fence UAVs device-wide
+/// at `s_waitcnt_vscnt` (a `DeviceMemoryBarrier`). Off by default; off, the
+/// translation is byte for byte as without the switch. Per thread, so a
+/// shader cache filled on other threads is never touched.
+pub fn set_coherent(on: bool) {
+    COHERENT.with(|c| c.set(on));
+}
+
+/// Whether [`set_coherent`] is on for this thread.
+pub fn coherent() -> bool {
+    COHERENT.with(std::cell::Cell::get)
+}
+
+/// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc is
+/// installed (next to the validator, or `VICTORY_PC_DXC`).
+#[cfg(all(test, windows))]
+pub(crate) fn tests_dump_dxil(container: &[u8]) -> Option<String> {
+    let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => validator::Validator::default_path()?.with_file_name("dxc.exe"),
+    };
+    if !dxc.exists() {
+        return None;
+    }
+    let file = std::env::temp_dir().join(format!(
+        "victory-coherent-{}-{:?}.dxil",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&file, container).ok()?;
+    let out = std::process::Command::new(dxc).arg("-dumpbin").arg(&file).output().ok()?;
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "dxc -dumpbin failed: {}", String::from_utf8_lossy(&out.stderr));
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {

@@ -723,6 +723,11 @@ fn effects(
     vgprs: u16,
     m0_max: Option<u8>,
 ) -> Result<Option<Effects>, ShaderError> {
+    // Diagnostics (`crate::emit::set_coherent`): the wait for stores stays,
+    // as a device-wide UAV fence, without registers.
+    if name == "s_waitcnt_vscnt" && crate::emit::coherent() {
+        return Ok(Some((Vec::new(), Vec::new())));
+    }
     if DROPPED.contains(&name) {
         return Ok(None);
     }
