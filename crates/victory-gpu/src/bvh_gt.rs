@@ -1697,6 +1697,40 @@ pub(crate) fn check_top_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> (Top
     (t, v)
 }
 
+/// [`check_top_v3`] over the compared pages (`first`, G) and the pages read
+/// besides (`besides`), `title` naming the words of those that came from
+/// title memory: a top level judged with any such word is not judged
+/// (senior 99: the 4 bad slots per top level were a root of zeros on a
+/// title-memory page read before the GPU built it, valid one submission
+/// later). Pages from the arena hold the GPU's bytes and count.
+pub(crate) fn top_v3_over(
+    first: &dyn Fn(u64) -> Option<u32>,
+    besides: &dyn Fn(u64) -> Option<u32>,
+    title: &dyn Fn(u64) -> bool,
+    at: u64,
+) -> (TopCheck, Verdict) {
+    let used = std::cell::Cell::new(false);
+    let read = |a: u64| {
+        first(a).or_else(|| {
+            let w = besides(a);
+            if w.is_some() && title(a) {
+                used.set(true);
+            }
+            w
+        })
+    };
+    let (t, v) = check_top_v3(&read, at);
+    let v = match v {
+        Verdict::NotJudged(w) if w.starts_with("no top level") => Verdict::NotJudged(w),
+        v if used.get() => Verdict::NotJudged(format!("read from title memory besides (may predate the GPU's build): {}", match &v {
+            Verdict::Valid => "valid",
+            Verdict::Invalid(w) | Verdict::NotJudged(w) => w,
+        })),
+        v => v,
+    };
+    (t, v)
+}
+
 /// The v3 counts of one submission's headers ([`validate`]), and of the
 /// run. Every count of verdicts is [valid, invalid, not judged].
 #[derive(Default, Debug, Clone)]
@@ -1711,9 +1745,10 @@ pub(crate) struct V3 {
     /// Top levels with finite header bounds and with +-FLT_MAX in them.
     pub(crate) tops: [[u32; 3]; 2],
     /// Of the headers not judged: no plausible top level; top levels with a
-    /// box node or instance entry not read; with a bottom level not read.
+    /// box node or instance entry not read; with a bottom level not read;
+    /// judged by a page read besides from title memory ([`top_v3_over`]).
     pub(crate) no_top: u32,
-    pub(crate) top_unread: [u32; 2],
+    pub(crate) top_unread: [u32; 3],
     /// Summed over the judged top levels only (valid or invalid), so that
     /// "never" holds no instance merely not read.
     pub(crate) instances: u64,
@@ -1777,9 +1812,14 @@ impl V3 {
         let start = usize::from(t.bounds_start);
         match v {
             Verdict::NotJudged(w) if w.starts_with("no top level") => self.no_top += 1,
-            Verdict::NotJudged(_) => {
+            Verdict::NotJudged(w) => {
                 self.tops[start][2] += 1;
-                self.top_unread[usize::from(t.first_unread.as_deref().is_some_and(|u| u.contains("bottom level")))] += 1;
+                let k = if w.starts_with("read from title memory") {
+                    2
+                } else {
+                    usize::from(t.first_unread.as_deref().is_some_and(|u| u.contains("bottom level")))
+                };
+                self.top_unread[k] += 1;
             }
             _ => {
                 self.tops[start][v.index()] += 1;
@@ -1816,7 +1856,7 @@ impl V3 {
     pub(crate) fn text(&self) -> String {
         let c = |k: &[u32; 3]| format!("{}/{}/{}", k[0], k[1], k[2]);
         format!(
-            "valid/invalid/not judged: bottom fresh {}, rehydrated without the bit-30 rule {}, with the rule (centre from cb) {}, header one-sided fallback apart {}, other bottom {}, packed {}; top {}, top with +-FLT_MAX header bounds {}; not judged: no top level {}, top with a box node or instance not read {}, with a bottom level not read {}; judged top levels: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}, bottom level no header {}; on packed {}, on 0x8002 {} (finite {}), on 0x8004 {} (finite {}), on other bottom {}",
+            "valid/invalid/not judged: bottom fresh {}, rehydrated without the bit-30 rule {}, with the rule (centre from cb) {}, header one-sided fallback apart {}, other bottom {}, packed {}; top {}, top with +-FLT_MAX header bounds {}; not judged: no top level {}, top with a box node or instance not read {}, with a bottom level not read {}, read from title memory besides {}; judged top levels: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}, bottom level no header {}; on packed {}, on 0x8002 {} (finite {}), on 0x8004 {} (finite {}), on other bottom {}",
             c(&self.bottom[2]),
             c(&self.bottom[1]),
             c(&self.rule),
@@ -1828,6 +1868,7 @@ impl V3 {
             self.no_top,
             self.top_unread[0],
             self.top_unread[1],
+            self.top_unread[2],
             self.instances,
             self.reached,
             self.never,
@@ -1862,7 +1903,12 @@ fn most_top_pages() -> usize {
 /// Pages for the top levels' check that the compared ones lack (title
 /// addresses of 64 KiB pages): the arena's bytes where it holds them, else
 /// title memory. Counts into `extra` ([`V2::extra`]).
-fn more_pages(want: &std::collections::BTreeSet<u64>, budget: &mut usize, extra: &mut [u64; 3]) -> Vec<(usize, Vec<u8>)> {
+fn more_pages(
+    want: &std::collections::BTreeSet<u64>,
+    budget: &mut usize,
+    extra: &mut [u64; 3],
+    title: &mut std::collections::HashSet<u64>,
+) -> Vec<(usize, Vec<u8>)> {
     let wanted: Vec<u64> = want.iter().copied().take(*budget).collect();
     extra[2] += (want.len() - wanted.len()) as u64;
     *budget -= wanted.len();
@@ -1875,6 +1921,7 @@ fn more_pages(want: &std::collections::BTreeSet<u64>, budget: &mut usize, extra:
         let mut b = vec![0u8; 1 << 16];
         if crate::host::read_into(page as *const u8, &mut b) {
             extra[1] += 1;
+            title.insert(page);
             got.push((page as usize, b));
         }
     }
@@ -1899,6 +1946,9 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -
     let mut v3 = V3::default();
     let read = reader(pages);
     let mut extra_pages: Vec<(usize, Vec<u8>)> = Vec::new();
+    // Pages read besides from title memory (not the arena): v3 judges no
+    // top level by them ([`top_v3_over`]).
+    let mut title_pages = std::collections::HashSet::new();
     let mut budget = if fetch { most_top_pages() } else { 0 };
     for &at in headers {
         let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
@@ -1945,7 +1995,7 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -
                     if missed.is_empty() || round == 2 || !fetch {
                         break;
                     }
-                    let got = more_pages(&missed, &mut budget, &mut v.extra);
+                    let got = more_pages(&missed, &mut budget, &mut v.extra, &mut title_pages);
                     if got.is_empty() {
                         break;
                     }
@@ -1959,8 +2009,8 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -
                 // besides; what is still missing (past the budget) leaves the
                 // structure not judged.
                 let more = reader(&extra_pages);
-                let read_all = |a: u64| read(a).or_else(|| more(a));
-                let (t3, verdict) = check_top_v3(&read_all, at);
+                let title = |a: u64| title_pages.contains(&(a & !0xffff));
+                let (t3, verdict) = top_v3_over(&read, &more, &title, at);
                 v3.add_top(at, &t3, &verdict);
             }
         }
@@ -2307,7 +2357,7 @@ mod tests {
         assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("not read")), "{v:?}");
         let mut c = V3::default();
         c.add_top(base, &t, &v);
-        assert_eq!((c.tops[1], c.never, c.instances, c.top_unread), ([0, 0, 1], 0, 0, [1, 0]));
+        assert_eq!((c.tops[1], c.never, c.instances, c.top_unread), ([0, 0, 1], 0, 0, [1, 0, 0]));
     }
 
     /// An instance whose bottom-level page is missing leaves the top level
@@ -2324,7 +2374,7 @@ mod tests {
         assert_eq!((t.reached, t.never, t.blas_unread, t.blas_no_header), (3, 0, 1, 0));
         let mut c = V3::default();
         c.add_top(base, &t, &v);
-        assert_eq!((c.tops[1], c.never, c.top_unread), ([0, 0, 1], 0, [0, 1]));
+        assert_eq!((c.tops[1], c.never, c.top_unread), ([0, 0, 1], 0, [0, 1, 0]));
         // Read, but no bottom-level header there.
         let mut m = mini_top();
         m.insert(0x20200, 0x1234_5678);
@@ -2480,6 +2530,55 @@ mod tests {
         println!("capture {cap} pages {prefix}: headers {}; v3: {}", headers.len(), v3.text());
         println!("first invalid: {}; first not judged: {}", v3.first.join(", "), v3.first_not_judged.join(", "));
         println!("words read from the dump {}, from PRE {}, absent {}", from_dump.borrow(), from_pre.borrow(), absent.borrow());
+    }
+
+    /// senior 99 (1): the grid scan finds "headers" that are runs of small
+    /// integers with dword 0 = 6; their dword 3 is no instance count. The
+    /// header must be plausible first: else no top level, and its count
+    /// goes into no total (v2 summed it: 3.2e9 and part of "never").
+    #[test]
+    fn v3_runs_of_small_integers_are_no_top_level_and_add_no_instances() {
+        let base = 0x10000u64;
+        let s6191 = [
+            [6u32, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+            [6, 9, 9, 9, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0],
+            [6, 0x706, 0x706, 0x706, 0x706, 0x607, 0x607, 7, 7, 7, 7, 7, 6, 0x706, 0x706, 6],
+            [6, 0x24, 0x39, 6, 5, 0x14, 0x39, 0x2d, 0x61, 0x39, 0x14, 0x2d, 0x61, 0x39, 0x14, 0x2d],
+        ];
+        let mut c = V3::default();
+        for h in s6191 {
+            let m: std::collections::HashMap<u64, u32> = h.iter().enumerate().map(|(i, w)| (base + 4 * i as u64, *w)).collect();
+            let (t, v) = check_top_v3(&read_map(&m), base);
+            assert!(matches!(&v, Verdict::NotJudged(why) if why.starts_with("no top level")), "{h:x?} {v:?}");
+            c.add_top(base, &t, &v);
+        }
+        assert_eq!((c.no_top, c.instances, c.never, c.tops), (4, 0, 0, [[0; 3]; 2]));
+    }
+
+    /// senior 99 (2): a top level whose root node lies on a page read
+    /// besides from title memory (zeros there: before the GPU built it; 4
+    /// bad slots in v2) is not judged; the same bytes from the arena or G
+    /// are judged.
+    #[test]
+    fn v3_a_top_level_read_from_title_memory_is_not_judged() {
+        let base = 0x10000u64;
+        let m = mini_top();
+        // The header and instances in G; the root node's page read besides.
+        let root = base + 64..base + 64 + 112;
+        let first = |a: u64| if root.contains(&a) { None } else { m.get(&a).copied() };
+        let zeros = |a: u64| root.contains(&a).then_some(0u32);
+        let (t, v) = top_v3_over(&first, &zeros, &|_| true, base);
+        assert_eq!(t.bad_slots, 4, "a root of zeros: four bad slots");
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.starts_with("read from title memory")), "{v:?}");
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!((c.tops[1], c.top_unread, c.bad_slots), ([0, 0, 1], [0, 0, 1], 0));
+        // The same zeros from the arena (no title page): invalid.
+        let (_, v) = top_v3_over(&first, &zeros, &|_| false, base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("slot")), "{v:?}");
+        // The built root read besides from the arena: valid.
+        let built = |a: u64| m.get(&a).copied();
+        assert_eq!(top_v3_over(&first, &built, &|_| false, base).1, Verdict::Valid);
     }
 
     /// Rehydrated ones with the header one-sided fallback (no 5e687674
