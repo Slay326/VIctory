@@ -355,6 +355,9 @@ mod game {
         pub(crate) constants: Vec<(u32, Vec<u32>)>,
         /// The program's table views: kind, register, root slot, dword.
         pub(crate) used: Vec<String>,
+        /// senior 115: each table view's name (`t355`), title address (as
+        /// the view-address table holds it, 0: none) and the view as text.
+        pub(crate) addresses: Vec<(String, u64, String)>,
     }
 
     /// The bytes of `[address, address + len)` as the GPU left them in
@@ -405,6 +408,24 @@ mod game {
         let Some(plan) = plan() else { return };
         if records.is_empty() || TAKEN.fetch_add(1, Ordering::Relaxed) >= plan.most {
             return;
+        }
+        // senior 115: where the reader's top levels are (t355, t356) against
+        // what the builder built (the v4 build map, `VICTORY_BVH_GT`).
+        for (k, r) in records.iter().enumerate() {
+            let tlas: Vec<String> = r
+                .addresses
+                .iter()
+                .filter(|(n, _, _)| n == "t355" || n == "t356")
+                .map(|(n, a, v)| format!("{n} {a:#x} [{}] view {v}", crate::bvh_gt::build_text(*a)))
+                .collect();
+            tracing::info!(
+                target: "victory_gpu::reader_capture",
+                "reader top levels s{submission} d{k}: {}; top-level targets {}",
+                tlas.join("; "),
+                crate::bvh_gt::recent_top_targets()
+            );
+            let all: Vec<String> = r.addresses.iter().map(|(n, a, _)| format!("{n}={a:#x}")).collect();
+            tracing::info!(target: "victory_gpu::reader_capture", "reader view addresses s{submission} d{k}: {}", all.join(" "));
         }
         let frame = crate::queue::presented();
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();

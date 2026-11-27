@@ -1747,6 +1747,9 @@ pub(crate) struct Builds {
     /// The targets of the submission noted last, and that submission.
     now: std::collections::HashMap<u64, u8>,
     submission: u64,
+    /// senior 115: the submission before the one noted last that noted
+    /// targets, and its targets.
+    before: (u64, std::collections::HashMap<u64, u8>),
     /// Binds noted; targets not kept because the map was full.
     noted: u64,
     full: u64,
@@ -1760,6 +1763,9 @@ pub(crate) struct Builds {
 impl Builds {
     /// Submission `submission` ran the builder binds `targets`.
     fn note(&mut self, submission: u64, targets: &[(u64, u8)]) {
+        if !self.now.is_empty() {
+            self.before = (self.submission, std::mem::take(&mut self.now));
+        }
         self.submission = submission;
         self.now.clear();
         for &(at, stage) in targets {
@@ -1810,6 +1816,45 @@ static BUILDS: std::sync::Mutex<Option<Builds>> = std::sync::Mutex::new(None);
 
 fn with_builds<R>(f: impl FnOnce(&mut Builds) -> R) -> R {
     f(BUILDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Builds::default))
+}
+
+/// senior 115: what the build map knows of the structure at `at`: first
+/// and last submission that built it and its stages (bits by
+/// [`BUILD_TARGETS`] index), or "never built"; nearest target below within
+/// 1 MiB otherwise.
+pub(crate) fn build_text(at: u64) -> String {
+    with_builds(|b| match b.map.get(&at) {
+        Some(&(first, last, stages)) => format!("built s{first}..s{last} stages {stages:#x}"),
+        None => match b.map.range(at.saturating_sub(1 << 20)..at).next_back() {
+            Some((&t, &(_, last, stages))) => {
+                format!("never built; nearest target below {t:#x} (-{:#x}, last s{last}, stages {stages:#x})", at - t)
+            }
+            None => "never built".into(),
+        },
+    })
+}
+
+/// senior 115: the top-level targets (stage 190fbf0e) of the submission
+/// noted last and of the one before that noted any.
+pub(crate) fn recent_top_targets() -> String {
+    with_builds(|b| {
+        let tops = |m: &std::collections::HashMap<u64, u8>| {
+            let mut v: Vec<String> = m
+                .iter()
+                .filter(|(_, s)| *s & (1 << TOP_STAGE) != 0)
+                .map(|(a, _)| format!("{a:#x}"))
+                .collect();
+            v.sort();
+            v.join(" ")
+        };
+        format!(
+            "s{} [{}], before s{} [{}]",
+            b.submission,
+            tops(&b.now),
+            b.before.0,
+            tops(&b.before.1)
+        )
+    })
 }
 
 /// After the fence of submission `submission` (every one while

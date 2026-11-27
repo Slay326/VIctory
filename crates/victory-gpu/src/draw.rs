@@ -1648,9 +1648,20 @@ impl State {
         let Some(plan) = reader::plan() else { return };
         let mut ranges = Vec::new();
         let mut used = Vec::new();
+        let mut addresses = Vec::new();
         for u in &stage.translated().used {
             let uav = u.kind == ResourceType::Uav;
             used.push(format!("{:?} r{} slot {} dw {}", u.kind, u.lower_bound, u.slot, u.table_offset_dwords));
+            // senior 115: every table view's title address as the
+            // view-address table holds it (f607780a takes its top level's
+            // address from t355's, t356's for the far ray) and the view.
+            if let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot))) {
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                let title = view.as_ref().and_then(crate::descriptor::host::buffer_range).map_or(0, |(a, _)| a);
+                let mut text = format!("{view:?}");
+                text.truncate(240);
+                addresses.push((format!("{}{}", if uav { 'u' } else if u.kind == ResourceType::Cbv { 'b' } else { 't' }, u.lower_bound), title, text));
+            }
             // senior 105: constant buffers by register (b3: N of u52's index).
             if u.kind == ResourceType::Cbv && plan.cbvs.contains(&u.lower_bound) {
                 if let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot)))
@@ -1722,6 +1733,7 @@ impl State {
             ranges,
             constants,
             used,
+            addresses,
         });
     }
 
