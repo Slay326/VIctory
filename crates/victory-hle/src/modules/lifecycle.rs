@@ -583,6 +583,11 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // The memclass stream's END record and its last bytes (VICTORY_MEMCLASS),
+    // first: saving the pipeline cache below can outlast the wait of whoever
+    // ends the run, and a stream without END reads as cut off.
+    #[cfg(windows)]
+    victory_gpu::memclass_finish();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

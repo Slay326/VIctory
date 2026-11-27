@@ -39,6 +39,8 @@ mod host;
 mod indirect;
 pub mod list;
 #[cfg(windows)]
+mod memclass;
+#[cfg(windows)]
 mod memory;
 pub mod object;
 pub mod pipeline;
@@ -72,7 +74,9 @@ pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use memclass::{allocated as memclass_allocated, finish as memclass_finish, init as memclass_init};
+#[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped, title_memory_section,
-    title_memory_section_gone, title_memory_view, writing as kernel_will_write,
+    title_memory_section_gone, title_memory_view, kernel_will_write,
 };
