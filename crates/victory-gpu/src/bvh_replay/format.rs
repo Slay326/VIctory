@@ -202,6 +202,11 @@ pub enum RootArg {
     },
 }
 
+/// [`TableView::kind`] of a dispatch's indirect arguments (senior 115): not
+/// a view, the bytes the game read the arguments from, in a table of their
+/// own (parameter, index and slot `u32::MAX`).
+pub const INDIRECT_ARGUMENTS: u8 = 3;
+
 /// A buffer view of a descriptor table as the game's host made it
 /// (`crate::descriptor::host` `make`): its host description over its host
 /// copy, with the copy's bytes in that range before the program's first

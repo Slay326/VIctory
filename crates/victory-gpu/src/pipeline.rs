@@ -201,6 +201,13 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The container as the title passed it (senior 115: the reader capture
+    /// saves it, for the harness to translate afresh with diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {

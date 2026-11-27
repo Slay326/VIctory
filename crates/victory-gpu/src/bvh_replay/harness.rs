@@ -292,14 +292,13 @@ pub fn unsupported(c: &Capture, all: bool) -> Vec<String> {
 /// Why a table view cannot be replayed: no host view (the capture could
 /// not describe it), or fewer bytes than the host view spans.
 pub fn view_unusable(v: &TableView) -> Option<String> {
-    // Address only (no host view, but a title address the view-address
-    // table holds): replayed as a null view with its address, as the reader
-    // reads t355.
-    if v.count == 0 && v.title != 0 {
-        return None;
-    }
+    // No host view (an acceleration structure view such as the reader's
+    // t355, read only for its address, or a slot the title left null, such
+    // as t373 in the reader's s6 != 16 form): replayed as a null view with
+    // its title address in the view addresses. A program that reads through
+    // it reads zeros, as through a null view in the game.
     if v.count == 0 {
-        return Some("no host view".into());
+        return None;
     }
     if v.element() == 0 {
         return Some(format!("format {} of unknown size", v.format));
@@ -416,6 +415,17 @@ impl Gpu {
         // SAFETY: plain object creation.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
+            // senior 115: `VICTORY_HARNESS_DEBUG=1`: the D3D12 debug layer,
+            // its messages printed when a run fails ([`Gpu::messages`]).
+            if std::env::var_os("VICTORY_HARNESS_DEBUG").is_some() {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok()
+                    && let Some(debug) = debug
+                {
+                    debug.EnableDebugLayer();
+                    println!("harness: D3D12 debug layer on");
+                }
+            }
             if warp {
                 let factory: IDXGIFactory4 = CreateDXGIFactory1()?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
@@ -494,6 +504,27 @@ impl Gpu {
         Ok(p.cast())
     }
 
+    /// The debug layer's stored messages (`VICTORY_HARNESS_DEBUG`), printed.
+    fn messages(&self) {
+        let Ok(q) = self.device.cast::<ID3D12InfoQueue>() else { return };
+        // SAFETY: plain queries into buffers of the size asked for.
+        unsafe {
+            for i in 0..q.GetNumStoredMessages().min(64) {
+                let mut len = 0usize;
+                if q.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let m = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if q.GetMessage(i, Some(m), &mut len).is_ok() {
+                    let d = &*m;
+                    let text = std::slice::from_raw_parts(d.pDescription, d.DescriptionByteLength.saturating_sub(1));
+                    println!("d3d12 debug: {}", String::from_utf8_lossy(text));
+                }
+            }
+        }
+    }
+
     /// Records with `f` and runs it, waiting.
     fn run(
         &mut self,
@@ -504,7 +535,10 @@ impl Gpu {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
             f(&self.list)?;
-            self.list.Close()?;
+            if let Err(e) = self.list.Close() {
+                self.messages();
+                return Err(e.into());
+            }
             let started = std::time::Instant::now();
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.sent += 1;
@@ -610,7 +644,7 @@ fn run_prefix(
                 NumDescriptors: slots,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
-            })?
+            }).context("descriptor heap")?
     };
     // SAFETY: as above.
     let samplers: ID3D12DescriptorHeap = unsafe {
@@ -620,7 +654,7 @@ fn run_prefix(
                 NumDescriptors: 16,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
-            })?
+            }).context("descriptor heap")?
     };
     // SAFETY: plain queries.
     let (step, cpu0) = unsafe {
@@ -760,13 +794,17 @@ fn run_prefix(
                         // SAFETY: live buffers, ranges inside them.
                         unsafe { list.CopyBufferRegion(&b, 0, &upload, 0, n) };
                         Ok(())
-                    })?;
+                    }).context("harness run: table view fill")?;
                     tbufs.insert(key, (b, false));
                 }
                 if v.kind == 2
                     && let Some(t) = tbufs.get_mut(&key)
                 {
                     t.1 = true;
+                }
+                if v.kind == INDIRECT_ARGUMENTS {
+                    // Read by ExecuteIndirect, bound nowhere.
+                    continue;
                 }
                 let at = cpu(base + v.dw / 8);
                 let b = &tbufs[&key].0;
@@ -829,10 +867,10 @@ fn run_prefix(
         None
     } else {
         let n = u64::from(victory_shader::emit::HEAP_VIEWS.max(next));
-        let strides = gpu.buffer(4 * n, D3D12_HEAP_TYPE_UPLOAD, false)?;
-        let addresses = gpu.buffer(16 * n, D3D12_HEAP_TYPE_UPLOAD, false)?;
-        let marks = gpu.buffer(8 * n, D3D12_HEAP_TYPE_UPLOAD, false)?;
-        let bits = gpu.buffer(bits_len, D3D12_HEAP_TYPE_DEFAULT, true)?;
+        let strides = gpu.buffer(4 * n, D3D12_HEAP_TYPE_UPLOAD, false).context("view strides")?;
+        let addresses = gpu.buffer(16 * n, D3D12_HEAP_TYPE_UPLOAD, false).context("view addresses")?;
+        let marks = gpu.buffer(8 * n, D3D12_HEAP_TYPE_UPLOAD, false).context("view marks")?;
+        let bits = gpu.buffer(bits_len, D3D12_HEAP_TYPE_DEFAULT, true).context("view write bits")?;
         let (sp, ap, mp) = (Gpu::map(&strides)?, Gpu::map(&addresses)?, Gpu::map(&marks)?);
         // SAFETY: mapped upload buffers of n entries each.
         unsafe {
@@ -861,7 +899,7 @@ fn run_prefix(
             // SAFETY: live buffers.
             unsafe { list.CopyBufferRegion(&bits, 0, &upload, 0, bits_len) };
             Ok(())
-        })?;
+        }).context("harness run: view bitmap fill")?;
         Some((strides, addresses, marks, bits))
     };
     let fill = |words: &mut [u32]| words.fill(POISON);
@@ -880,7 +918,7 @@ fn run_prefix(
                 // SAFETY: live buffers, ranges inside them.
                 unsafe { list.CopyBufferRegion(&b, at, &upload, 0, n) };
                 Ok(())
-            })?;
+            }).context("harness run: segment poison")?;
             at += n;
         }
     }
@@ -899,7 +937,7 @@ fn run_prefix(
                 unsafe { list.CopyBufferRegion(&segs[&s].buffer, at_seg, &upload, off, len) };
             }
             Ok(())
-        })?;
+        }).context("harness run: page upload")?;
         Ok(())
     };
     for p in &pre {
@@ -964,7 +1002,7 @@ fn run_prefix(
         // SAFETY: live buffers.
         unsafe { list.CopyBufferRegion(&bitmap, 0, &upload, 0, BITMAP_BYTES) };
         Ok(())
-    })?;
+    }).context("harness run: page bitmap fill")?;
     // Pipelines.
     let mut psos: HashMap<u32, (ID3D12RootSignature, ID3D12PipelineState)> = HashMap::new();
     for d in c.dispatches.iter().filter(|d| o.all || d.builder) {
@@ -1189,14 +1227,28 @@ fn run_prefix(
                         most,
                         ..
                     } => {
-                        let (_, s) =
-                            gpu_of(*args).context("indirect arguments outside the capture")?;
-                        let off = gpu_of(*args).map(|(a, s)| a - s.gpu).unwrap_or(0);
                         let counter = (*count != 0).then(|| gpu_of(*count)).flatten();
+                        // senior 115: arguments captured with their bytes.
+                        let own = d.args.iter().find_map(|a| match a {
+                            RootArg::Table { views, .. } => views
+                                .iter()
+                                .find(|v| v.kind == INDIRECT_ARGUMENTS && v.address == *args)
+                                .and_then(|v| tbufs.get(&(v.address, v.len())))
+                                .map(|(b, _)| b),
+                            _ => None,
+                        });
+                        let (buffer, off) = match own {
+                            Some(b) => (b, 0),
+                            None => {
+                                let (a, s) =
+                                    gpu_of(*args).context("indirect arguments outside the capture")?;
+                                (&s.buffer, a - s.gpu)
+                            }
+                        };
                         list.ExecuteIndirect(
                             &signatures[stride],
                             *most,
-                            &s.buffer,
+                            buffer,
                             off,
                             counter.map(|(_, cs)| &cs.buffer),
                             counter.map_or(0, |(a, cs)| a - cs.gpu),
@@ -1206,7 +1258,7 @@ fn run_prefix(
             }
         }
         Ok(())
-    })?;
+    }).context("harness run: the dispatches")?;
     // Results: the bitmap, then every marked page's bytes.
     let readback = gpu.buffer(STAGE, D3D12_HEAP_TYPE_READBACK, false)?;
     let rb = Gpu::map(&readback)?;
@@ -1214,7 +1266,7 @@ fn run_prefix(
         // SAFETY: live buffers.
         unsafe { list.CopyBufferRegion(&readback, 0, &bitmap, 0, BITMAP_BYTES) };
         Ok(())
-    })?;
+    }).context("harness run: bitmap readback")?;
     let mut set = BTreeSet::new();
     // SAFETY: the mapped readback buffer, the GPU done with it.
     let words =
@@ -1256,7 +1308,7 @@ fn run_prefix(
                 unsafe { list.CopyBufferRegion(&readback, *k as u64 * PAGE, b, *off, *len) };
             }
             Ok(())
-        })?;
+        }).context("harness run: page readback")?;
         for (k, at, _, _, len) in jobs {
             // SAFETY: the mapped readback buffer.
             let bytes =
@@ -1279,7 +1331,7 @@ fn run_prefix(
             // SAFETY: live buffers, ranges inside them.
             unsafe { list.CopyBufferRegion(&readback, 0, b, 0, len) };
             Ok(())
-        })?;
+        }).context("harness run: table view readback")?;
         // SAFETY: the mapped readback buffer, the GPU done with it.
         view_bytes.insert(key, unsafe { std::slice::from_raw_parts(rb, len as usize) }.to_vec());
     }
@@ -2017,8 +2069,8 @@ mod tests {
         let refused = unsupported(&reader(vec![short], true), false);
         assert!(refused.iter().any(|w| w.contains("t10") && w.contains("15 of 16")), "{refused:?}");
         let none = TableView { count: 0, title: 0, ..view(0, 3, 56, 0) };
-        assert!(view_unusable(&none).is_some());
-        let address_only = TableView { count: 0, title: 0xd5f2_0cd00, ..view(1, 355, 32, 0) };
+        assert!(view_unusable(&none).is_none());
+        let address_only = TableView { count: 0, format: 0, title: 0xd5f2_0cd00, ..view(1, 355, 32, 0) };
         assert!(view_unusable(&address_only).is_none());
         assert!(view_unusable(&TableView { format: 0, ..view(1, 1, 0, 4) }).is_some());
         assert!(view_unusable(&view(1, 1, 0, 4)).is_none());

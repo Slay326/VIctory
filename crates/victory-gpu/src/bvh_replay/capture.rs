@@ -97,13 +97,16 @@ fn from_frame() -> u64 {
     })
 }
 
-/// The 256 MiB blocks (address >> 28) of the table views' title
-/// addresses and host ranges, zeros left out: the replay follows pointers
-/// from there (the reader's top level is t355's address).
+/// The 256 MiB blocks (address >> 28) of the title addresses of table
+/// views without a host view (the reader's t355 and t356: its top levels),
+/// zeros left out: the replay walks title memory from there. Views with a
+/// host view carry their own bytes ([`TableView::pre`]): their blocks are
+/// not taken (a capture of all of them was 7.7 GB, run onCap).
 pub fn view_blocks<'a>(views: impl IntoIterator<Item = &'a TableView>) -> BTreeSet<u64> {
     views
         .into_iter()
-        .flat_map(|v| [v.title, v.address])
+        .filter(|v| v.count == 0)
+        .map(|v| v.title)
         .filter(|&a| a != 0)
         .map(|a| a >> 28)
         .collect()
@@ -127,6 +130,28 @@ pub(crate) fn target(p: &HostPipeline, builder: bool) -> bool {
 /// Whether binds of `p` record its tables ([`RootArg::Table`]).
 pub(crate) fn wants_tables(p: &HostPipeline) -> bool {
     enabled() && reader_prefix().is_some() && target(p, false)
+}
+
+/// An indirect dispatch's arguments as a table of one
+/// [`INDIRECT_ARGUMENTS`] view (parameter, index and slot `u32::MAX`),
+/// their title address and bytes (stride times the most commands); none for
+/// a direct dispatch.
+pub fn indirect_arguments(groups: &Groups) -> Option<(RootArg, u64, u64)> {
+    let Groups::Indirect { args: at, stride, most, .. } = groups else {
+        return None;
+    };
+    let len = u64::from(*stride) * u64::from((*most).max(1));
+    let view = TableView {
+        kind: INDIRECT_ARGUMENTS,
+        title: *at,
+        address: *at,
+        format: 39,
+        count: (len / 4) as u32,
+        raw: true,
+        ..TableView::default()
+    };
+    let table = RootArg::Table { param: u32::MAX, index: u32::MAX, slot: u32::MAX, value: 0, views: vec![view] };
+    Some((table, *at, len))
 }
 
 /// Where a table view's bytes are: the record's argument and view, the copy
@@ -166,6 +191,11 @@ pub(crate) struct Recorded {
 /// Host pipelines dispatches named, by name.
 static PIPELINES: Mutex<BTreeMap<String, Pipeline>> = Mutex::new(BTreeMap::new());
 
+/// With `VICTORY_BVH_CAPTURE_READER`: the captured program's shader
+/// containers as the title passed them, by shader hash (written next to the
+/// capture as `container-<hash>.dxbc`, for `--retranslate`).
+static CONTAINERS: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+
 /// A dispatch is about to be recorded into `list`.
 pub(crate) fn record(
     list: &HostList,
@@ -173,12 +203,33 @@ pub(crate) fn record(
     builder: bool,
     barrier: bool,
     groups: Groups,
-    args: Vec<RootArg>,
-    views: Vec<ViewSource>,
+    mut args: Vec<RootArg>,
+    mut views: Vec<ViewSource>,
 ) {
     // With `VICTORY_BVH_CAPTURE_READER` the captured program stands where
     // the builder does.
     let builder = target(p, builder);
+    // Its indirect arguments with their bytes (the page table may name
+    // another copy for their page): a table of one [`INDIRECT_ARGUMENTS`]
+    // view, bound nowhere.
+    if builder
+        && reader_prefix().is_some()
+        && let Some((table, at, len)) = indirect_arguments(&groups)
+    {
+        if let Some(copy) = crate::shadow::find(at, len) {
+            views.push(ViewSource { arg: args.len(), view: 0, copy, address: at, len, unordered: false });
+        }
+        args.push(table);
+    }
+    if builder && reader_prefix().is_some()
+        && let Some(stage) = p.stages.first()
+    {
+        CONTAINERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(stage.shader.hash.clone())
+            .or_insert_with(|| stage.shader.container().to_vec());
+    }
     {
         let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
         // Only the builder's programs keep their code and root signature:
@@ -839,6 +890,9 @@ pub(crate) fn post(mut p: Pending, runs: &[&HostList]) {
         return;
     }
     let _ = std::fs::write(p.dir.join("manifest.txt"), p.capture.manifest());
+    for (hash, bytes) in CONTAINERS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = std::fs::write(p.dir.join(format!("container-{hash}.dxbc")), bytes);
+    }
     tracing::info!(
         target: "victory_gpu::bvh_capture",
         "BVH capture s{submission} written to {}: pre {} MB, post {} MB ({} pages marked, {} of them not taken before), dispatches {} (builder {}), title writes between snapshot and fence {}, other commands {}, {} ms",
@@ -857,7 +911,8 @@ pub(crate) fn post(mut p: Pending, runs: &[&HostList]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_target, view_blocks};
+    use super::{indirect_arguments, is_target, view_blocks};
+    use crate::bvh_replay::format::{Groups, RootArg, INDIRECT_ARGUMENTS};
     use crate::bvh_replay::format::TableView;
 
     /// senior 115: the reader switch makes the reader the captured program
@@ -875,9 +930,24 @@ mod tests {
     #[test]
     fn table_views_name_the_blocks_to_take() {
         let t355 = TableView { title: 0xd5f2_0cd00, ..TableView::default() };
-        let u52 = TableView { title: 0x10_0b1e_0000, address: 0x10_0b1e_0000, ..TableView::default() };
+        let t356 = TableView { title: 0x10_0274_0000, ..TableView::default() };
+        let u52 = TableView { title: 0x12_0b1e_0000, address: 0x12_0b1e_0000, count: 163840, ..TableView::default() };
         let none = TableView::default();
-        let blocks = view_blocks([&t355, &u52, &none]);
+        let blocks = view_blocks([&t355, &t356, &u52, &none]);
         assert_eq!(blocks.into_iter().collect::<Vec<_>>(), vec![0xd5, 0x100]);
+    }
+
+    /// senior 115: an indirect dispatch's arguments are recorded as a
+    /// table of one argument view over stride x most bytes; a direct one
+    /// has none.
+    #[test]
+    fn indirect_arguments_are_recorded_with_their_bytes() {
+        let g = Groups::Indirect { stride: 12, arguments: vec![[2, 0, 0, 0]], args: 0xd_9358_fe60, count: 0, most: 2 };
+        let (table, at, len) = indirect_arguments(&g).unwrap();
+        assert_eq!((at, len), (0xd_9358_fe60, 24));
+        let RootArg::Table { param, views, .. } = table else { panic!("not a table") };
+        assert_eq!(param, u32::MAX);
+        assert_eq!((views[0].kind, views[0].address, views[0].len()), (INDIRECT_ARGUMENTS, 0xd_9358_fe60, 24));
+        assert!(indirect_arguments(&Groups::Direct([1, 1, 1])).is_none());
     }
 }
