@@ -232,6 +232,8 @@ mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
 #[cfg(all(test, windows))]
+mod threadlimit_tests;
+#[cfg(all(test, windows))]
 mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
