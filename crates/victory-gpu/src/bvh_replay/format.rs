@@ -16,8 +16,9 @@ use std::io::{self, Read, Write};
 
 /// The first bytes of `capture.bin`.
 pub const MAGIC: &[u8; 8] = b"VBVHCAP1";
-/// Format version; a reader refuses others.
-pub const VERSION: u32 = 1;
+/// Format version; a reader refuses others (2: [`RootArg::Table`], senior
+/// 115's reader replay; version 1 files are still read).
+pub const VERSION: u32 = 2;
 /// A page of the page table: 64 KiB.
 pub const PAGE: u64 = 1 << 16;
 /// Entries per level-2 block of the page table (`crate::memory`).
@@ -187,6 +188,86 @@ pub enum RootArg {
         param: u32,
         what: Special,
     },
+    /// A descriptor table the program reads (senior 115, captures of the
+    /// RT reader with `VICTORY_BVH_CAPTURE_READER`): the root-constant
+    /// dword `index` of parameter `param` held its byte offset `value` in
+    /// the heap (a view at table dword `dw` is heap index
+    /// `(value + 4 * dw) >> 5`), and the views the program uses there.
+    Table {
+        param: u32,
+        index: u32,
+        slot: u32,
+        value: u32,
+        views: Vec<TableView>,
+    },
+}
+
+/// A buffer view of a descriptor table as the game's host made it
+/// (`crate::descriptor::host` `make`): its host description over its host
+/// copy, with the copy's bytes in that range before the program's first
+/// list ran (and after the fence for unordered views).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableView {
+    /// 0 constant (read as a raw buffer), 1 shader resource, 2 unordered.
+    pub kind: u8,
+    /// The program's register (`t10`, `u52`, `b3`).
+    pub register: u32,
+    /// The view's dword in its table (a multiple of 8).
+    pub dw: u32,
+    /// The title address of the view's start (as the view-address table
+    /// holds it) and of the host view's element 0.
+    pub title: u64,
+    pub address: u64,
+    /// The host view: DXGI format, elements, structure stride, raw.
+    pub format: u32,
+    pub count: u32,
+    pub stride: u32,
+    pub raw: bool,
+    /// The view-stride table's dword for it (stride and kind bits).
+    pub stride_word: u32,
+    /// Bytes from `address`, `count` elements (before / after).
+    pub pre: Vec<u8>,
+    pub post: Vec<u8>,
+}
+
+impl TableView {
+    /// Bytes of one host element.
+    pub fn element(&self) -> u64 {
+        if self.raw {
+            4
+        } else if self.stride > 0 {
+            u64::from(self.stride)
+        } else {
+            u64::from(format_bytes(self.format))
+        }
+    }
+    /// Bytes the host view spans.
+    pub fn len(&self) -> u64 {
+        self.element() * u64::from(self.count)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Bytes per element of the DXGI buffer formats the reader's views use
+/// (0 for any other).
+pub fn format_bytes(format: u32) -> u32 {
+    match format {
+        // R32G32B32A32 _TYPELESS/_FLOAT/_UINT/_SINT
+        1..=4 => 16,
+        // R32G32B32
+        5..=8 => 12,
+        // R16G16B16A16, R32G32, R32G8X24
+        9..=22 => 8,
+        // R10G10B10A2, R11G11B10, R8G8B8A8, R16G16, R32, R24G8
+        23..=47 => 4,
+        // R8G8, R16
+        48..=59 => 2,
+        // R8, A8
+        60..=65 => 1,
+        _ => 0,
+    }
 }
 
 /// Root parameters our shaders read that are not the title's.
@@ -449,6 +530,34 @@ impl Capture {
                         w.u32(*param)?;
                         w.u8(*what as u8)?;
                     }
+                    RootArg::Table {
+                        param,
+                        index,
+                        slot,
+                        value,
+                        views,
+                    } => {
+                        w.u8(3)?;
+                        w.u32(*param)?;
+                        w.u32(*index)?;
+                        w.u32(*slot)?;
+                        w.u32(*value)?;
+                        w.len(views.len())?;
+                        for v in views {
+                            w.u8(v.kind)?;
+                            w.u32(v.register)?;
+                            w.u32(v.dw)?;
+                            w.u64(v.title)?;
+                            w.u64(v.address)?;
+                            w.u32(v.format)?;
+                            w.u32(v.count)?;
+                            w.u32(v.stride)?;
+                            w.u8(u8::from(v.raw))?;
+                            w.u32(v.stride_word)?;
+                            w.bytes(&v.pre)?;
+                            w.bytes(&v.post)?;
+                        }
+                    }
                 }
             }
         }
@@ -486,7 +595,7 @@ impl Capture {
             return Err(bad("not a capture (magic)"));
         }
         let version = r.u32()?;
-        if version != VERSION {
+        if version != VERSION && version != 1 {
             return Err(bad(&format!(
                 "version {version}, this reader knows {VERSION}"
             )));
@@ -619,6 +728,33 @@ impl Capture {
                             _ => return Err(bad("special kind")),
                         };
                         RootArg::Special { param, what }
+                    }
+                    3 if version >= 2 => {
+                        let (param, index, slot, value) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+                        let mut views = Vec::new();
+                        for _ in 0..r.len(256)? {
+                            views.push(TableView {
+                                kind: r.u8()?,
+                                register: r.u32()?,
+                                dw: r.u32()?,
+                                title: r.u64()?,
+                                address: r.u64()?,
+                                format: r.u32()?,
+                                count: r.u32()?,
+                                stride: r.u32()?,
+                                raw: r.u8()? != 0,
+                                stride_word: r.u32()?,
+                                pre: r.bytes()?,
+                                post: r.bytes()?,
+                            });
+                        }
+                        RootArg::Table {
+                            param,
+                            index,
+                            slot,
+                            value,
+                            views,
+                        }
                     }
                     _ => return Err(bad("root argument kind")),
                 });
@@ -843,6 +979,27 @@ impl Capture {
                 "dispatch {i}: run {} {p} builder {} {:?}",
                 d.list, d.builder, d.groups
             );
+            for a in &d.args {
+                if let RootArg::Table { slot, value, views, .. } = a {
+                    for v in views {
+                        let _ = writeln!(
+                            t,
+                            "  table slot {slot} (offset {value}) dw {} {}{}: title {:#x} host {:#x} format {} count {} stride {} raw {} bytes pre {} post {}",
+                            v.dw,
+                            ["b", "t", "u"].get(usize::from(v.kind)).unwrap_or(&"?"),
+                            v.register,
+                            v.title,
+                            v.address,
+                            v.format,
+                            v.count,
+                            v.stride,
+                            v.raw,
+                            v.pre.len(),
+                            v.post.len()
+                        );
+                    }
+                }
+            }
         }
         t
     }
@@ -953,6 +1110,74 @@ mod tests {
         c.write(&mut bytes).unwrap();
         let back = Capture::read(&mut &bytes[..]).unwrap();
         assert_eq!(back, c);
+    }
+
+    fn table_view() -> TableView {
+        TableView {
+            kind: 2,
+            register: 52,
+            dw: 48,
+            title: 0x100b1e0000,
+            address: 0x100b1e0000,
+            format: 61,
+            count: 163840,
+            stride: 0,
+            raw: false,
+            stride_word: 1,
+            pre: vec![0xa5; 16],
+            post: vec![127; 16],
+        }
+    }
+
+    /// senior 115: a reader capture's table (views with their bytes) reads
+    /// back as written.
+    #[test]
+    fn a_table_argument_reads_back_as_written() {
+        let mut c = sample();
+        c.dispatches[0].args.push(RootArg::Table {
+            param: 0,
+            index: 1,
+            slot: 5,
+            value: 32 * 7,
+            views: vec![table_view(), TableView { kind: 0, register: 3, dw: 56, raw: true, ..table_view() }],
+        });
+        let mut bytes = Vec::new();
+        c.write(&mut bytes).unwrap();
+        let back = Capture::read(&mut &bytes[..]).unwrap();
+        assert_eq!(back, c);
+    }
+
+    /// senior 115: version 1 files (no tables) are still read; a table in a
+    /// file claiming version 1 is refused.
+    #[test]
+    fn version_1_is_still_read_but_knows_no_tables() {
+        let mut bytes = Vec::new();
+        sample().write(&mut bytes).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(Capture::read(&mut &bytes[..]).unwrap(), sample());
+        let mut c = sample();
+        c.dispatches[0].args.push(RootArg::Table { param: 0, index: 1, slot: 5, value: 0, views: vec![] });
+        let mut bytes = Vec::new();
+        c.write(&mut bytes).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(Capture::read(&mut &bytes[..]).is_err());
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(Capture::read(&mut &bytes[..]).is_err());
+    }
+
+    #[test]
+    fn table_view_lengths_follow_the_host_view() {
+        assert_eq!(table_view().element(), 1);
+        assert_eq!(table_view().len(), 163840);
+        let raw = TableView { raw: true, format: 1, count: 140, ..table_view() };
+        assert_eq!(raw.len(), 560);
+        let ids = TableView { format: 17, count: 32768, ..table_view() };
+        assert_eq!(ids.len(), 262144);
+        let structured = TableView { format: 0, stride: 12, count: 3, ..table_view() };
+        assert_eq!(structured.len(), 36);
+        assert_eq!(format_bytes(42), 4);
+        assert_eq!(format_bytes(20), 8);
+        assert_eq!(format_bytes(2), 16);
     }
 
     #[test]

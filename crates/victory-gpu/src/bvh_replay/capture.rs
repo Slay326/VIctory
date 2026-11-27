@@ -22,6 +22,19 @@
 //! * `VICTORY_BVH_CAPTURE_MB` (8192): the most page bytes a capture takes
 //!   (the rest are left out and named in the manifest).
 //!
+//! * `VICTORY_BVH_CAPTURE_READER=<hash prefix>` (senior 115, the RT
+//!   reader f607780a): the programs captured are that one's instead of the
+//!   builder's (selection, cuts, code and root signature kept, "builder"
+//!   in the file means "captured program"); their descriptor tables are
+//!   recorded with their buffer views ([`RootArg::Table`]: host
+//!   description, bytes before the program's first list and after the
+//!   fence). `VICTORY_BVH_CAPTURE_FRAME` (0): submissions count from this
+//!   presented frame on (an event such as the scene trigger), nothing is
+//!   cut before it. The 256 MiB blocks of every table view's title address
+//!   are taken too: f607780a reads its top level's address from t355's
+//!   descriptor (the view-address table, disassembly 0x3ec-0x404 and
+//!   0x650-0x688) and follows it through title memory.
+//!
 //! Captures hold game data: never commit them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -60,6 +73,74 @@ fn ordinals() -> &'static [u64] {
     })
 }
 
+/// `VICTORY_BVH_CAPTURE_READER`: the program captured instead of the
+/// builder (hash prefix, lower case).
+pub(crate) fn reader_prefix() -> Option<&'static str> {
+    static P: OnceLock<Option<String>> = OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("VICTORY_BVH_CAPTURE_READER")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    })
+    .as_deref()
+}
+
+/// `VICTORY_BVH_CAPTURE_FRAME`: the first presented frame counted.
+fn from_frame() -> u64 {
+    static F: OnceLock<u64> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("VICTORY_BVH_CAPTURE_FRAME")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// The 256 MiB blocks (address >> 28) of the table views' title
+/// addresses and host ranges, zeros left out: the replay follows pointers
+/// from there (the reader's top level is t355's address).
+pub fn view_blocks<'a>(views: impl IntoIterator<Item = &'a TableView>) -> BTreeSet<u64> {
+    views
+        .into_iter()
+        .flat_map(|v| [v.title, v.address])
+        .filter(|&a| a != 0)
+        .map(|a| a >> 28)
+        .collect()
+}
+
+/// Whether the program with shader hash `hash` is a captured one: the
+/// reader's with `VICTORY_BVH_CAPTURE_READER`, else the builder's.
+pub fn is_target(reader: Option<&str>, hash: &str, builder: bool) -> bool {
+    match reader {
+        Some(prefix) => hash.to_ascii_lowercase().starts_with(prefix),
+        None => builder,
+    }
+}
+
+/// [`is_target`] for a host pipeline.
+pub(crate) fn target(p: &HostPipeline, builder: bool) -> bool {
+    let hash = p.stages.first().map(|s| s.shader.hash.as_str()).unwrap_or("");
+    is_target(reader_prefix(), hash, builder)
+}
+
+/// Whether binds of `p` record its tables ([`RootArg::Table`]).
+pub(crate) fn wants_tables(p: &HostPipeline) -> bool {
+    enabled() && reader_prefix().is_some() && target(p, false)
+}
+
+/// Where a table view's bytes are: the record's argument and view, the copy
+/// and the host view's title range.
+#[derive(Clone)]
+pub(crate) struct ViewSource {
+    pub(crate) arg: usize,
+    pub(crate) view: usize,
+    pub(crate) copy: Arc<Shadow>,
+    pub(crate) address: u64,
+    pub(crate) len: u64,
+    pub(crate) unordered: bool,
+}
+
 fn most_bytes() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| {
@@ -79,6 +160,7 @@ pub(crate) struct Recorded {
     pub(crate) barrier: bool,
     pub(crate) groups: Groups,
     pub(crate) args: Vec<RootArg>,
+    pub(crate) views: Vec<ViewSource>,
 }
 
 /// Host pipelines dispatches named, by name.
@@ -92,7 +174,11 @@ pub(crate) fn record(
     barrier: bool,
     groups: Groups,
     args: Vec<RootArg>,
+    views: Vec<ViewSource>,
 ) {
+    // With `VICTORY_BVH_CAPTURE_READER` the captured program stands where
+    // the builder does.
+    let builder = target(p, builder);
     {
         let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
         // Only the builder's programs keep their code and root signature:
@@ -131,6 +217,7 @@ pub(crate) fn record(
         barrier,
         groups,
         args,
+        views,
     });
 }
 
@@ -142,7 +229,9 @@ static BUILDER_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 /// Whether the lists recorded now are cut around the builder
 /// ([`super::cut_window`]).
 pub(crate) fn cutting() -> bool {
-    enabled() && super::cut_window(BUILDER_SUBMISSIONS.load(Ordering::Relaxed), ordinals())
+    enabled()
+        && (reader_prefix().is_none() || crate::queue::presented() + 1 >= from_frame())
+        && super::cut_window(BUILDER_SUBMISSIONS.load(Ordering::Relaxed), ordinals())
 }
 
 pub(crate) fn due(runs: &[&HostList]) -> Option<usize> {
@@ -152,6 +241,9 @@ pub(crate) fn due(runs: &[&HostList]) -> Option<usize> {
     let first = runs
         .iter()
         .position(|l| l.bvh_records().iter().any(|r| r.builder))?;
+    if reader_prefix().is_some() && crate::queue::presented() < from_frame() {
+        return None;
+    }
     let n = BUILDER_SUBMISSIONS.fetch_add(1, Ordering::Relaxed) + 1;
     ordinals().contains(&n).then_some(first)
 }
@@ -200,6 +292,9 @@ pub(crate) struct Pending {
     changed_before: BTreeSet<u64>,
     left_out: u64,
     started: std::time::Instant,
+    /// Table views' bytes before the captured program's first list: (run,
+    /// record, argument, view) -> bytes.
+    view_pre: HashMap<(usize, usize, usize, usize), Vec<u8>>,
 }
 
 fn meta(c: &mut Capture, k: &str, v: impl ToString) {
@@ -305,6 +400,10 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
     );
     meta(&mut capture, "page tables read", keys.len());
     meta(&mut capture, "translator", victory_shader::SOURCE_HASH);
+    if let Some(prefix) = reader_prefix() {
+        meta(&mut capture, "captured program", prefix);
+        meta(&mut capture, "from frame", from_frame());
+    }
     if let Some(host) = crate::host::host() {
         meta(&mut capture, "gpu", super::adapter_text(&host.device));
     }
@@ -407,7 +506,7 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
                         );
                     }
                 }
-                RootArg::Special { .. } => {}
+                RootArg::Special { .. } | RootArg::Table { .. } => {}
             }
         }
         if let Groups::Indirect { args, count, .. } = &r.groups {
@@ -418,6 +517,34 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
         }
     }
     touched.extend(views.iter().map(|a| a >> 28));
+    // Table views (`VICTORY_BVH_CAPTURE_READER`): their bytes now, their
+    // blocks, and the block of the BVH descriptor's base address.
+    let mut view_pre = HashMap::new();
+    let mut titles = BTreeSet::new();
+    for (i, l) in runs.iter().enumerate().skip(first) {
+        for (k, r) in l.bvh_records().iter().enumerate() {
+            for a in &r.args {
+                if let RootArg::Table { views, .. } = a {
+                    touched.extend(view_blocks(views));
+                    titles.extend(views.iter().map(|v| (v.kind, v.register, v.title)));
+                }
+            }
+            for v in &r.views {
+                view_pre.insert((i, k, v.arg, v.view), super::reader::gpu_range(&v.copy, v.address, v.len));
+            }
+        }
+    }
+    if !titles.is_empty() {
+        meta(
+            &mut capture,
+            "table view addresses",
+            titles
+                .iter()
+                .map(|(k, r, t)| format!("{}{r}={t:#x}", ["b", "t", "u"].get(usize::from(*k)).unwrap_or(&"?")))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
     // The first 256 MiB block too: in all eight captures of 2026-11-26 the
     // builder read 2-5 pages of it (0xb64...-0xb90... MiB) that no root
     // view or constant names, and the harness refuses such a capture.
@@ -468,6 +595,7 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
         changed_before: BTreeSet::new(),
         left_out: 0,
         started,
+        view_pre,
     };
     let mut budget = most_bytes() / PAGE;
     let seg_of: HashMap<u32, Arc<Shadow>> = pending
@@ -583,15 +711,28 @@ pub(crate) fn post(mut p: Pending, runs: &[&HostList]) {
             }
             p.capture.bitmaps.push((i as u32, set));
         }
-        for r in l.bvh_records() {
+        for (k, r) in l.bvh_records().iter().enumerate() {
             let index = pipelines.keys().position(|k| *k == r.pipeline).unwrap_or(0) as u32;
+            let mut args = r.args.clone();
+            // Table views: bytes before (taken then) and, unordered ones,
+            // after the fence (now).
+            for v in &r.views {
+                if let Some(RootArg::Table { views, .. }) = args.get_mut(v.arg)
+                    && let Some(tv) = views.get_mut(v.view)
+                {
+                    tv.pre = p.view_pre.remove(&(i, k, v.arg, v.view)).unwrap_or_default();
+                    if v.unordered {
+                        tv.post = super::reader::gpu_range(&v.copy, v.address, v.len);
+                    }
+                }
+            }
             p.capture.dispatches.push(Dispatch {
                 list: i as u32,
                 pipeline: index,
                 builder: r.builder,
                 barrier: r.barrier,
                 groups: r.groups.clone(),
-                args: r.args.clone(),
+                args,
             });
         }
         p.capture.refreshed.extend(l.refreshed_ranges());
@@ -712,4 +853,31 @@ pub(crate) fn post(mut p: Pending, runs: &[&HostList]) {
         p.capture.others.len(),
         p.started.elapsed().as_millis()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_target, view_blocks};
+    use crate::bvh_replay::format::TableView;
+
+    /// senior 115: the reader switch makes the reader the captured program
+    /// and only it; without it the builder stays.
+    #[test]
+    fn the_reader_switch_captures_the_reader_instead_of_the_builder() {
+        assert!(is_target(Some("f607780a"), "F607780AA8E502D0", false));
+        assert!(!is_target(Some("f607780a"), "5552dac6aaaa", true));
+        assert!(is_target(None, "5552dac6aaaa", true));
+        assert!(!is_target(None, "f607780aa8e502d0", false));
+    }
+
+    /// senior 115: every table view's title address and host range give
+    /// their 256 MiB block (the reader's top level behind t355), zeros none.
+    #[test]
+    fn table_views_name_the_blocks_to_take() {
+        let t355 = TableView { title: 0xd5f2_0cd00, ..TableView::default() };
+        let u52 = TableView { title: 0x10_0b1e_0000, address: 0x10_0b1e_0000, ..TableView::default() };
+        let none = TableView::default();
+        let blocks = view_blocks([&t355, &u52, &none]);
+        assert_eq!(blocks.into_iter().collect::<Vec<_>>(), vec![0xd5, 0x100]);
+    }
 }

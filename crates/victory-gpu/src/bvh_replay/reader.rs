@@ -360,7 +360,7 @@ mod game {
     /// The bytes of `[address, address + len)` as the GPU left them in
     /// `copy` (one fetch for all pages, the CPU side left as it was);
     /// shorter if pages are missing.
-    fn gpu_range(copy: &Shadow, address: u64, len: u64) -> Vec<u8> {
+    pub(crate) fn gpu_range(copy: &Shadow, address: u64, len: u64) -> Vec<u8> {
         const PAGE: u64 = 1 << 16;
         let first = address & !(PAGE - 1);
         let pages: Vec<usize> = (first..address + len).step_by(PAGE as usize).map(|p| p as usize).collect();

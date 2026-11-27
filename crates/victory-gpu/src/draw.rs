@@ -58,6 +58,10 @@ pub(crate) struct State {
     /// bind set (`crate::bvh_replay`).
     #[cfg(feature = "diagnostics")]
     bvh_args: Vec<crate::bvh_replay::format::RootArg>,
+    /// With `VICTORY_BVH_CAPTURE_READER`: where the table views of
+    /// `bvh_args` are (senior 115).
+    #[cfg(feature = "diagnostics")]
+    bvh_views: Vec<crate::bvh_replay::capture::ViewSource>,
     pipeline: usize,
     /// The threads in x the dispatch being bound runs, for a program
     /// translated to take a thread limit ([`State::dispatch_x`]); none for
@@ -647,6 +651,8 @@ impl State {
         let capturing = compute && crate::bvh_replay::capture::enabled();
         #[cfg(feature = "diagnostics")]
         let mut cap: Vec<RootArg> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut cap_views: Vec<crate::bvh_replay::capture::ViewSource> = Vec::new();
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
         if list.take_rebind() {
@@ -884,6 +890,11 @@ impl State {
                                 .map(|(&value, &(kind, address))| Dword { kind, value, address })
                                 .collect();
                             cap.push(RootArg::Constants { param, dwords });
+                            // `VICTORY_BVH_CAPTURE_READER` (senior 115): the
+                            // captured program's tables with their views.
+                            if crate::bvh_replay::capture::wants_tables(p) {
+                                self.capture_tables(t, compute, param, &values, &mut cap, &mut cap_views);
+                            }
                         }
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
@@ -1014,8 +1025,83 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if capturing {
             self.bvh_args = cap;
+            self.bvh_views = cap_views;
         }
         true
+    }
+
+    /// `VICTORY_BVH_CAPTURE_READER` (diagnostics, senior 115): one
+    /// [`RootArg::Table`] per table slot of the stage `t` (its root-constant
+    /// dword in parameter `param` held `values`), with the buffer views the
+    /// program uses there as the host makes them
+    /// ([`crate::descriptor::host::buffer_plan`]); where their bytes are
+    /// goes to `sources`. A view the plan cannot describe is kept with no
+    /// elements, so that the replay refuses the capture.
+    #[cfg(feature = "diagnostics")]
+    fn capture_tables(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        param: u32,
+        values: &[u32],
+        cap: &mut Vec<crate::bvh_replay::format::RootArg>,
+        sources: &mut Vec<crate::bvh_replay::capture::ViewSource>,
+    ) {
+        use crate::bvh_replay::format::{RootArg, TableView};
+        let mut slots: Vec<u8> = Vec::new();
+        for u in t.host.user_data.iter().filter(|u| u.root == RootType::Table) {
+            if slots.contains(&u.slot) {
+                continue;
+            }
+            slots.push(u.slot);
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let arg = cap.len();
+            let mut views = Vec::new();
+            for r in t.used.iter().filter(|r| r.root == RootType::Table && r.slot == u.slot) {
+                let kind = match r.kind {
+                    ResourceType::Cbv => 0,
+                    ResourceType::Srv => 1,
+                    ResourceType::Uav => 2,
+                    _ => continue,
+                };
+                let mut tv = TableView { kind, register: r.lower_bound, dw: r.table_offset_dwords, ..TableView::default() };
+                let view = crate::descriptor::view(table + u64::from(r.table_offset_dwords) * 4);
+                // The address the view-address table holds for it, also for
+                // a view the plan cannot describe (f607780a's t355: only its
+                // address is read, the top level's).
+                tv.title = view
+                    .as_ref()
+                    .and_then(crate::descriptor::host::buffer_range)
+                    .map_or(0, |(a, _)| a);
+                if let Some(plan) = view.as_ref().and_then(crate::descriptor::host::buffer_plan) {
+                    tv.title = plan.title;
+                    tv.address = plan.address();
+                    tv.format = plan.format;
+                    tv.count = plan.count;
+                    tv.stride = plan.stride;
+                    tv.raw = plan.raw;
+                    tv.stride_word = plan.stride_word;
+                    sources.push(crate::bvh_replay::capture::ViewSource {
+                        arg,
+                        view: views.len(),
+                        copy: plan.copy.clone(),
+                        address: tv.address,
+                        len: tv.len(),
+                        unordered: kind == 2,
+                    });
+                }
+                views.push(tv);
+            }
+            cap.push(RootArg::Table {
+                param,
+                index: u.index,
+                slot: u32::from(u.slot),
+                value: values.get(u.index as usize).copied().unwrap_or(0),
+                views,
+            });
+        }
     }
 
     /// The heap index of a raw view (`uav`: unordered access) of the host
@@ -1304,6 +1390,7 @@ impl State {
                 builder && crate::bvh_gt::uav_barrier(),
                 crate::bvh_replay::format::Groups::Direct([x, y, z]),
                 std::mem::take(&mut self.bvh_args),
+                std::mem::take(&mut self.bvh_views),
             );
         }
         // SAFETY: an open list with everything set.
@@ -2201,6 +2288,7 @@ impl State {
                     most: max,
                 },
                 std::mem::take(&mut self.bvh_args),
+                std::mem::take(&mut self.bvh_views),
             );
         }
         #[cfg(feature = "diagnostics")]

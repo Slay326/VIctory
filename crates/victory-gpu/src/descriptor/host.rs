@@ -1311,6 +1311,136 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
     Some((shadow, address, len))
 }
 
+/// A buffer view of a table as [`make`] makes it, without making it
+/// (senior 115, `VICTORY_BVH_CAPTURE_READER`, diagnostics): the host
+/// description [`buffer_srv`] / [`buffer_uav`] build over the copy
+/// [`crate::shadow::for_view`] names. Mirrors them; keep both in step.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct BufferPlan {
+    pub(crate) format: u32,
+    /// Elements from the copy's byte 0 (`first`) and their count.
+    pub(crate) first: u64,
+    pub(crate) count: u32,
+    pub(crate) stride: u32,
+    pub(crate) raw: bool,
+    /// Bytes of one host element.
+    pub(crate) element: u64,
+    pub(crate) copy: std::sync::Arc<crate::shadow::Shadow>,
+    /// The title address of the copy's byte 0.
+    pub(crate) copy_start: u64,
+    /// The view-stride table's dword ([`view_stride`] | [`view_kind`]).
+    pub(crate) stride_word: u32,
+    /// The view's title start, as the view-address table holds it.
+    pub(crate) title: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl BufferPlan {
+    /// The title address of the host view's element 0.
+    pub(crate) fn address(&self) -> u64 {
+        self.copy_start + self.first * self.element
+    }
+}
+
+/// [`BufferPlan`] of `view`; None for textures, samplers and views
+/// [`make`] would refuse.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffer_plan(view: &View) -> Option<BufferPlan> {
+    let (unordered, address, words_srv, words_uav) = match view {
+        &View::Constant(address, size) => {
+            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let bytes = u64::from(size).min(shadow.left(address));
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: (bytes / 4) as u32,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            (false, address, Some(desc), None)
+        }
+        View::Shader(resource, Some(desc)) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::host_copy(resource).is_some() {
+                return None;
+            }
+            let (data, _) = crate::resource::buffer_bytes(resource)?;
+            (false, data as u64, Some(srv_desc(desc)), None)
+        }
+        View::Unordered(resource, _, Some(desc)) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::host_copy(resource).is_some() {
+                return None;
+            }
+            let (data, _) = crate::resource::buffer_bytes(resource)?;
+            (true, data as u64, None, Some(uav_desc(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: &[u32; 10] = desc[..10].try_into().ok()?;
+            if *unordered {
+                (true, address, None, Some(uav_desc(words)))
+            } else {
+                (false, address, Some(srv_desc(words)), None)
+            }
+        }
+        _ => return None,
+    };
+    let (format, first, count, stride, element) = if let Some(desc) = words_srv {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (desc.Format, b.FirstElement, b.NumElements, b.StructureByteStride, element_size(&desc))
+    } else {
+        let desc = words_uav?;
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let element = if b.StructureByteStride > 0 {
+            u64::from(b.StructureByteStride)
+        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        };
+        (desc.Format, b.FirstElement, b.NumElements, b.StructureByteStride, element)
+    };
+    if element == 0 {
+        return None;
+    }
+    let start = address + first * element;
+    let (shadow, _) = crate::shadow::for_view(start, u64::from(count) * element, copy_align(format, stride, element))?;
+    let offset = shadow.offset(start);
+    let copy_start = start - offset;
+    let plan = match raw_window(offset, count, raw_stride(format, stride)) {
+        Some((first, count)) => (DXGI_FORMAT_R32_TYPELESS.0 as u32, first, count, 0, true, 4),
+        None => (format.0 as u32, offset / element, count, stride, false, element),
+    };
+    let raw_flag = words_srv.is_some_and(|d| {
+        // SAFETY: a buffer view's union member.
+        unsafe { d.Anonymous.Buffer }.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+    }) || words_uav.is_some_and(|d| {
+        // SAFETY: a buffer view's union member.
+        unsafe { d.Anonymous.Buffer }.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+    });
+    let _ = unordered;
+    Some(BufferPlan {
+        format: plan.0,
+        first: plan.1,
+        count: plan.2,
+        stride: plan.3,
+        raw: plan.4 || raw_flag,
+        element: plan.5,
+        copy: shadow,
+        copy_start,
+        stride_word: view_stride(view) | view_kind(view),
+        title: buffer_range(view).map_or(start, |(a, _)| a),
+    })
+}
+
 /// Where the host copy a buffer view reads starts ([`copy_align`]), as
 /// [`buffer_srv`] and [`buffer_uav`] ask for it, so that draws find and
 /// refresh the copy the slot shows.

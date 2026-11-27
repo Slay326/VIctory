@@ -69,6 +69,10 @@ pub struct Options {
     pub retranslate: Option<PathBuf>,
     /// Shader hash prefixes to translate afresh (default 5552dac6).
     pub only: Vec<String>,
+    /// senior 115: a reader capture (`VICTORY_BVH_CAPTURE_READER`): run the
+    /// captured program and compare its unordered table views with the
+    /// game's bytes after the fence ([`reader_verdict`]).
+    pub reader: bool,
 }
 
 /// Where the stage dumps cut the builder's dispatches.
@@ -133,6 +137,7 @@ impl Options {
             cuts: None,
             retranslate: None,
             only: vec!["5552dac6".to_string()],
+            reader: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -143,6 +148,7 @@ impl Options {
                 "--card" => o.card_only = true,
                 "--warp" => o.warp = true,
                 "--diagnose" => o.diagnose = true,
+                "--reader" => o.reader = true,
                 "--retranslate" => {
                     o.retranslate = Some(PathBuf::from(
                         it.next().context("--retranslate needs a file")?,
@@ -171,7 +177,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..] [--retranslate <dll> [--only h,h]]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..] [--retranslate <dll> [--only h,h]] [--reader]"
             );
         }
         Ok(o)
@@ -228,10 +234,22 @@ impl Loaded {
 pub fn unsupported(c: &Capture, all: bool) -> Vec<String> {
     let mut why = BTreeSet::new();
     for d in c.dispatches.iter().filter(|d| all || d.builder) {
+        // senior 115: tables recorded with their views are replayable, and
+        // so are the view tables built from them.
+        let tables: Vec<(u32, u32)> = d
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                RootArg::Table { param, index, .. } => Some((*param, *index)),
+                _ => None,
+            })
+            .collect();
         for a in &d.args {
             match a {
-                RootArg::Constants { dwords, .. } => {
-                    if dwords.iter().any(|d| d.kind == DwordKind::TableOffset) {
+                RootArg::Constants { dwords, param } => {
+                    if dwords.iter().enumerate().any(|(i, d)| {
+                        d.kind == DwordKind::TableOffset && !tables.contains(&(*param, i as u32))
+                    }) {
                         why.insert(
                             "descriptor tables (table offsets in root constants)".to_string(),
                         );
@@ -239,11 +257,27 @@ pub fn unsupported(c: &Capture, all: bool) -> Vec<String> {
                 }
                 RootArg::Special { what, .. } => match what {
                     Special::MemoryTable | Special::MemoryDirty => {}
+                    Special::ViewStrides
+                    | Special::ViewAddresses
+                    | Special::MarksTable
+                    | Special::MarksBitmap
+                        if !tables.is_empty() => {}
                     w => {
                         why.insert(format!("root parameter {w:?}"));
                     }
                 },
                 RootArg::View { .. } => {}
+                RootArg::Table { views, slot, .. } => {
+                    for v in views {
+                        if let Some(w) = view_unusable(v) {
+                            why.insert(format!(
+                                "table slot {slot} view {}{}: {w}",
+                                ["b", "t", "u"].get(usize::from(v.kind)).unwrap_or(&"?"),
+                                v.register
+                            ));
+                        }
+                    }
+                }
             }
         }
         if let Groups::Indirect { arguments, .. } = &d.groups
@@ -253,6 +287,88 @@ pub fn unsupported(c: &Capture, all: bool) -> Vec<String> {
         }
     }
     why.into_iter().collect()
+}
+
+/// Why a table view cannot be replayed: no host view (the capture could
+/// not describe it), or fewer bytes than the host view spans.
+pub fn view_unusable(v: &TableView) -> Option<String> {
+    // Address only (no host view, but a title address the view-address
+    // table holds): replayed as a null view with its address, as the reader
+    // reads t355.
+    if v.count == 0 && v.title != 0 {
+        return None;
+    }
+    if v.count == 0 {
+        return Some("no host view".into());
+    }
+    if v.element() == 0 {
+        return Some(format!("format {} of unknown size", v.format));
+    }
+    if (v.pre.len() as u64) < v.len() {
+        return Some(format!("bytes {} of {}", v.pre.len(), v.len()));
+    }
+    None
+}
+
+/// senior 115: an unordered table view after the replay against the game's
+/// bytes after the fence. `pre`: before the program ran (both sides
+/// started there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewVerdict {
+    /// Bytes compared, bytes that differ, largest byte difference.
+    pub bytes: usize,
+    pub differ: usize,
+    pub most: u8,
+    /// Bytes the game changed and the harness changed (pre -> after).
+    pub game_changed: usize,
+    pub harness_changed: usize,
+    /// The first differing byte offsets.
+    pub first: Vec<usize>,
+}
+
+/// [`ViewVerdict`] of `harness` against `game`, both from `pre`.
+pub fn compare_view(pre: &[u8], game: &[u8], harness: &[u8]) -> ViewVerdict {
+    let n = game.len().min(harness.len());
+    let mut v = ViewVerdict {
+        bytes: n,
+        differ: game.len().max(harness.len()) - n,
+        most: 0,
+        game_changed: 0,
+        harness_changed: 0,
+        first: Vec::new(),
+    };
+    for i in 0..n {
+        let (g, h) = (game[i], harness[i]);
+        if g != h {
+            v.differ += 1;
+            v.most = v.most.max(g.abs_diff(h));
+            if v.first.len() < 16 {
+                v.first.push(i);
+            }
+        }
+        if pre.get(i).is_some_and(|&p| p != g) {
+            v.game_changed += 1;
+        }
+        if pre.get(i).is_some_and(|&p| p != h) {
+            v.harness_changed += 1;
+        }
+    }
+    v
+}
+
+/// The verdict over all views: "BYTE-EQUAL", "WITHIN 1" (every byte at most
+/// 1 apart: unorm rounding of another GPU), else "DIFFERENT"; "NO VIEW"
+/// without any unordered view with game bytes.
+pub fn reader_verdict(views: &[ViewVerdict]) -> &'static str {
+    if views.is_empty() {
+        "NO VIEW"
+    } else if views.iter().all(|v| v.differ == 0) {
+        "BYTE-EQUAL"
+    } else if views.iter().all(|v| v.most <= 1 && v.bytes > 0) {
+        "WITHIN 1"
+    } else {
+        "DIFFERENT"
+    }
 }
 
 struct Gpu {
@@ -417,6 +533,9 @@ struct Seg {
 pub struct RunResult {
     pub bitmap: BTreeSet<u32>,
     pub pages: BTreeMap<u64, Vec<u8>>,
+    /// senior 115: the unordered table views' bytes after the run, by
+    /// (host view address, bytes).
+    pub views: BTreeMap<(u64, u64), Vec<u8>>,
     pub gpu_ms: f64,
 }
 
@@ -455,15 +574,34 @@ fn run_prefix(
                         wanted.extend(seg_of(x.address));
                     }
                 }
-                RootArg::Special { .. } => {}
+                RootArg::Special { .. } | RootArg::Table { .. } => {}
             }
         }
         if let Groups::Indirect { args, .. } = &d.groups {
             wanted.extend(seg_of(*args));
         }
     }
-    // Heap: null pair, a pair per segment.
-    let slots = 2 + 2 * wanted.len() as u32 + 16;
+    // senior 115: tables of the replayed dispatches (reader captures): a
+    // heap range each after the segments' pairs, entry k of a table at its
+    // base + k.
+    let replayed: Vec<(usize, Dispatch)> = c
+        .dispatches
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(_, d)| o.all || d.builder)
+        .take(upto)
+        .collect();
+    let table_slots: u32 = replayed
+        .iter()
+        .flat_map(|(_, d)| d.args.iter())
+        .map(|a| match a {
+            RootArg::Table { views, .. } => views.iter().map(|v| v.dw / 8 + 1).max().unwrap_or(1),
+            _ => 0,
+        })
+        .sum();
+    // Heap: null pair, a pair per segment, the tables.
+    let slots = 2 + 2 * wanted.len() as u32 + 16 + table_slots;
     // SAFETY: plain descriptor heap creation.
     let heap: ID3D12DescriptorHeap = unsafe {
         gpu.device
@@ -570,6 +708,162 @@ fn run_prefix(
     const STAGE: u64 = 64 << 20;
     let upload = gpu.buffer(STAGE, D3D12_HEAP_TYPE_UPLOAD, false)?;
     let up = Gpu::map(&upload)?;
+    // Table views (senior 115): a buffer per host range (shared by the
+    // dispatches naming it, so that one dispatch's writes reach the next),
+    // filled with the bytes before the program's first list; the views as
+    // the game's host made them, over the buffer from its byte 0.
+    let mut tbufs: BTreeMap<(u64, u64), (ID3D12Resource, bool)> = BTreeMap::new();
+    let mut table_base: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut heap_views: Vec<(u32, TableView)> = Vec::new();
+    for (dk, d) in &replayed {
+        for (ak, a) in d.args.iter().enumerate() {
+            let RootArg::Table { views, .. } = a else { continue };
+            let base = next;
+            let n = views.iter().map(|v| v.dw / 8 + 1).max().unwrap_or(1);
+            for k in 0..n {
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            NumElements: 1,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                };
+                // SAFETY: a slot of our heap; a null view.
+                unsafe { gpu.device.CreateShaderResourceView(None, Some(&desc), cpu(base + k)) };
+            }
+            next += n;
+            table_base.insert((*dk, ak), base);
+            for v in views {
+                if v.count == 0 {
+                    // Address only: the slot stays null.
+                    heap_views.push((base + v.dw / 8, v.clone()));
+                    continue;
+                }
+                let key = (v.address, v.len());
+                if !tbufs.contains_key(&key) {
+                    let len = v.len().next_multiple_of(4).max(4);
+                    let b = gpu
+                        .buffer(len, D3D12_HEAP_TYPE_DEFAULT, true)
+                        .with_context(|| format!("table view {:#x} ({len} bytes)", v.address))?;
+                    let n = (v.pre.len() as u64).min(v.len());
+                    if n > STAGE {
+                        bail!("table view {:#x}: {n} bytes past the upload stage", v.address);
+                    }
+                    // SAFETY: inside the mapped upload buffer; the GPU is done with it.
+                    unsafe { std::ptr::copy_nonoverlapping(v.pre.as_ptr(), up, n as usize) };
+                    gpu.run(|list| {
+                        // SAFETY: live buffers, ranges inside them.
+                        unsafe { list.CopyBufferRegion(&b, 0, &upload, 0, n) };
+                        Ok(())
+                    })?;
+                    tbufs.insert(key, (b, false));
+                }
+                if v.kind == 2
+                    && let Some(t) = tbufs.get_mut(&key)
+                {
+                    t.1 = true;
+                }
+                let at = cpu(base + v.dw / 8);
+                let b = &tbufs[&key].0;
+                let format = if v.raw {
+                    DXGI_FORMAT_R32_TYPELESS
+                } else {
+                    DXGI_FORMAT(v.format as i32)
+                };
+                // SAFETY: a slot of our heap, a live buffer the view lies in.
+                unsafe {
+                    if v.kind == 2 {
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    FirstElement: 0,
+                                    NumElements: v.count,
+                                    StructureByteStride: v.stride,
+                                    CounterOffsetInBytes: 0,
+                                    Flags: if v.raw {
+                                        D3D12_BUFFER_UAV_FLAG_RAW
+                                    } else {
+                                        D3D12_BUFFER_UAV_FLAG_NONE
+                                    },
+                                },
+                            },
+                        };
+                        gpu.device.CreateUnorderedAccessView(b, None, Some(&desc), at);
+                    } else {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    FirstElement: 0,
+                                    NumElements: v.count,
+                                    StructureByteStride: v.stride,
+                                    Flags: if v.raw {
+                                        D3D12_BUFFER_SRV_FLAG_RAW
+                                    } else {
+                                        D3D12_BUFFER_SRV_FLAG_NONE
+                                    },
+                                },
+                            },
+                        };
+                        gpu.device.CreateShaderResourceView(b, Some(&desc), at);
+                    }
+                }
+                heap_views.push((base + v.dw / 8, v.clone()));
+            }
+        }
+    }
+    // The view tables the game binds next to tables, as the game's host
+    // fills them for these slots: strides, view addresses, write marks
+    // (none: the harness reads its buffers back whole) and their bitmap.
+    let bits_len = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+    let view_tables = if heap_views.is_empty() {
+        None
+    } else {
+        let n = u64::from(victory_shader::emit::HEAP_VIEWS.max(next));
+        let strides = gpu.buffer(4 * n, D3D12_HEAP_TYPE_UPLOAD, false)?;
+        let addresses = gpu.buffer(16 * n, D3D12_HEAP_TYPE_UPLOAD, false)?;
+        let marks = gpu.buffer(8 * n, D3D12_HEAP_TYPE_UPLOAD, false)?;
+        let bits = gpu.buffer(bits_len, D3D12_HEAP_TYPE_DEFAULT, true)?;
+        let (sp, ap, mp) = (Gpu::map(&strides)?, Gpu::map(&addresses)?, Gpu::map(&marks)?);
+        // SAFETY: mapped upload buffers of n entries each.
+        unsafe {
+            let st = std::slice::from_raw_parts_mut(sp.cast::<u32>(), n as usize);
+            let ad = std::slice::from_raw_parts_mut(ap.cast::<u32>(), 4 * n as usize);
+            let mk = std::slice::from_raw_parts_mut(mp.cast::<u32>(), 2 * n as usize);
+            st.fill(0);
+            ad.fill(0);
+            for e in mk.chunks_mut(2) {
+                e[0] = victory_shader::emit::VIEW_MARK_NONE;
+                e[1] = 0;
+            }
+            // The segments' raw pairs.
+            for i in 2..(2 + 2 * segs.len()) {
+                st[i] = 4;
+            }
+            for (i, v) in &heap_views {
+                let i = *i as usize;
+                st[i] = v.stride_word;
+                ad[4 * i] = v.title as u32;
+                ad[4 * i + 1] = ((v.title >> 32) & 0xffff) as u32;
+            }
+            std::ptr::write_bytes(up, 0, bits_len as usize);
+        }
+        gpu.run(|list| {
+            // SAFETY: live buffers.
+            unsafe { list.CopyBufferRegion(&bits, 0, &upload, 0, bits_len) };
+            Ok(())
+        })?;
+        Some((strides, addresses, marks, bits))
+    };
     let fill = |words: &mut [u32]| words.fill(POISON);
     // SAFETY: the mapped upload buffer, STAGE bytes.
     fill(unsafe { std::slice::from_raw_parts_mut(up.cast::<u32>(), (STAGE / 4) as usize) });
@@ -780,8 +1074,21 @@ fn run_prefix(
                     }
                     _ => (index as usize, 0, u32::MAX),
                 });
+                // Table offsets: the harness's heap ranges (senior 115).
+                let overrides: Vec<(u32, u32, u32)> = d
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ak, a)| match a {
+                        RootArg::Table { param, index, .. } => {
+                            table_base.get(&(dk, ak)).map(|&b| (*param, *index, b * 32))
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 for a in &d.args {
                     match a {
+                        RootArg::Table { .. } => {}
                         RootArg::Constants { param, dwords } => {
                             let mut values = Vec::with_capacity(dwords.len());
                             for (xi, x) in dwords.iter().enumerate() {
@@ -812,6 +1119,13 @@ fn run_prefix(
                                 }
                                 values[index] = threads;
                             }
+                            for &(p, index, value) in &overrides {
+                                if p == *param
+                                    && let Some(v) = values.get_mut(index as usize)
+                                {
+                                    *v = value;
+                                }
+                            }
                             list.SetComputeRoot32BitConstants(
                                 *param,
                                 values.len() as u32,
@@ -841,8 +1155,22 @@ fn run_prefix(
                             param,
                             what: Special::MemoryDirty,
                         } => list.SetComputeRootUnorderedAccessView(*param, bitmap_gpu),
-                        RootArg::Special { what, .. } => {
-                            bail!("root parameter {what:?} not replayable")
+                        RootArg::Special { param, what } => {
+                            let Some((strides, addresses, marks, bits)) = &view_tables else {
+                                bail!("root parameter {what:?} not replayable")
+                            };
+                            let (srv, buffer) = match what {
+                                Special::ViewStrides => (true, strides),
+                                Special::ViewAddresses => (true, addresses),
+                                Special::MarksTable => (true, marks),
+                                Special::MarksBitmap => (false, bits),
+                                _ => bail!("root parameter {what:?} not replayable"),
+                            };
+                            if srv {
+                                list.SetComputeRootShaderResourceView(*param, buffer.GetGPUVirtualAddress());
+                            } else {
+                                list.SetComputeRootUnorderedAccessView(*param, buffer.GetGPUVirtualAddress());
+                            }
                         }
                     }
                 }
@@ -937,11 +1265,114 @@ fn run_prefix(
             pages.insert(at, bytes);
         }
     }
+    // Unordered table views (reader captures).
+    let mut view_bytes = BTreeMap::new();
+    for (&key, (b, uav)) in &tbufs {
+        if !*uav {
+            continue;
+        }
+        let len = key.1;
+        if len > STAGE {
+            bail!("table view {:#x} of {len} bytes: past the readback stage", key.0);
+        }
+        gpu.run(|list| {
+            // SAFETY: live buffers, ranges inside them.
+            unsafe { list.CopyBufferRegion(&readback, 0, b, 0, len) };
+            Ok(())
+        })?;
+        // SAFETY: the mapped readback buffer, the GPU done with it.
+        view_bytes.insert(key, unsafe { std::slice::from_raw_parts(rb, len as usize) }.to_vec());
+    }
     Ok(RunResult {
+        views: view_bytes,
         bitmap: set,
         pages,
         gpu_ms: took.as_secs_f64() * 1000.0,
     })
+}
+
+/// senior 115, `--reader`: runs a reader capture `o.runs` times and
+/// compares every unordered table view with the game's bytes after the
+/// fence (all from the bytes before the program's first list). Exit 0: the
+/// game's bytes reproduced (byte-equal, or within 1 with a note), 1: not,
+/// 2: the capture cannot stand for the game (accesses outside it, or
+/// incomplete before the run).
+fn reader_main(gpu: &mut Gpu, l: &mut Loaded, o: &Options, incomplete: bool) -> anyhow::Result<i32> {
+    let c = l.capture.clone();
+    // The game's views: bytes before (first dispatch naming the range) and
+    // after the fence (the last one).
+    let mut game: BTreeMap<(u64, u64), (String, Vec<u8>, Vec<u8>)> = BTreeMap::new();
+    for d in c.dispatches.iter().filter(|d| o.all || d.builder) {
+        for a in &d.args {
+            let RootArg::Table { views, .. } = a else { continue };
+            for v in views.iter().filter(|v| v.kind == 2 && !v.post.is_empty()) {
+                let e = game
+                    .entry((v.address, v.len()))
+                    .or_insert_with(|| (format!("u{}", v.register), v.pre.clone(), Vec::new()));
+                e.2 = v.post.clone();
+            }
+        }
+    }
+    let runs: BTreeSet<u32> = c.dispatches.iter().filter(|d| o.all || d.builder).map(|d| d.list).collect();
+    let game_bits: BTreeSet<u32> = c
+        .bitmaps
+        .iter()
+        .filter(|(list, _)| runs.contains(list))
+        .flat_map(|(_, s)| s.iter().copied())
+        .collect();
+    println!(
+        "reader replay: dispatches {}, unordered views with game bytes {}, page bitmap bits in the game {}",
+        c.dispatches.iter().filter(|d| o.all || d.builder).count(),
+        game.len(),
+        game_bits.len()
+    );
+    let mut first: Option<BTreeMap<(u64, u64), Vec<u8>>> = None;
+    let mut deterministic = true;
+    let mut worst = Vec::new();
+    let mut outside_any = 0usize;
+    for k in 0..o.runs.max(1) {
+        let r = run_once(gpu, l, o)?;
+        let out = outside(&c, &r.bitmap, &game_bits);
+        outside_any += out.len();
+        let mut verdicts = Vec::new();
+        for (key, (name, pre, post)) in &game {
+            let Some(h) = r.views.get(key) else {
+                println!("run {k}: {name} at {:#x}: no harness bytes", key.0);
+                continue;
+            };
+            let v = compare_view(pre, post, &h[..post.len().min(h.len())]);
+            println!(
+                "run {k}: {name} at {:#x} ({} bytes): differ {} (most {}), changed by the game {}, by the harness {}, first differing {:?}, {:.1} ms",
+                key.0, v.bytes, v.differ, v.most, v.game_changed, v.harness_changed, v.first, r.gpu_ms
+            );
+            verdicts.push(v);
+        }
+        println!(
+            "run {k}: accesses outside the capture {} (first: {})",
+            out.len(),
+            out.iter().take(8).map(|&a| outside_text(a)).collect::<Vec<_>>().join(", ")
+        );
+        match &first {
+            None => first = Some(r.views.clone()),
+            Some(f) => deterministic &= *f == r.views,
+        }
+        worst = verdicts;
+    }
+    let verdict = reader_verdict(&worst);
+    println!("determinism across {} runs: {}", o.runs.max(1), if deterministic { "same bytes" } else { "BYTES DIFFER" });
+    let code = if incomplete || outside_any > 0 {
+        println!(
+            "RESULT: CAPTURE INVALID (incomplete before the run {incomplete}, accesses outside {outside_any}); output {verdict}"
+        );
+        2
+    } else {
+        println!("RESULT: {verdict}");
+        match verdict {
+            "BYTE-EQUAL" | "WITHIN 1" => 0,
+            _ => 1,
+        }
+    };
+    Ok(code)
 }
 
 /// The validator over `pages` (title address of the page, bytes): headers
@@ -1071,6 +1502,9 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
             before.join("; ")
         );
         return Ok(2);
+    }
+    if o.reader {
+        return reader_main(&mut gpu, &mut l, &o, !before.is_empty());
     }
     // The game's G and bitmap.
     let mut g: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -1516,6 +1950,102 @@ mod tests {
         assert_eq!(Cuts::Stages.points(&p), vec![2, 5, 6, 7]);
         assert_eq!(Cuts::Each.points(&p), vec![1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(Cuts::List(vec![4, 0, 99, 4]).points(&p), vec![1, 4, 7]);
+    }
+
+    use super::{compare_view, reader_verdict, unsupported, view_unusable};
+    use crate::bvh_replay::format::*;
+
+    fn view(kind: u8, register: u32, dw: u32, bytes: usize) -> TableView {
+        TableView {
+            kind,
+            register,
+            dw,
+            title: 0x1000,
+            address: 0x1000,
+            format: 61,
+            count: bytes as u32,
+            stride: 0,
+            raw: false,
+            stride_word: 1,
+            pre: vec![255; bytes],
+            post: Vec::new(),
+        }
+    }
+
+    /// A reader dispatch: the table offset in root constant dword 1 of
+    /// parameter 0, the table with `views`, the view tables beside it.
+    fn reader(views: Vec<TableView>, covered: bool) -> Capture {
+        let mut c = Capture::default();
+        c.pipelines.push(Pipeline { name: "r".into(), hash: "f607780a".into(), ..Pipeline::default() });
+        let mut args = vec![
+            RootArg::Constants {
+                param: 0,
+                dwords: vec![
+                    Dword::default(),
+                    Dword { kind: DwordKind::TableOffset, value: 0x4000, address: 0 },
+                ],
+            },
+            RootArg::Special { param: 1, what: Special::ViewStrides },
+            RootArg::Special { param: 2, what: Special::MarksTable },
+            RootArg::Special { param: 3, what: Special::MarksBitmap },
+        ];
+        if covered {
+            args.push(RootArg::Table { param: 0, index: 1, slot: 5, value: 0x4000, views });
+        }
+        c.dispatches.push(Dispatch {
+            list: 0,
+            pipeline: 0,
+            builder: true,
+            barrier: false,
+            groups: Groups::Direct([1, 1, 1]),
+            args,
+        });
+        c
+    }
+
+    /// senior 115: a table recorded with its views makes the table offset
+    /// and the view tables replayable; without it they stay refused, and a
+    /// view with too few bytes or no host view refuses the capture.
+    #[test]
+    fn tables_with_their_views_are_replayable_and_only_whole_ones() {
+        assert_eq!(unsupported(&reader(vec![view(2, 52, 48, 16)], true), false), Vec::<String>::new());
+        let refused = unsupported(&reader(vec![], false), false);
+        assert!(refused.iter().any(|w| w.contains("descriptor tables")), "{refused:?}");
+        assert!(refused.iter().any(|w| w.contains("ViewStrides")), "{refused:?}");
+        let mut short = view(1, 10, 8, 16);
+        short.pre.truncate(15);
+        let refused = unsupported(&reader(vec![short], true), false);
+        assert!(refused.iter().any(|w| w.contains("t10") && w.contains("15 of 16")), "{refused:?}");
+        let none = TableView { count: 0, title: 0, ..view(0, 3, 56, 0) };
+        assert!(view_unusable(&none).is_some());
+        let address_only = TableView { count: 0, title: 0xd5f2_0cd00, ..view(1, 355, 32, 0) };
+        assert!(view_unusable(&address_only).is_none());
+        assert!(view_unusable(&TableView { format: 0, ..view(1, 1, 0, 4) }).is_some());
+        assert!(view_unusable(&view(1, 1, 0, 4)).is_none());
+    }
+
+    /// senior 115: the u52 comparison counts every differing byte, the
+    /// bytes each side changed, and the verdict follows the largest gap.
+    #[test]
+    fn reader_views_compare_byte_by_byte() {
+        let pre = vec![255u8; 8];
+        let mut game = pre.clone();
+        game[2] = 127;
+        game[5] = 127;
+        let v = compare_view(&pre, &game, &game);
+        assert_eq!((v.differ, v.game_changed, v.harness_changed), (0, 2, 2));
+        assert_eq!(reader_verdict(&[v]), "BYTE-EQUAL");
+        let mut near = game.clone();
+        near[5] = 128;
+        let v = compare_view(&pre, &game, &near);
+        assert_eq!((v.differ, v.most, v.first.clone()), (1, 1, vec![5]));
+        assert_eq!(reader_verdict(&[v]), "WITHIN 1");
+        let v = compare_view(&pre, &game, &pre);
+        assert_eq!((v.differ, v.most, v.harness_changed), (2, 128, 0));
+        assert_eq!(reader_verdict(&[v]), "DIFFERENT");
+        let v = compare_view(&pre, &game, &game[..7]);
+        assert_eq!(v.differ, 1);
+        assert_eq!(reader_verdict(&[]), "NO VIEW");
     }
 }
 
