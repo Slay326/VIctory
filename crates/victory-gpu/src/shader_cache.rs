@@ -152,14 +152,68 @@ pub fn wide_groups(container: &[u8]) -> bool {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    host_shader_with(container, None)
+    host_shader_with(container, None, (0, 0))
+}
+
+/// Translations made with coherent title memory since the start
+/// ([`host_shader_with`]'s `coherent`; translated or from the cache).
+static COHERENT: AtomicU64 = AtomicU64::new(0);
+
+/// How many shaders were taken with coherent title memory since the start
+/// (`VICTORY_BVH_COHERENT`, the BVH builder's stages).
+pub fn coherent_count() -> u64 {
+    COHERENT.load(Ordering::Relaxed)
+}
+
+/// The translation of `container` as `options` say, with the coherence
+/// parts `coherent` (`victory_shader::emit::with_coherent`, on the thread
+/// that translates). 0: exactly `victory_shader::emit::translate_with`.
+pub(crate) fn translate_container(
+    container: &[u8],
+    options: victory_shader::emit::Options,
+    coherent: u8,
+) -> Result<HostShader, String> {
+    let translate = || victory_shader::emit::translate_with(container, options).map_err(|e| e.to_string());
+    if coherent != 0 {
+        victory_shader::emit::with_coherent(coherent, translate)
+    } else {
+        translate()
+    }
+}
+
+/// The key part of an entry: `build` ([`host_build`]), then a builder
+/// stage's own loop limit and its coherence (parts, `VICTORY_BVH_COHERENT`
+/// stage), each only when set, so every other entry keeps its key.
+fn entry_build(build: [u8; 32], loop_limit: Option<u32>, coherent: (u8, u8)) -> [u8; 32] {
+    let mut build = build;
+    if let Some(limit) = loop_limit {
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"loop limit of the program's own");
+        h.update(&limit.to_le_bytes());
+        build = *h.finalize().as_bytes();
+    }
+    if coherent.0 != 0 {
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"coherent title memory where the console bypasses its caches: parts, stage");
+        h.update(&[coherent.0, coherent.1]);
+        build = *h.finalize().as_bytes();
+    }
+    build
 }
 
 /// [`host_shader`] with loops left after `loop_limit` iterations if set
 /// (`victory_shader::emit::Options::loop_limit`; the BVH builder's stages,
-/// `crate::pipeline`): such entries are keyed apart, every other entry
-/// stays as it is.
-pub fn host_shader_with(container: &[u8], loop_limit: Option<u32>) -> (Result<HostShader, String>, bool) {
+/// `crate::pipeline`), and with the coherence parts `coherent.0` if not 0
+/// (the builder's stages with `VICTORY_BVH_COHERENT`, stage `coherent.1`,
+/// [`translate_container`]):
+/// such entries are keyed apart, every other entry stays as it is.
+pub fn host_shader_with(
+    container: &[u8],
+    loop_limit: Option<u32>,
+    coherent: (u8, u8),
+) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options {
@@ -167,7 +221,7 @@ pub fn host_shader_with(container: &[u8], loop_limit: Option<u32>) -> (Result<Ho
         group_x_offset: wide_groups(container),
         loop_limit,
     };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| translate_container(c, options, coherent.0);
     // The host first: making it says what its view heaps are like, which
     // translations depend on. Without a host they are as for most hosts.
     let _ = crate::host::host();
@@ -175,13 +229,16 @@ pub fn host_shader_with(container: &[u8], loop_limit: Option<u32>) -> (Result<Ho
         victory_shader::emit::heap_views(),
         victory_shader::emit::title_views(),
     );
-    let mut build = host_build(build(), views, title);
-    if let Some(limit) = loop_limit {
-        let mut h = blake3::Hasher::new();
-        h.update(&build);
-        h.update(b"loop limit of the program's own");
-        h.update(&limit.to_le_bytes());
-        build = *h.finalize().as_bytes();
+    let build = entry_build(host_build(build(), views, title), loop_limit, coherent);
+    if coherent.0 != 0 {
+        let n = COHERENT.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            n,
+            parts = coherent.0,
+            stage = coherent.1,
+            container = %&blake3::hash(container).to_hex()[..16],
+            "VICTORY_BVH_COHERENT: a BVH builder stage taken with coherent title memory"
+        );
     }
     match cache() {
         Some((cache, _)) => cached(
@@ -469,8 +526,115 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A compute program in an `ACCC` container (the `FSPX` layout
+    /// `victory_shader::native::fspx_program` reads), wave32, 32 lanes, a
+    /// root UAV whose address is in `s[4:5]`: a pointer loaded from it, a
+    /// `glc dlc` load of title memory where it points (as the BVH builder's
+    /// refit loads), a store of the value 4 bytes on,
+    /// `s_waitcnt_vscnt null, 0`. Made here, so no title data is needed.
+    pub(crate) fn coherent_container() -> Vec<u8> {
+        const GLC: u32 = 1 << 16;
+        const DLC: u32 = 1 << 12;
+        let global = |op: u32, vdst: u32, vaddr: u32, data: u32, saddr: u32, offset: u32| {
+            [0x37 << 26 | op << 18 | 2 << 14 | (offset & 0xFFF), vaddr | data << 8 | saddr << 16 | vdst << 24]
+        };
+        // A pointer read from the root view, then title memory where it
+        // points (an address the program computes, as the builder's are).
+        let mut w = vec![
+            0x7E00_0000 | 1 << 17 | 0x01 << 9 | 4, // v_mov_b32 v1, s4
+            0x7E00_0000 | 2 << 17 | 0x01 << 9 | 5, // v_mov_b32 v2, s5
+        ];
+        w.extend(global(0x0D, 3, 1, 0, 0x7D, 0)); // global_load_dwordx2 v[3:4], v[1:2], off: a pointer
+        w.push(0xBF8C_0000); // s_waitcnt 0
+        let [a, b] = global(0x0C, 5, 3, 0, 0x7D, 0); // global_load_dword v5, v[3:4], off glc dlc
+        w.extend([a | GLC | DLC, b, 0xBF8C_0000]); // s_waitcnt 0
+        w.extend(global(0x1C, 0, 3, 5, 0x7D, 4)); // global_store_dword v[3:4], v5, off offset:4
+        w.extend([0xBBFD_0000, 0xBF81_0000]); // s_waitcnt_vscnt null, 0; s_endpgm
+        let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // Registers: threads 32x1x1, wave32, 16 VGPRs, 6 user SGPRs.
+        let packet = words(&[0, 0, 0, 32 | 1 << 16, 1 | (1 << 4) << 16, 1, 6 << 1]);
+        // A root UAV (resource type 3, root type 1) in user data 4, slot 0.
+        let mut uav = [0u8; 32];
+        uav[0] = 0x41;
+        uav[4..6].copy_from_slice(&[3, 1]);
+        uav[20..23].copy_from_slice(&[2, 4, 0]);
+        uav[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut hash = [0u8; 32];
+        hash[0] = 0x43;
+        let mut meta = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+        meta.extend_from_slice(&[0x40, 4, 1, 0]);
+        meta.extend_from_slice(&uav);
+        meta.extend_from_slice(&hash);
+        let len = meta.len() as u32 - 0x14;
+        meta[4..8].copy_from_slice(&len.to_le_bytes());
+        let blobs: [(u32, &[u8]); 4] = [(0, &packet), (1, &[0; 0x14]), (6, &code), (7, &meta)];
+        let mut part = vec![0u8; 0x10 + 16 * blobs.len()];
+        for (i, (kind, blob)) in blobs.iter().enumerate() {
+            let at = part.len().next_multiple_of(16);
+            part.resize(at, 0);
+            part[0x10 + 16 * i..0x10 + 16 * (i + 1)].copy_from_slice(&words(&[*kind, at as u32, blob.len() as u32, 0]));
+            part.extend_from_slice(blob);
+        }
+        let header = words(&[u32::from_le_bytes(*b"FSPX"), 1, 4, part.len() as u32]);
+        part[..16].copy_from_slice(&header);
+        // A container of that one part (as `victory_shader::dxbc` reads one).
+        let total = 0x20 + 4 + 8 + part.len();
+        let mut out = b"DXBC".to_vec();
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&words(&[1, total as u32, 1, 0x24]));
+        out.extend_from_slice(&victory_shader::FourCC::ACCC.0);
+        out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        out.extend_from_slice(&part);
+        out
+    }
+
+    /// The options the host translates with ([`host_shader_with`]).
+    fn host_options() -> victory_shader::emit::Options {
+        victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None }
+    }
+
+    /// `VICTORY_BVH_COHERENT` off (and for every stage not the builder's
+    /// with it on): the translation is the one made without the switch,
+    /// byte for byte, and its cache entry keeps its key; on, the container
+    /// above (glc dlc, vscnt) translates differently and is keyed apart.
+    #[test]
+    fn coherent_translations_change_only_what_asks_for_them() {
+        let container = coherent_container();
+        let today = victory_shader::emit::translate_with(&container, host_options()).expect("translates");
+        let plain = translate_container(&container, host_options(), 0).expect("translates");
+        assert_eq!(plain.dxil, today.dxil, "off: byte for byte as without the switch");
+        let b = victory_shader::emit::COHERENT_UAV | victory_shader::emit::COHERENT_GLOBAL;
+        let coherent = translate_container(&container, host_options(), b).expect("translates");
+        assert_ne!(coherent.dxil, today.dxil, "on: the glc dlc load through the coherent UAV changes the DXIL");
+        assert!(!victory_shader::emit::coherent(), "the thread's switch is reset");
+        let again = translate_container(&container, host_options(), 0).expect("translates");
+        assert_eq!(again.dxil, today.dxil, "a coherent translation leaves later ones as they were");
+        // Keys: as before the switch existed when off (the old derivation,
+        // written out), apart when on.
+        let build = [7u8; 32];
+        let old = |limit: Option<u32>| match limit {
+            None => build,
+            Some(limit) => {
+                let mut h = blake3::Hasher::new();
+                h.update(&build);
+                h.update(b"loop limit of the program's own");
+                h.update(&limit.to_le_bytes());
+                *h.finalize().as_bytes()
+            }
+        };
+        for limit in [None, Some(4096)] {
+            assert_eq!(entry_build(build, limit, (0, 0)), old(limit), "off: the key of today, {limit:?}");
+            // No parts is off whatever the stage says.
+            assert_eq!(entry_build(build, limit, (0, 2)), old(limit), "no parts: the key of today, {limit:?}");
+            assert_ne!(entry_build(build, limit, (b, 1)), old(limit), "on: keyed apart, {limit:?}");
+            assert_ne!(entry_build(build, limit, (b, 1)), entry_build(build, limit, (b, 2)), "each stage its own key");
+        }
+        assert_ne!(entry_build(build, None, (b, 1)), entry_build(build, Some(4096), (b, 1)));
+    }
 
     fn shader() -> HostShader {
         HostShader {
