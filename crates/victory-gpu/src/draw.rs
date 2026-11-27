@@ -54,6 +54,10 @@ pub(crate) struct IndexView {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// With `VICTORY_BVH_CAPTURE`: the root arguments the last compute
+    /// bind set (`crate::bvh_replay`).
+    #[cfg(feature = "diagnostics")]
+    bvh_args: Vec<crate::bvh_replay::format::RootArg>,
     pipeline: usize,
     /// The threads in x the dispatch being bound runs, for a program
     /// translated to take a thread limit ([`State::dispatch_x`]); none for
@@ -317,6 +321,12 @@ impl State {
     /// title list's own), texture states and twins (each segment has its
     /// own, made from the real states at its submission). Clears and copies
     /// are commands, recorded once in the segment they belong to.
+    /// The bound pipeline (the title's object).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pipeline(&self) -> usize {
+        self.pipeline
+    }
+
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
@@ -624,6 +634,13 @@ impl State {
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
         let _builder = list.writer_is_builder(crate::arena::enabled() && crate::pipeline::is_builder(self.pipeline as This));
         let l = &list.list;
+        // `VICTORY_BVH_CAPTURE`: what each root parameter gets, by meaning.
+        #[cfg(feature = "diagnostics")]
+        use crate::bvh_replay::format::{Dword, DwordKind, RootArg, Special};
+        #[cfg(feature = "diagnostics")]
+        let capturing = compute && crate::bvh_replay::capture::enabled();
+        #[cfg(feature = "diagnostics")]
+        let mut cap: Vec<RootArg> = Vec::new();
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
         if list.take_rebind() {
@@ -687,6 +704,11 @@ impl State {
                 if compute {
                     l.SetComputeRootShaderResourceView(table_param, table);
                     l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
+                    #[cfg(feature = "diagnostics")]
+                    if capturing {
+                        cap.push(RootArg::Special { param: table_param, what: Special::MarksTable });
+                        cap.push(RootArg::Special { param: bitmap_param, what: Special::MarksBitmap });
+                    }
                 } else {
                     l.SetGraphicsRootShaderResourceView(table_param, table);
                     l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
@@ -755,6 +777,8 @@ impl State {
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
+                #[cfg(feature = "diagnostics")]
+                let mut kinds = vec![(DwordKind::Plain, 0u64); dwords as usize];
                 // `VICTORY_BVH_ARENA`: the builder's root descriptors into
                 // memory no copy holds (its pools) get arena pages before
                 // this submission runs.
@@ -787,6 +811,25 @@ impl State {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    #[cfg(feature = "diagnostics")]
+                    if capturing {
+                        let address = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(&Root::View(a)) => a,
+                            _ => 0,
+                        };
+                        kinds[u.index as usize] = if fresh.is_some() || u.root == RootType::Table {
+                            (DwordKind::TableOffset, 0)
+                        } else if takes_group_offset(t.group_x_offset, u) {
+                            (DwordKind::GroupXOffset, 0)
+                        } else if is_root_view_offset(u) {
+                            (DwordKind::RootViewOffset, address)
+                        } else if is_root_view(u) {
+                            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
+                            (if uav { DwordKind::RootViewUav } else { DwordKind::RootViewSrv }, address)
+                        } else {
+                            (DwordKind::Plain, 0)
+                        };
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         // Set by the split dispatch's signature (`execute_indirect`).
@@ -822,6 +865,15 @@ impl State {
                 unsafe {
                     if compute {
                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        #[cfg(feature = "diagnostics")]
+                        if capturing {
+                            let dwords = values
+                                .iter()
+                                .zip(&kinds)
+                                .map(|(&value, &(kind, address))| Dword { kind, value, address })
+                                .collect();
+                            cap.push(RootArg::Constants { param, dwords });
+                        }
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
@@ -847,6 +899,10 @@ impl State {
                             let gpu = table.GetGPUVirtualAddress();
                             if compute {
                                 l.SetComputeRootShaderResourceView(param, gpu);
+                                #[cfg(feature = "diagnostics")]
+                                if capturing {
+                                    cap.push(RootArg::Special { param, what: Special::ViewStrides });
+                                }
                             } else {
                                 l.SetGraphicsRootShaderResourceView(param, gpu);
                             }
@@ -861,6 +917,10 @@ impl State {
                     let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
                         continue;
                     };
+                    #[cfg(feature = "diagnostics")]
+                    if capturing {
+                        cap.push(RootArg::View { param, kind, address: *address });
+                    }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
                         match (compute, kind) {
@@ -884,6 +944,10 @@ impl State {
                     not_run("view addresses without a view heap");
                     return false;
                 };
+                #[cfg(feature = "diagnostics")]
+                if capturing {
+                    cap.push(RootArg::Special { param, what: Special::ViewAddresses });
+                }
                 // SAFETY: an open list; the heap's buffer lives with the heap.
                 unsafe {
                     if compute {
@@ -900,6 +964,13 @@ impl State {
                     return false;
                 };
                 crate::memory::note_use(&p.name);
+                #[cfg(feature = "diagnostics")]
+                if capturing {
+                    cap.push(RootArg::Special { param, what: Special::MemoryTable });
+                    if let Some(dirty_param) = stage.memory_dirty {
+                        cap.push(RootArg::Special { param: dirty_param, what: Special::MemoryDirty });
+                    }
+                }
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {
@@ -929,6 +1000,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
+        #[cfg(feature = "diagnostics")]
+        if capturing {
+            self.bvh_args = cap;
+        }
         true
     }
 
@@ -1203,6 +1278,18 @@ impl State {
             && let Some((_, map)) = &self.memory
         {
             map.note_builder();
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::capture::enabled() {
+            let builder = crate::pipeline::is_builder(self.pipeline as This);
+            crate::bvh_replay::capture::record(
+                list,
+                p,
+                builder,
+                builder && crate::bvh_gt::uav_barrier(),
+                crate::bvh_replay::format::Groups::Direct([x, y, z]),
+                std::mem::take(&mut self.bvh_args),
+            );
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
@@ -1989,6 +2076,26 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH
+            && crate::bvh_replay::capture::enabled()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            crate::bvh_replay::capture::record(
+                list,
+                p,
+                crate::pipeline::is_builder(self.pipeline as This),
+                false,
+                crate::bvh_replay::format::Groups::Indirect {
+                    stride,
+                    arguments: vec![[kind, u32::from(split.is_some()), 0, 0]],
+                    args: arguments,
+                    count: count.unwrap_or(0),
+                    most: max,
+                },
+                std::mem::take(&mut self.bvh_args),
+            );
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -2070,14 +2177,14 @@ fn group_offset(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 /// whose x is groups; PC 2 flag log, 27.11.).
 // shortcut: the bit's meaning is read off the title's dispatches, not a
 // header; the other bits (0x20 in all of them) are not looked at.
-const X_IN_GROUPS: u32 = 0x8000;
+pub(crate) const X_IN_GROUPS: u32 = 0x8000;
 
 /// What a `DispatchX` of `x` with `flags` runs on the host: the groups in
 /// x, and the thread limit its program takes (none: every thread of them).
 /// `group` is the program's group size in x where it is translated to take
 /// a thread limit; other programs, and dispatches whose x counts groups,
 /// run x groups as they are.
-fn x_groups(flags: u32, x: u32, group: Option<u32>) -> (u32, Option<u32>) {
+pub(crate) fn x_groups(flags: u32, x: u32, group: Option<u32>) -> (u32, Option<u32>) {
     match group {
         Some(group) if flags & X_IN_GROUPS == 0 && group != 0 => (x.div_ceil(group), Some(x)),
         _ => (x, None),
