@@ -875,6 +875,11 @@ impl State {
                         // rehydrating stage's centre values per bottom level.
                         if crate::bvh_gt::target().is_some() {
                             crate::bvh_gt::note_bind(&p.name, &values);
+                            // v4: the structure a builder stage writes, kept
+                            // with the list for its submission.
+                            if let Some((at, stage)) = crate::bvh_gt::build_target(&p.name, &values) {
+                                list.note_gt_build(at, stage);
+                            }
                         }
                         #[cfg(feature = "diagnostics")]
                         if capturing {

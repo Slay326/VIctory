@@ -44,6 +44,30 @@
 //! (a box32 root in the last 64 bytes); 0x8002 / 0x8004 nodes still start
 //! inside D1 * 64.
 //!
+//! v4 (Fable, review "Aufruf 9" of bvh-harness-design-fable.md; `BVH GT s..
+//! v4` lines, the ones to read for "top levels valid in the game"):
+//! * pages read besides the compared ones come from where the list's page
+//!   table sends shaders ([`Table`], `crate::memory`): the copy it names,
+//!   else its arena page, else nothing (the GPU reads zeros there; never
+//!   title memory). Before, the arena directory's page came first and then
+//!   the first copy of all holding the whole page, which with nested title
+//!   buffers or an arena page under a later buffer are other bytes than the
+//!   builder wrote and the readers see;
+//! * only top levels the submission built are judged ([`build_target`]: the
+//!   builder stages' root constants name the structure they write, kept
+//!   with the list and taken at its submission); another top-level header
+//!   in a compared page is an older build whose bottom levels may be gone
+//!   and counts apart, not judged;
+//! * every reached instance falls in one class (Aufruf 8 point 2): (a) a
+//!   bottom-level header at its address A; (b) one at A + k * 64 whose
+//!   parent table (dword 14) starts at A; (d) none, and A was a build
+//!   target of this or an earlier submission: the defect; (e) none, and A
+//!   never was one: not judged, counted (c) once a later submission builds
+//!   it; and apart: A in no page of the table;
+//! * bottom levels with dword 15 bits 24-29 set are not judged (Aufruf 8
+//!   point 7); a bottom level's box nodes are all walked (v3 stopped after
+//!   4096 and called the rest valid).
+//!
 //! `VICTORY_BVH_GT_PAGES` (64): the most pages a submission compares.
 //! `VICTORY_BVH_GT_MAX` (200): the most submissions compared in a run.
 //! `VICTORY_BVH_UAV_BARRIER=1`: a global UAV barrier before every dispatch
@@ -222,7 +246,7 @@ pub(crate) fn reader_check(submission: u64) {
     );
     // The second validator on the readers' bytes (top levels only with
     // what these pages hold: nothing is read besides).
-    let (v2, v3) = validate(&now.iter().map(|(f, b)| (*f, &b[..])).collect::<Vec<_>>(), &last.headers, false);
+    let (v2, v3, _) = validate(&now.iter().map(|(f, b)| (*f, &b[..])).collect::<Vec<_>>(), &last.headers, &Ctx::none());
     tracing::info!(
         target: "victory_gpu::bvh_gt",
         "BVH GT reader s{submission} v2 (headers of builder s{}): {}; first invalid: {}",
@@ -287,7 +311,35 @@ pub(crate) struct Marks {
     pub(crate) missed_pages: u64,
     pub(crate) missed_regions: u64,
     pub(crate) first_missed: Vec<u64>,
+    /// v4: the list's page table, for the pages read besides.
+    pub(crate) table: Option<Table>,
 }
+
+/// Where a page table sends shaders at a 64 KiB page (v4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// A copy of a title buffer.
+    Copy,
+    /// A page of the BVH arena (`crate::arena`).
+    Arena,
+    /// The null views: shaders read zeros, their stores are dropped.
+    Nothing,
+}
+
+/// One page as a list's page table gives it ([`Table`]): the 64 KiB page
+/// asked for, where the table sends shaders there, and the GPU's bytes
+/// (from title address `from`; a copy holding part of the page gives that
+/// part); no bytes for [`Source::Nothing`] or a fetch that failed.
+pub(crate) struct Got {
+    pub(crate) page: u64,
+    pub(crate) source: Source,
+    pub(crate) from: usize,
+    pub(crate) bytes: Option<Vec<u8>>,
+}
+
+/// The pages at the given title addresses as the shaders of a list read
+/// them after its submission's fence (`crate::memory::gt_table`).
+pub(crate) type Table = Arc<dyn Fn(&[u64]) -> Vec<Got> + Send + Sync>;
 
 /// A page compared: where its bytes start, its copy (none for an arena
 /// page) and page, G.
@@ -317,6 +369,7 @@ pub(crate) struct Gt {
     /// ([`validate`]).
     v2: V2,
     v3: V3,
+    v4: V4,
     t: [Option<Compare>; 2],
 }
 
@@ -330,7 +383,13 @@ impl Gt {
         }
         let (mut owned, mut missed_pages, mut missed_regions, mut first_missed) = (Vec::new(), 0, 0, Vec::new());
         let mut arena = Vec::new();
+        // v4: the first target list's page table (the lists of one
+        // submission name the same copies and arena pages).
+        let mut table: Option<Table> = None;
         for m in marks {
+            if table.is_none() {
+                table = m.table;
+            }
             owned.extend(m.owned);
             arena.extend(m.arena);
             missed_pages += m.missed_pages;
@@ -356,13 +415,35 @@ impl Gt {
             Some(Page { from, page, copy: Some(copy), g })
         }));
         let g = scan(&pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>());
-        let (v2, v3) = validate(
+        // v4: the build map as of this submission ([`note_builds`] ran
+        // before), title memory only to tell whether it holds a header the
+        // GPU's bytes lack.
+        let now: std::collections::HashMap<u64, u8> =
+            with_builds(|b| if b.submission == submission { b.now.clone() } else { Default::default() });
+        let headers: Vec<u64> = g.headers.iter().map(|(at, _)| *at).collect();
+        let (v2, v3, mut v4) = validate(
             &pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>(),
-            &g.headers.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
-            true,
+            &headers,
+            &Ctx {
+                table: table.as_ref(),
+                gate: true,
+                built_now: &|at| now.get(&at).copied(),
+                built: &|at| with_builds(|b| b.first(at)),
+                near: &|at| with_builds(|b| b.near(at)),
+                title: &|at| {
+                    let mut b = [0u8; 4];
+                    crate::host::read_into(at as *const u8, &mut b).then(|| u32::from_le_bytes(b))
+                },
+            },
         );
+        v4.targets = now.len() as u32;
+        let tops: Vec<u64> = now.iter().filter(|(_, stages)| **stages & 1 << TOP_STAGE != 0).map(|(at, _)| *at).collect();
+        v4.top_targets = tops.len() as u32;
+        v4.top_targets_unseen = tops.iter().filter(|at| !headers.contains(at)).count() as u32;
+        with_builds(|b| b.wait_for(submission, &v4.never_built));
         V2_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V2::default).add(&v2);
         V3_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V3::default).add(&v3);
+        V4_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V4::default).add(&v4);
         // Remembered for the readers' check ([`reader_check`]): the pages
         // with headers, where they live.
         if reader_target().is_some() && !g.headers.is_empty() {
@@ -387,6 +468,7 @@ impl Gt {
             g,
             v2,
             v3,
+            v4,
             t: [None, None],
         })
     }
@@ -590,6 +672,21 @@ impl Gt {
         );
         let total3 = V3_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
         tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} v3 run so far: {}", total3.text());
+        // v4 (Fable): the lines to read for the top levels.
+        tracing::info!(
+            target: "victory_gpu::bvh_gt",
+            "BVH GT s{s} v4: {}; first invalid: {}; first not judged: {}",
+            self.v4.text(),
+            self.v4.first.join(", "),
+            self.v4.first_not_judged.join(", "),
+        );
+        let total4 = V4_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        let (later, waiting, dropped, known, full, noted) = with_builds(|b| (b.later, b.pending.len(), b.dropped, b.map.len(), b.full, b.noted));
+        tracing::info!(
+            target: "victory_gpu::bvh_gt",
+            "BVH GT s{s} v4 run so far: {}; class e instances built by a later submission (c) {later}, still never built {waiting} (not kept {dropped}); build targets known {known} (not kept {full}), binds noted {noted}",
+            total4.text(),
+        );
         for (k, t) in self.t.iter().enumerate() {
             let Some(t) = t else { continue };
             let first: Vec<String> = t.first.iter().map(|(a, g, t)| format!("{a:#x} G={g:#010x} T={t:#010x}")).collect();
@@ -719,6 +816,9 @@ pub(crate) struct Check {
     /// Parent table: entries checked, matching as `table[node]` (forward)
     /// and as `table[-1 - node]` (backward); its form is not known.
     pub(crate) parents: (u32, u32, u32),
+    /// v4 (counted only, no verdict): children whose pointer names the
+    /// header itself (address 0, as every slot of a node of zeros does).
+    pub(crate) into_header: u32,
 }
 
 type Aabb = ([f32; 3], [f32; 3]);
@@ -834,7 +934,18 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
     let mut seen = std::collections::HashSet::new();
     while let Some((p, bounds, is_root)) = queue.pop() {
         let kind = p & 7;
-        if !(kind == 4 || kind == 5) || at(p) == 0 || at(p) >= bytes || !seen.insert(p) || seen.len() > 4096 {
+        if !(kind == 4 || kind == 5) || at(p) == 0 || at(p) >= bytes || !seen.insert(p) {
+            continue;
+        }
+        // v4: v3 walks every box node (D1 counts at most 2^22 nodes; what is
+        // past [`MOST_NODES`] counts as not read). Before, and still in v1
+        // and v2, the walk stopped after 4096 nodes and the rest passed
+        // unchecked.
+        let most = if node_end { MOST_NODES } else { 4096 };
+        if seen.len() > most {
+            if node_end && seen.len() == most + 1 {
+                c.missing += 1;
+            }
             continue;
         }
         let n = if kind == 4 { 16 } else { 28 };
@@ -862,6 +973,7 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
                 continue;
             }
             children += 1;
+            c.into_header += u32::from(at(child) == 0);
             if at(child) >= bytes {
                 c.outside += 1;
                 fail(&mut c, format!("child {child:#x} of {p:#x} past the size"));
@@ -899,6 +1011,10 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
     c.valid = c.why.is_none();
     c
 }
+
+/// The most box nodes v3 walks in one bottom level (v4): twice the nodes
+/// the largest size counts ([`is_header`]).
+const MOST_NODES: usize = 1 << 23;
 
 /// Header dword 0 mark (high half): the structure is still packed.
 const PACKED: u32 = 0x100;
@@ -1211,6 +1327,48 @@ pub(crate) struct TopCheck {
     pub(crate) kind_from_title: u32,
     pub(crate) any_title: bool,
     pub(crate) title_before: Option<usize>,
+    /// v4 (only with a [`TopCtx`]): reached instances by class
+    /// ([`CLASS_A`] ..); those whose search for a header past the parent
+    /// table hit a word not read, and those whose bottom level lies in no
+    /// page of the table (both not judged, in [`TopCheck::blas_unread`]);
+    /// class (e) instances with a build target within 64 KiB past their
+    /// address; instances without a header in the GPU's bytes (classes d, e
+    /// and no page) where title memory holds a bottom-level header; the
+    /// first class (e) instance, which leaves the top level not judged; the
+    /// class (e) bottom levels (at most 4096); the first class (b) instance.
+    pub(crate) classes: [u32; 4],
+    pub(crate) search_unread: u32,
+    pub(crate) blas_unmapped: u32,
+    pub(crate) near: u32,
+    pub(crate) title_header: u32,
+    pub(crate) first_order: Option<String>,
+    pub(crate) never_built: Vec<u64>,
+    pub(crate) first_b: Option<String>,
+    /// v4: the first instance's bottom-level address with no header in the
+    /// GPU's bytes (classes d, e, or no page of the table).
+    pub(crate) first_no_header: Option<u64>,
+}
+
+/// Indices of [`TopCheck::classes`] (v4, Fable Aufruf 8 point 2): (a) a
+/// bottom-level header at the instance's address, (b) one past its parent
+/// table, (d) none though the address was a build target, (e) none and
+/// never a build target so far ((c), built by a later submission, is known
+/// only later: [`Builds::later`]).
+const CLASS_A: usize = 0;
+const CLASS_B: usize = 1;
+const CLASS_D: usize = 2;
+const CLASS_E: usize = 3;
+
+/// What the v4 check of a top level asks besides the bytes: the first
+/// submission that built the structure at an address (none: never a build
+/// target so far), whether a build target lies within 64 KiB past it,
+/// whether its page is in no page of the table, and title memory's word
+/// there (to tell a header the GPU's bytes lack; decides nothing).
+pub(crate) struct TopCtx<'a> {
+    pub(crate) built: &'a dyn Fn(u64) -> Option<u64>,
+    pub(crate) near: &'a dyn Fn(u64) -> bool,
+    pub(crate) unmapped: &'a dyn Fn(u64) -> bool,
+    pub(crate) title: &'a dyn Fn(u64) -> Option<u32>,
 }
 
 /// Index of `b` in [`TopCheck::on`] and [`TopCheck::finite`].
@@ -1236,7 +1394,7 @@ fn bottom_index(b: Bottom) -> usize {
 /// Child boxes are not compared with their parent's (that is [`check`]'s,
 /// which counts the packed instances' +-FLT_MAX as outside).
 pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopCheck {
-    check_top_core(read, base, 64, None)
+    check_top_core(read, base, 64, None, None)
 }
 
 /// [`check_top`] with the instance list ending by D1 * 64 + `list_extra`
@@ -1252,10 +1410,22 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
 /// first defect, the tree and the bottom levels' kinds note whether title
 /// words decided them ([`TopCheck::defect_from_title`]). v2 passes none
 /// and is unchanged.
-fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64, title: Option<&dyn Fn(u64) -> bool>) -> TopCheck {
+///
+/// With `x` (v4) each reached instance is classed ([`TopCheck::classes`]):
+/// (b) counts as the header it found, (d) is a defect, (e) is noted in
+/// [`TopCheck::first_order`], a bottom level in no page of the table as
+/// not read.
+fn check_top_core(
+    read: &dyn Fn(u64) -> Option<u32>,
+    base: u64,
+    list_extra: u64,
+    title: Option<&dyn Fn(u64) -> bool>,
+    x: Option<&TopCtx>,
+) -> TopCheck {
     let mut t = TopCheck::default();
     let mut why: Option<String> = None;
     let (mut defect, mut unread): (Option<String>, Option<String>) = (None, None);
+    let mut order: Option<String> = None;
     let mut defect_title = false;
     let tw = |a: u64| title.is_some_and(|f| f(a));
     let fail = |why: &mut Option<String>, w: String| {
@@ -1373,11 +1543,78 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64,
                     };
                     let blas = u64::from(e15) << 8;
                     let header = (read(blas), read(blas + 4));
-                    let kind = match header {
+                    let mut kind = match header {
                         (Some(d0), Some(d1)) if is_header(d0, d1) => bottom_kind(d0),
                         _ => None,
                     };
-                    let blas_title = tw(blas) || tw(blas + 4);
+                    let mut blas_title = tw(blas) || tw(blas + 4);
+                    // v4: one class per reached instance.
+                    if let Some(x) = x {
+                        let title_header = || {
+                            matches!(((x.title)(blas), (x.title)(blas + 4)), (Some(d0), Some(d1)) if is_header(d0, d1) && bottom_kind(d0).is_some())
+                        };
+                        if kind.is_some() {
+                            t.classes[CLASS_A] += 1;
+                        } else if header.0.is_none() || header.1.is_none() {
+                            if (x.unmapped)(blas) {
+                                t.blas_unread += 1;
+                                t.blas_unmapped += 1;
+                                t.first_no_header.get_or_insert(blas);
+                                t.title_header += u32::from(title_header());
+                                let w = format!("instance {index}: bottom level {blas:#x} in no page of the table (the GPU reads zeros there)");
+                                note(&mut unread, &w);
+                                fail(&mut why, w);
+                                continue;
+                            }
+                        } else {
+                            match header_past_parents(read, blas) {
+                                Search::Found(head, k) => {
+                                    t.classes[CLASS_B] += 1;
+                                    if t.first_b.is_none() {
+                                        t.first_b = Some(format!("instance {index} {blas:#x}: header at +{:#x}", head - blas));
+                                    }
+                                    kind = Some(k);
+                                    blas_title |= tw(head) || tw(head + 4) || tw(head + 56);
+                                }
+                                Search::NotRead(a) => {
+                                    t.blas_unread += 1;
+                                    t.search_unread += 1;
+                                    let w = format!(
+                                        "instance {index}: no bottom-level header at {blas:#x}, past its parent table the bottom level at {a:#x} not read"
+                                    );
+                                    note(&mut unread, &w);
+                                    fail(&mut why, w);
+                                    continue;
+                                }
+                                Search::Nothing => {
+                                    t.blas_unread += 1;
+                                    t.blas_no_header += 1;
+                                    t.first_no_header.get_or_insert(blas);
+                                    t.title_header += u32::from(title_header());
+                                    let w = match (x.built)(blas) {
+                                        Some(first) => {
+                                            t.classes[CLASS_D] += 1;
+                                            let w = format!("instance {index}: no bottom-level header at {blas:#x}, a build target since s{first} (v4 d)");
+                                            note_defect(&mut defect, &mut defect_title, &w, entry_title || blas_title);
+                                            w
+                                        }
+                                        None => {
+                                            t.classes[CLASS_E] += 1;
+                                            t.near += u32::from((x.near)(blas));
+                                            if t.never_built.len() < 4096 {
+                                                t.never_built.push(blas);
+                                            }
+                                            let w = format!("instance {index}: no bottom-level header at {blas:#x}, never a build target so far (v4 e)");
+                                            note(&mut order, &w);
+                                            w
+                                        }
+                                    };
+                                    fail(&mut why, w);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let Some(kind) = kind else {
                         t.blas_unread += 1;
                         if let (Some(_), Some(_)) = header {
@@ -1434,6 +1671,7 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64,
     t.why = why;
     t.first_defect = defect;
     t.first_unread = unread;
+    t.first_order = order;
     t
 }
 
@@ -1475,6 +1713,146 @@ fn note_cb(blas: u64, cb: [u32; 3]) {
 
 fn cb_of(blas: u64) -> Option<[u32; 3]> {
     CB.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&blas).copied()
+}
+
+/// v4: the builder stages whose root constants name the structure a
+/// dispatch writes: (shader hash prefix, user-data index of the address's
+/// low dword; the high dword follows). Read by senior 112 from the dispatch
+/// lists of the s89-1 captures (runs\s112\build-targets-s89-1.txt; s7072:
+/// 5552dac6 names 166 structures, the 162 bottom levels of 6f6a359d and the
+/// 4 top levels of 190fbf0e; 5e687674 the 69 rehydrated ones), unverified:
+/// the v4 lines count the targets noted, a wrong table shows as 0 there.
+const BUILD_TARGETS: [(&str, usize); 3] = [("5552dac6", 16), ("190fbf0e", 22), (REHYDRATE, 35)];
+
+/// Index in [`BUILD_TARGETS`] of the stage that runs for top levels only.
+const TOP_STAGE: u8 = 1;
+
+/// The structure a compute bind of the pipeline named `name` with the root
+/// constants `values` (by user-data index) writes, and its stage (index in
+/// [`BUILD_TARGETS`]); none for other programs and for addresses no header
+/// can lie at (0, not 256-byte aligned).
+pub(crate) fn build_target(name: &str, values: &[u32]) -> Option<(u64, u8)> {
+    let (stage, &(_, i)) = BUILD_TARGETS.iter().enumerate().find(|(_, (hash, _))| name.contains(hash))?;
+    let at = u64::from(*values.get(i)?) | u64::from(*values.get(i + 1)?) << 32;
+    (at != 0 && at & 0xff == 0).then_some((at, stage as u8))
+}
+
+/// v4: what the builder built, by submission (the GPU's order; the binds
+/// are kept with their list and noted when it is submitted).
+#[derive(Default)]
+pub(crate) struct Builds {
+    /// Each target's first and last submission and its stages (bits by
+    /// [`BUILD_TARGETS`] index).
+    map: std::collections::BTreeMap<u64, (u64, u64, u8)>,
+    /// The targets of the submission noted last, and that submission.
+    now: std::collections::HashMap<u64, u8>,
+    submission: u64,
+    /// Binds noted; targets not kept because the map was full.
+    noted: u64,
+    full: u64,
+    /// Class (e) bottom levels and the submission that found them; those a
+    /// later submission built since (class (c)); those not kept.
+    pending: Vec<(u64, u64)>,
+    later: u64,
+    dropped: u64,
+}
+
+impl Builds {
+    /// Submission `submission` ran the builder binds `targets`.
+    fn note(&mut self, submission: u64, targets: &[(u64, u8)]) {
+        self.submission = submission;
+        self.now.clear();
+        for &(at, stage) in targets {
+            self.noted += 1;
+            *self.now.entry(at).or_default() |= 1 << stage;
+            let room = self.map.len() < 1 << 20;
+            match self.map.get_mut(&at) {
+                Some(e) => {
+                    e.1 = submission;
+                    e.2 |= 1 << stage;
+                }
+                None if room => {
+                    self.map.insert(at, (submission, submission, 1 << stage));
+                }
+                None => self.full += 1,
+            }
+        }
+        let before = self.pending.len();
+        let now = &self.now;
+        self.pending.retain(|(blas, found)| !(now.contains_key(blas) && submission > *found));
+        self.later += (before - self.pending.len()) as u64;
+    }
+
+    /// The first submission that built the structure at `at`.
+    fn first(&self, at: u64) -> Option<u64> {
+        self.map.get(&at).map(|e| e.0)
+    }
+
+    /// Whether a build target lies within 64 KiB past `at`.
+    fn near(&self, at: u64) -> bool {
+        self.map.range(at + 1..=at + 0x1_0000).next().is_some()
+    }
+
+    /// Class (e) bottom levels found by submission `submission`, kept until
+    /// a later one builds them.
+    fn wait_for(&mut self, submission: u64, never_built: &[u64]) {
+        for &blas in never_built {
+            if self.pending.len() < 1 << 16 {
+                self.pending.push((blas, submission));
+            } else {
+                self.dropped += 1;
+            }
+        }
+    }
+}
+
+static BUILDS: std::sync::Mutex<Option<Builds>> = std::sync::Mutex::new(None);
+
+fn with_builds<R>(f: impl FnOnce(&mut Builds) -> R) -> R {
+    f(BUILDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Builds::default))
+}
+
+/// After the fence of submission `submission` (every one while
+/// `VICTORY_BVH_GT` is set, before [`Gt::take`]): the build targets its
+/// lists' binds named (`crate::host`).
+pub(crate) fn note_builds(submission: u64, targets: &[(u64, u8)]) {
+    with_builds(|b| b.note(submission, targets));
+}
+
+/// The most 64-byte steps past an instance's address that
+/// [`header_past_parents`] looks for a header (64 KiB).
+const PARENT_STEPS: u64 = 1024;
+
+/// What [`header_past_parents`] found.
+#[derive(Debug, PartialEq)]
+enum Search {
+    Found(u64, Bottom),
+    NotRead(u64),
+    Nothing,
+}
+
+/// v4 class (b) (Fable Aufruf 8 point 2): a bottom-level header at `blas` +
+/// k * 64 (k = 1 ..= [`PARENT_STEPS`]) whose parent table (dword 14, signed,
+/// from the header) starts at `blas`: the instance names the block's start
+/// and the parent table lies before the header (V105: 2 of 8 "no header"
+/// 0x400 below a header). Headers that point elsewhere are passed by; a
+/// word not read ends the search.
+fn header_past_parents(read: &dyn Fn(u64) -> Option<u32>, blas: u64) -> Search {
+    for k in 1..=PARENT_STEPS {
+        let at = blas + 64 * k;
+        let Some(d0) = read(at) else { return Search::NotRead(at) };
+        if d0 & 0xffff != 6 {
+            continue;
+        }
+        let (Some(d1), Some(d14)) = (read(at + 4), read(at + 56)) else { return Search::NotRead(at) };
+        if is_header(d0, d1)
+            && let Some(kind) = bottom_kind(d0)
+            && at as i64 + i64::from(d14 as i32) == blas as i64
+        {
+            return Search::Found(at, kind);
+        }
+    }
+    Search::Nothing
 }
 
 /// v2 of one bottom level: valid as e56de5c ([`Centre::Bit30AllAxes`]),
@@ -1680,12 +2058,34 @@ impl Verdict {
 /// v3c (senior 109): box nodes of every kind may end by D1 * 64 + 64 (a
 /// fresh bottom level's box32 root at D1 * 64 - 64, see [`check_core`]);
 /// where they start stays as above (0x8002 / 0x8004 inside D1 * 64).
+///
+/// v4 (Fable Aufruf 8 points 7, 8): a bottom level with dword 15 bits 24-29
+/// set is not judged (the bit-30 rule is read from capture data, 31/31
+/// against 4/31, not from the shader source, and says nothing about those
+/// bits). The node end is a rule by kind: 0x8002 / 0x8004 nodes start inside
+/// D1 * 64 and so end by D1 * 64 + 48 (pointers step by 64 bytes); packed
+/// ones lie exactly within D1 * 64 ([`check_packed`]); other bottom levels
+/// keep v3b's measured rule (start by D1 * 64, end by D1 * 64 + 64).
 pub(crate) fn check_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> Verdict {
+    check_v3_counted(read, base, centre).0
+}
+
+/// Dword 15 bits the bit-30 rule does not cover (v4).
+const D15_UNKNOWN: u32 = 0x3f00_0000;
+
+/// [`check_v3`] and [`Check::into_header`] of the walk.
+fn check_v3_counted(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> (Verdict, u32) {
+    if let Some(d15) = read(base + 60)
+        && d15 & D15_UNKNOWN != 0
+    {
+        return (Verdict::NotJudged(format!("dword 15 {d15:#x}: bits 24-29 set")), 0);
+    }
     let extra = match read(base).and_then(bottom_kind) {
         Some(Bottom::Other) => 64,
         _ => 0,
     };
-    verdict_of(&check_core(read, base, extra, Some(centre), true))
+    let c = check_core(read, base, extra, Some(centre), true);
+    (verdict_of(&c), c.into_header)
 }
 
 /// [`Verdict`] of a bottom-level [`Check`]: a reason that names something
@@ -1709,10 +2109,12 @@ pub(crate) struct BottomV3 {
     pub(crate) without_rule: Verdict,
     pub(crate) with_rule: Verdict,
     pub(crate) cb_known: bool,
+    /// v4: [`Check::into_header`] of the walk.
+    pub(crate) into_header: u32,
 }
 
 pub(crate) fn check_bottom_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, kind: Bottom, cb: Option<[u32; 3]>) -> BottomV3 {
-    let without_rule = check_v3(read, base, Centre::Bit30AllAxes);
+    let (without_rule, into_header) = check_v3_counted(read, base, Centre::Bit30AllAxes);
     let h: Option<Vec<u32>> = (0..16).map(|i| read(base + 4 * i)).collect();
     let centre = match cb {
         Some(cb) => Some(cb.map(f32::from_bits)),
@@ -1722,7 +2124,7 @@ pub(crate) fn check_bottom_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, kind
         Some(c) if kind != Bottom::Packed => check_v3(read, base, Centre::Given(c)),
         _ => without_rule.clone(),
     };
-    BottomV3 { without_rule, with_rule, cb_known: cb.is_some() }
+    BottomV3 { without_rule, with_rule, cb_known: cb.is_some(), into_header }
 }
 
 /// The most instances a plausible top level holds (v3).
@@ -1768,23 +2170,35 @@ pub(crate) fn no_top_level(h: &[u32]) -> Option<String> {
 /// and "never reached" counts only when all was read.
 #[cfg(test)]
 pub(crate) fn check_top_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> (TopCheck, Verdict) {
-    check_top_v3_with(read, base, &|_| false)
+    check_top_v3_with(read, base, &|_| false, None)
 }
 
 /// [`check_top_v3`] with `title` naming the words read from title memory
 /// (v3b, senior 105; see [`check_top_core`]).
-pub(crate) fn check_top_v3_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, title: &dyn Fn(u64) -> bool) -> (TopCheck, Verdict) {
+///
+/// With `x` (v4, [`TopCtx`]) the instances are classed: a class (d) instance
+/// is a defect; a bottom level in no page of the table or a class (e)
+/// instance leaves the top level not judged (after defects and words not
+/// read, before "never reached").
+pub(crate) fn check_top_v3_with(
+    read: &dyn Fn(u64) -> Option<u32>,
+    base: u64,
+    title: &dyn Fn(u64) -> bool,
+    x: Option<&TopCtx>,
+) -> (TopCheck, Verdict) {
     let Some(h) = (0..16).map(|i| read(base + 4 * i)).collect::<Option<Vec<u32>>>() else {
         return (TopCheck::default(), Verdict::NotJudged("header not read".into()));
     };
     if let Some(w) = no_top_level(&h) {
         return (TopCheck { instances: h[3], ..Default::default() }, Verdict::NotJudged(w));
     }
-    let t = check_top_core(read, base, 0, Some(title));
+    let t = check_top_core(read, base, 0, Some(title), x);
     let v = if let Some(d) = &t.first_defect {
         Verdict::Invalid(d.clone())
     } else if let Some(u) = &t.first_unread {
         Verdict::NotJudged(u.clone())
+    } else if let Some(o) = &t.first_order {
+        Verdict::NotJudged(o.clone())
     } else if t.never > 0 {
         Verdict::Invalid(format!("{} of {} instances never reached", t.never, t.instances))
     } else {
@@ -1825,7 +2239,7 @@ pub(crate) fn top_v3_over(
         })
     };
     let from_title = |a: u64| first(a).is_none() && title(a) && besides(a).is_some();
-    let (mut t, v) = check_top_v3_with(&read, at, &from_title);
+    let (mut t, v) = check_top_v3_with(&read, at, &from_title, None);
     t.any_title = used.get();
     let decided = match &v {
         Verdict::Invalid(w) if w.ends_with("instances never reached") => t.tree_from_title,
@@ -2032,6 +2446,204 @@ static V3_TOTAL: std::sync::Mutex<Option<V3>> = std::sync::Mutex::new(None);
 /// v2 totals of the run ([`Gt::take`]).
 static V2_TOTAL: std::sync::Mutex<Option<V2>> = std::sync::Mutex::new(None);
 
+/// Pages read besides the compared ones (v4, [`more_pages`]): from the copy
+/// the table names, from its arena page, in no page of the table (not
+/// read), named but not fetched, wanted past the budget.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub(crate) struct Besides {
+    pub(crate) copies: u64,
+    pub(crate) arena: u64,
+    pub(crate) unmapped: u64,
+    pub(crate) not_fetched: u64,
+    pub(crate) past_budget: u64,
+}
+
+/// The v4 counts of one submission ([`validate`]) and of the run: the top
+/// levels the submission built, judged on the bytes its shaders read.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct V4 {
+    /// Structures the submission's builder binds named, of them by the
+    /// top-level stage ([`TOP_STAGE`]), of those with no header among the
+    /// compared ones (built, but never seen by the validator).
+    pub(crate) targets: u32,
+    pub(crate) top_targets: u32,
+    pub(crate) top_targets_unseen: u32,
+    /// Top levels built by the submission: [valid, invalid, not judged].
+    pub(crate) tops: [u32; 3],
+    /// Plausible top-level headers the submission did not build (not
+    /// judged, nothing read besides for them), and headers that are no
+    /// plausible top level.
+    pub(crate) stale: u32,
+    pub(crate) no_top: u32,
+    /// Of the built ones not judged: a box node or instance entry not read;
+    /// a bottom level not read (past the budget, not fetched); a bottom
+    /// level in no page of the table; a class (e) instance; another reason.
+    pub(crate) why_not: [u32; 5],
+    /// Summed over the judged built top levels (valid or invalid).
+    pub(crate) instances: u64,
+    pub(crate) reached: u64,
+    pub(crate) never: u64,
+    pub(crate) twice: u64,
+    pub(crate) bad_slots: u64,
+    pub(crate) nodes_twice: u64,
+    /// Summed over every built plausible top level, judged or not
+    /// ([`TopCheck::classes`] and the counts beside it).
+    pub(crate) classes: [u64; 4],
+    pub(crate) search_unread: u64,
+    pub(crate) blas_unmapped: u64,
+    pub(crate) near: u64,
+    pub(crate) title_header: u64,
+    pub(crate) pages: Besides,
+    /// Bottom levels not judged for dword 15 bits 24-29; valid ones with a
+    /// child pointer into the header ([`Check::into_header`]).
+    pub(crate) d15_unknown: u32,
+    pub(crate) into_header: u32,
+    /// The class (e) bottom levels (at most 4096 a submission).
+    pub(crate) never_built: Vec<u64>,
+    pub(crate) first: Vec<String>,
+    pub(crate) first_not_judged: Vec<String>,
+}
+
+impl V4 {
+    fn add(&mut self, o: &V4) {
+        self.targets += o.targets;
+        self.top_targets += o.top_targets;
+        self.top_targets_unseen += o.top_targets_unseen;
+        for (a, b) in self.tops.iter_mut().zip(&o.tops).chain(self.why_not.iter_mut().zip(&o.why_not)) {
+            *a += b;
+        }
+        self.stale += o.stale;
+        self.no_top += o.no_top;
+        self.instances += o.instances;
+        self.reached += o.reached;
+        self.never += o.never;
+        self.twice += o.twice;
+        self.bad_slots += o.bad_slots;
+        self.nodes_twice += o.nodes_twice;
+        for (a, b) in self.classes.iter_mut().zip(&o.classes) {
+            *a += b;
+        }
+        self.search_unread += o.search_unread;
+        self.blas_unmapped += o.blas_unmapped;
+        self.near += o.near;
+        self.title_header += o.title_header;
+        self.pages.copies += o.pages.copies;
+        self.pages.arena += o.pages.arena;
+        self.pages.unmapped += o.pages.unmapped;
+        self.pages.not_fetched += o.pages.not_fetched;
+        self.pages.past_budget += o.pages.past_budget;
+        self.d15_unknown += o.d15_unknown;
+        self.into_header += o.into_header;
+    }
+
+    fn add_bottom(&mut self, kind: Bottom, c: &BottomV3) {
+        self.d15_unknown += u32::from(matches!(&c.without_rule, Verdict::NotJudged(w) if w.starts_with("dword 15")));
+        let verdict = if kind == Bottom::Rehydrated { &c.with_rule } else { &c.without_rule };
+        self.into_header += u32::from(*verdict == Verdict::Valid && c.into_header > 0);
+    }
+
+    /// The top level at `at`: `built` whether the submission built it (or
+    /// every top level is judged: no gate), `t` and `v` its v4 check, `note`
+    /// what is known of the first instance without a header.
+    fn add_top(&mut self, at: u64, built: bool, t: &TopCheck, v: &Verdict, note: &str) {
+        if matches!(v, Verdict::NotJudged(w) if w.starts_with("no top level")) {
+            self.no_top += 1;
+            return;
+        }
+        if !built {
+            self.stale += 1;
+            return;
+        }
+        self.tops[v.index()] += 1;
+        for (a, b) in self.classes.iter_mut().zip(&t.classes) {
+            *a += u64::from(*b);
+        }
+        self.search_unread += u64::from(t.search_unread);
+        self.blas_unmapped += u64::from(t.blas_unmapped);
+        self.near += u64::from(t.near);
+        self.title_header += u64::from(t.title_header);
+        let room = 4096usize.saturating_sub(self.never_built.len());
+        self.never_built.extend(t.never_built.iter().take(room));
+        let list = match v {
+            Verdict::Valid => None,
+            Verdict::Invalid(_) => Some(&mut self.first),
+            Verdict::NotJudged(w) => {
+                let k = if w.contains("in no page of the table") {
+                    2
+                } else if w.ends_with("(v4 e)") {
+                    3
+                } else if w.contains("bottom level") && w.ends_with("not read") {
+                    1
+                } else if w.ends_with("not read") || w.starts_with("more than") {
+                    0
+                } else {
+                    4
+                };
+                self.why_not[k] += 1;
+                Some(&mut self.first_not_judged)
+            }
+        };
+        if let Some(list) = list
+            && list.len() < 3
+        {
+            list.push(format!("top {at:#x} {}{note}", v.why()));
+        }
+        if matches!(v, Verdict::NotJudged(_)) {
+            return;
+        }
+        self.instances += u64::from(t.instances);
+        self.reached += u64::from(t.reached);
+        self.never += u64::from(t.never);
+        self.twice += u64::from(t.twice);
+        self.bad_slots += u64::from(t.bad_slots);
+        self.nodes_twice += u64::from(t.nodes_twice);
+    }
+
+    /// The counts as one log line's text.
+    pub(crate) fn text(&self) -> String {
+        format!(
+            "build targets {} (top-level stage {}, of them no header among the compared ones {}); top levels built here valid/invalid/not judged {}/{}/{}; top-level headers not built here (not judged) {}, no top level {}; not judged for: box node or instance not read {}, bottom level not read {}, bottom level in no page of the table {}, class e instance {}, other {}; judged: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}; instances of the built ones a header / b header past the parent table / d no header, a build target / e no header, never a build target {}/{}/{}/{} (header search not read {}, bottom level in no page of the table {}, e with a build target within 64 KiB {}; without a header but one in title memory {}); pages read besides: from the table's copy {}, its arena page {}, in no page of the table {}, not fetched {}, past the budget {}; bottom levels not judged for dword 15 bits 24-29 {}, valid with a child pointer into the header {}",
+            self.targets,
+            self.top_targets,
+            self.top_targets_unseen,
+            self.tops[0],
+            self.tops[1],
+            self.tops[2],
+            self.stale,
+            self.no_top,
+            self.why_not[0],
+            self.why_not[1],
+            self.why_not[2],
+            self.why_not[3],
+            self.why_not[4],
+            self.instances,
+            self.reached,
+            self.never,
+            self.twice,
+            self.bad_slots,
+            self.nodes_twice,
+            self.classes[CLASS_A],
+            self.classes[CLASS_B],
+            self.classes[CLASS_D],
+            self.classes[CLASS_E],
+            self.search_unread,
+            self.blas_unmapped,
+            self.near,
+            self.title_header,
+            self.pages.copies,
+            self.pages.arena,
+            self.pages.unmapped,
+            self.pages.not_fetched,
+            self.pages.past_budget,
+            self.d15_unknown,
+            self.into_header,
+        )
+    }
+}
+
+/// v4 totals of the run ([`Gt::take`]).
+static V4_TOTAL: std::sync::Mutex<Option<V4>> = std::sync::Mutex::new(None);
+
 /// `VICTORY_BVH_GT_TOP_PAGES` (256): the most 64 KiB pages a submission
 /// reads besides the compared ones to follow its top levels' instances to
 /// their bottom levels.
@@ -2040,77 +2652,118 @@ fn most_top_pages() -> usize {
     *N.get_or_init(|| number("VICTORY_BVH_GT_TOP_PAGES", 256) as usize)
 }
 
+/// What [`validate`] reads and asks besides the compared pages (v4).
+pub(crate) struct Ctx<'a> {
+    /// The list's page table; none: nothing is read besides.
+    pub(crate) table: Option<&'a Table>,
+    /// Whether only top levels the submission built are judged by v4.
+    pub(crate) gate: bool,
+    /// The stages (bits by [`BUILD_TARGETS`] index) that built the structure
+    /// at an address in this submission.
+    pub(crate) built_now: &'a dyn Fn(u64) -> Option<u8>,
+    /// As [`TopCtx`].
+    pub(crate) built: &'a dyn Fn(u64) -> Option<u64>,
+    pub(crate) near: &'a dyn Fn(u64) -> bool,
+    pub(crate) title: &'a dyn Fn(u64) -> Option<u32>,
+}
+
+impl Ctx<'static> {
+    /// Nothing read besides, no build map, every top level judged (the
+    /// readers' check; tests).
+    pub(crate) fn none() -> Ctx<'static> {
+        fn no_stage(_: u64) -> Option<u8> {
+            None
+        }
+        fn no_submission(_: u64) -> Option<u64> {
+            None
+        }
+        fn no(_: u64) -> bool {
+            false
+        }
+        fn no_word(_: u64) -> Option<u32> {
+            None
+        }
+        Ctx { table: None, gate: false, built_now: &no_stage, built: &no_submission, near: &no, title: &no_word }
+    }
+}
+
+/// Dwords at title addresses from `pages` (start, bytes), each within one
+/// 64 KiB page: as [`reader`], by page (the pages read besides are
+/// thousands).
+fn indexed<'a>(pages: &'a [(usize, Vec<u8>)]) -> impl Fn(u64) -> Option<u32> + 'a {
+    let mut by_page: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    for (i, (from, _)) in pages.iter().enumerate() {
+        by_page.entry(*from as u64 >> 16).or_default().push(i);
+    }
+    move |at: u64| {
+        by_page.get(&(at >> 16))?.iter().find_map(|&i| {
+            let (from, b) = &pages[i];
+            let o = (at as usize).checked_sub(*from)?;
+            let w = b.get(o..o + 4)?;
+            Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        })
+    }
+}
+
 /// Pages for the top levels' check that the compared ones lack (title
-/// addresses of 64 KiB pages): the arena's bytes where it holds them, else
-/// (v3b, senior 105) a copy's GPU bytes where one copy holds the whole page
-/// (the GPU's state after the fence, as for the compared pages; title
-/// memory gets it only after this check), else title memory. Counts into
-/// `extra` ([`V2::extra`]: arena and copies under 0) and `copies`.
+/// addresses of 64 KiB pages), v4: each from where the list's page table
+/// sends shaders (`table`): the GPU's bytes of the copy it names or of its
+/// arena page after the fence, as the builder's later stages and the ray
+/// tracing programs read them; a page it names nothing for is not read
+/// (`sources` notes each page's source, `n` counts). Before v4: the arena
+/// directory's page first, then the first copy of `shadow::all()` holding
+/// the whole page, then title memory.
 fn more_pages(
+    table: &Table,
     want: &std::collections::BTreeSet<u64>,
     budget: &mut usize,
-    extra: &mut [u64; 3],
-    title: &mut std::collections::HashSet<u64>,
-    copies: &mut u64,
+    n: &mut Besides,
+    sources: &mut std::collections::HashMap<u64, Source>,
 ) -> Vec<(usize, Vec<u8>)> {
     let wanted: Vec<u64> = want.iter().copied().take(*budget).collect();
-    extra[2] += (want.len() - wanted.len()) as u64;
+    n.past_budget += (want.len() - wanted.len()) as u64;
     *budget -= wanted.len();
-    let mut got: Vec<(usize, Vec<u8>)> = crate::arena::fetch(&wanted).into_iter().map(|(at, b)| (at as usize, b)).collect();
-    extra[0] += got.len() as u64;
-    // `VICTORY_BVH_GT_COPIES=0`: title memory as in v3 90102a3.
-    static COPIES: OnceLock<bool> = OnceLock::new();
-    let from_copies = *COPIES.get_or_init(|| number("VICTORY_BVH_GT_COPIES", 1) != 0);
-    let all = if from_copies && wanted.len() > got.len() { crate::shadow::all() } else { Vec::new() };
-    for &page in &wanted {
-        if got.iter().any(|(at, _)| *at as u64 == page) {
-            continue;
-        }
-        let whole = all.iter().find(|c| {
-            let (start, len) = c.range();
-            start <= page && page + (1 << 16) <= start + len && c.title_changed(page as usize) != Some(true)
-        });
-        if let Some((from, b)) = whole.and_then(|c| c.gpu_bytes(page as usize))
-            && from as u64 == page
-            && b.len() == 1 << 16
-        {
-            extra[0] += 1;
-            *copies += 1;
-            got.push((from, b));
-            continue;
-        }
-        let mut b = vec![0u8; 1 << 16];
-        if crate::host::read_into(page as *const u8, &mut b) {
-            extra[1] += 1;
-            title.insert(page);
-            got.push((page as usize, b));
+    let mut got = Vec::new();
+    for g in table(&wanted) {
+        sources.insert(g.page, g.source);
+        match (g.source, g.bytes) {
+            (Source::Nothing, _) => n.unmapped += 1,
+            (_, None) => n.not_fetched += 1,
+            (source, Some(bytes)) => {
+                if source == Source::Copy {
+                    n.copies += 1;
+                } else {
+                    n.arena += 1;
+                }
+                got.push((g.from, bytes));
+            }
         }
     }
     got
 }
 
 /// The v2 counts of the structures with headers at `headers` in `pages`
-/// (start, bytes). With `fetch`, a top level's box nodes, instances and
-/// their bottom levels' headers not in `pages` are read besides
-/// ([`more_pages`], within [`most_top_pages`]); without it they count as
-/// not read.
+/// (start, bytes), nothing read besides.
 #[cfg(test)]
-pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> V2 {
-    validate(pages, headers, fetch).0
+pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64]) -> V2 {
+    validate(pages, headers, &Ctx::none()).0
 }
 
-/// The v2 and v3 counts ([`V2`], [`V3`]) of the structures with headers at
-/// `headers` in `pages`, as [`v2_of`] says; v3 sees the same pages,
-/// including those read besides for the top levels.
-pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> (V2, V3) {
+/// The v2, v3 and v4 counts ([`V2`], [`V3`], [`V4`]) of the structures with
+/// headers at `headers` in `pages` (start, bytes). With a table in `ctx`, a
+/// top level's box nodes, instances and their bottom levels' headers not in
+/// `pages` are read besides ([`more_pages`], within [`most_top_pages`]) for
+/// the top levels v4 judges (those the submission built, or all without the
+/// gate); v2 and v3 see the same bytes.
+pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], ctx: &Ctx) -> (V2, V3, V4) {
     let mut v = V2::default();
     let mut v3 = V3::default();
+    let mut v4 = V4::default();
     let read = reader(pages);
     let mut extra_pages: Vec<(usize, Vec<u8>)> = Vec::new();
-    // Pages read besides from title memory (not the arena): v3 judges no
-    // top level by them ([`top_v3_over`]).
-    let mut title_pages = std::collections::HashSet::new();
-    let mut budget = if fetch { most_top_pages() } else { 0 };
+    // Where the table sends shaders at each page asked for besides.
+    let sources = std::cell::RefCell::new(std::collections::HashMap::<u64, Source>::new());
+    let mut budget = if ctx.table.is_some() { most_top_pages() } else { 0 };
     for &at in headers {
         let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
         if !is_header(d0, d1) {
@@ -2135,14 +2788,21 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -
                         v.first.push(format!("rehydrated {at:#x} {}", c.with_rule.why.as_deref().unwrap_or("?")));
                     }
                 }
-                v3.add_bottom(at, kind, &check_bottom_v3(&read, at, kind, cb));
+                let c3 = check_bottom_v3(&read, at, kind, cb);
+                v3.add_bottom(at, kind, &c3);
+                v4.add_bottom(kind, &c3);
             }
             None => {
-                let mut t = TopCheck::default();
-                for round in 0..3 {
+                // v4: judged only if the submission built it; only then are
+                // pages read besides for it.
+                let built = !ctx.gate || (ctx.built_now)(at).is_some();
+                let unmapped = |a: u64| sources.borrow().get(&(a & !0xffff)) == Some(&Source::Nothing);
+                let x = TopCtx { built: ctx.built, near: ctx.near, unmapped: &unmapped, title: ctx.title };
+                let mut top4 = None;
+                for round in 0..6 {
                     let missed = std::cell::RefCell::new(std::collections::BTreeSet::new());
                     {
-                        let more = reader(&extra_pages);
+                        let more = indexed(&extra_pages);
                         let read_all = |a: u64| {
                             let w = read(a).or_else(|| more(a));
                             if w.is_none() {
@@ -2150,33 +2810,54 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -
                             }
                             w
                         };
-                        t = check_top(&read_all, at);
+                        top4 = Some(check_top_v3_with(&read_all, at, &|_| false, Some(&x)));
                     }
-                    let missed = missed.into_inner();
-                    if missed.is_empty() || round == 2 || !fetch {
-                        break;
-                    }
-                    let got = more_pages(&missed, &mut budget, &mut v.extra, &mut title_pages, &mut v3.besides_from_copies);
-                    if got.is_empty() {
+                    // Pages asked for once are not asked for again (a copy
+                    // may hold part of a page only).
+                    let want: std::collections::BTreeSet<u64> =
+                        missed.into_inner().into_iter().filter(|p| !sources.borrow().contains_key(p)).collect();
+                    let Some(table) = ctx.table.filter(|_| built && round < 5 && !want.is_empty()) else { break };
+                    let got = more_pages(table, &want, &mut budget, &mut v4.pages, &mut sources.borrow_mut());
+                    if got.is_empty() && !want.iter().any(|p| sources.borrow().contains_key(p)) {
                         break;
                     }
                     extra_pages.extend(got);
                 }
+                let more = indexed(&extra_pages);
+                let read_all = |a: u64| read(a).or_else(|| more(a));
+                let t = check_top(&read_all, at);
                 v.add_top(&t);
                 if !t.valid && v.first.len() < 3 {
                     v.first.push(format!("top {at:#x} {}", t.why.as_deref().unwrap_or("?")));
                 }
                 // v3 on the same bytes: the compared pages and those read
-                // besides; what is still missing (past the budget) leaves the
-                // structure not judged.
-                let more = reader(&extra_pages);
-                let title = |a: u64| title_pages.contains(&(a & !0xffff));
-                let (t3, verdict) = top_v3_over(&read, &more, &title, at);
+                // besides (none of them title memory since v4).
+                let (t3, verdict) = top_v3_over(&read, &more, &|_| false, at);
                 v3.add_top(at, &t3, &verdict);
+                if let Some((t4, verdict)) = top4 {
+                    // Of the first instance without a header: where its
+                    // bytes came from.
+                    let note = match t4.first_no_header {
+                        Some(blas) => {
+                            let source = match sources.borrow().get(&(blas & !0xffff)) {
+                                Some(Source::Copy) => "the table's copy",
+                                Some(Source::Arena) => "the table's arena page",
+                                Some(Source::Nothing) => "no page of the table",
+                                None => "a compared page",
+                            };
+                            let title = matches!(((ctx.title)(blas), (ctx.title)(blas + 4)), (Some(d0), Some(d1)) if is_header(d0, d1) && bottom_kind(d0).is_some());
+                            format!(" [{blas:#x} read from {source}; title memory holds {} there]", if title { "a bottom-level header" } else { "no header" })
+                        }
+                        None => String::new(),
+                    };
+                    v4.add_top(at, built, &t4, &verdict, &note);
+                }
             }
         }
     }
-    (v, v3)
+    v.extra = [v4.pages.copies + v4.pages.arena, 0, v4.pages.past_budget];
+    v3.besides_from_copies = v4.pages.copies;
+    (v, v3, v4)
 }
 
 /// A small valid bottom-level structure of 64 dwords (256 bytes): header,
@@ -2941,7 +3622,7 @@ mod tests {
         garbage[3] = 3_212_292_472;
         put(&mut page, 0x200, &garbage);
         note_cb(from as u64, [0f32, 3.0, 0.0].map(f32::to_bits));
-        let (v2, v3) = validate(&[(from, &page)], &[from as u64, from as u64 + 0x100, from as u64 + 0x200], false);
+        let (v2, v3, _) = validate(&[(from, &page)], &[from as u64, from as u64 + 0x100, from as u64 + 0x200], &Ctx::none());
         assert_eq!((v2.cb_known, v2.cb_fallback), (1, 1));
         assert_eq!(v3.rule, [1, 0, 0], "the rule's count: cb known only");
         assert_eq!(v3.fallback, [1, 0, 0], "the fallback apart");
@@ -3016,7 +3697,7 @@ mod tests {
         put(&mut page, 0x200, &mini_packed());
         // cb of the rehydrated one as the title bound it.
         note_cb(from as u64 + 0x100, [0f32, 3.0, 0.0].map(f32::to_bits));
-        let v = v2_of(&[(from, &page)], &[from as u64, from as u64 + 0x100, from as u64 + 0x200], false);
+        let v = v2_of(&[(from, &page)], &[from as u64, from as u64 + 0x100, from as u64 + 0x200]);
         assert_eq!(v.bottom[bottom_index(Bottom::Fresh)], [1, 1, 1]);
         assert_eq!(v.bottom[bottom_index(Bottom::Rehydrated)], [1, 0, 1], "without / with the rule");
         assert_eq!(v.bottom[bottom_index(Bottom::Packed)], [1, 1, 1]);
@@ -3048,5 +3729,273 @@ mod tests {
         assert!(s.headers[0].1.valid);
         assert_eq!(s.empty16.0, 3, "the root's three empty boxes");
         assert_eq!(s.flt_max, (1, vec![0x10_0008]));
+    }
+
+    // v4 (Fable, review "Aufruf 9"). Red proofs in the JOURNAL entry "Fable
+    // Aufruf 9": the two tests of rules that exist in v3c (dword 15, the walk
+    // past 4096 nodes) are red against c389677 itself, the others against
+    // mutations of the v4 rule they name.
+
+    /// 64 KiB pages (start, bytes) holding the words of `m`, zeros elsewhere,
+    /// and the page after the last one (the header search past a parent table
+    /// reads up to 64 KiB past an instance's address).
+    fn pages_of(m: &std::collections::HashMap<u64, u32>) -> Vec<(usize, Vec<u8>)> {
+        let mut pages: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+        for (&at, &w) in m {
+            let page = pages.entry(at & !0xffff).or_insert_with(|| vec![0u8; 1 << 16]);
+            page[(at & 0xffff) as usize..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        let last = *pages.keys().next_back().unwrap();
+        pages.entry(last + 0x1_0000).or_insert_with(|| vec![0u8; 1 << 16]);
+        pages.into_iter().map(|(at, b)| (at as usize, b)).collect()
+    }
+
+    fn slices(pages: &[(usize, Vec<u8>)]) -> Vec<(usize, &[u8])> {
+        pages.iter().map(|(at, b)| (*at, &b[..])).collect()
+    }
+
+    /// [`Ctx`] with a gate and the given build map: `now` built by this
+    /// submission, `before` by submission 3.
+    fn gated<'a>(now: &'a dyn Fn(u64) -> Option<u8>, before: &'a dyn Fn(u64) -> Option<u64>) -> Ctx<'a> {
+        Ctx { gate: true, built_now: now, built: before, ..Ctx::none() }
+    }
+
+    /// A top-level header in a compared page that this submission did not
+    /// build is not judged and counts apart: its bottom levels may be gone
+    /// (v3 judged every header found: invalid here). Built by this
+    /// submission, the same bytes are judged.
+    #[test]
+    fn v4_only_top_levels_the_submission_built_are_judged() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.insert(0x20200, 0x1234_5678);
+        let pages = pages_of(&m);
+        let never = |_: u64| None;
+        let (_, v3, v4) = validate(&slices(&pages), &[base], &gated(&|_| None, &never));
+        assert_eq!(v3.tops[1], [0, 1, 0], "v3: invalid, whoever built it");
+        assert_eq!((v4.tops, v4.stale, v4.classes), ([0, 0, 0], 1, [0; 4]));
+        assert!(v4.first.is_empty() && v4.first_not_judged.is_empty());
+        // Built here, its bottom level a build target of submission 3: the
+        // defect, class (d).
+        let here = |at: u64| (at == base).then_some(1u8 << TOP_STAGE);
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&here, &|at| (at == 0x20200).then_some(3)));
+        assert_eq!((v4.tops, v4.stale, v4.classes), ([0, 1, 0], 0, [2, 0, 1, 0]));
+        assert!(v4.first[0].contains("(v4 d)") && v4.first[0].contains("read from a compared page"), "{:?}", v4.first);
+        // Without the gate (the readers' check) every top level is judged.
+        let (_, _, v4) = validate(&slices(&pages), &[base], &Ctx { built: &|_| Some(3), ..Ctx::none() });
+        assert_eq!((v4.tops, v4.stale), ([0, 1, 0], 0));
+    }
+
+    /// Fable Aufruf 8 point 2: each reached instance in one class. (a) a
+    /// header at its address; (b) one past the parent table whose dword 14
+    /// points back: counts as that header; (d) none, a build target before:
+    /// invalid; (e) none, never a build target: not judged, kept until a
+    /// later submission builds it (then (c)).
+    #[test]
+    fn v4_instances_without_a_header_fall_in_classes_b_d_e() {
+        let base = 0x10000u64;
+        let here = |at: u64| (at == base).then_some(1u8);
+        let never = |_: u64| None;
+        // (a) all three.
+        let pages = pages_of(&mini_top());
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&here, &never));
+        assert_eq!((v4.tops, v4.classes, v4.instances, v4.reached), ([1, 0, 0], [3, 0, 0, 0], 3, 3));
+        // (b) the fresh one's header 0x400 past the instance's address, its
+        // parent table (dword 14 = -0x400) at the address.
+        let mut m = mini_top();
+        m.insert(0x20200, 0x1234_5678);
+        m.insert(0x20600, 0x8004_0006);
+        m.insert(0x20604, 4);
+        m.insert(0x20600 + 56, (-0x400i32) as u32);
+        let pages = pages_of(&m);
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&here, &never));
+        assert_eq!((v4.tops, v4.classes), ([1, 0, 0], [2, 1, 0, 0]));
+        // A header there whose parent table lies elsewhere is not this
+        // instance's: (e), not judged, nothing counted as never reached.
+        m.insert(0x20600 + 56, (-0x200i32) as u32);
+        let pages = pages_of(&m);
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&here, &never));
+        assert_eq!((v4.tops, v4.classes, v4.why_not, v4.never), ([0, 0, 1], [2, 0, 0, 1], [0, 0, 0, 1, 0], 0));
+        assert_eq!(v4.never_built, vec![0x20200]);
+        assert!(v4.first_not_judged[0].contains("(v4 e)"), "{:?}", v4.first_not_judged);
+        // (d) with the address a build target since submission 3.
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&here, &|at| (at == 0x20200).then_some(3)));
+        assert_eq!((v4.tops, v4.classes), ([0, 1, 0], [2, 0, 1, 0]));
+        // The search past the parent table not read to its end: not judged.
+        let mut short = pages_of(&m);
+        short.pop();
+        let (_, _, v4) = validate(&slices(&short), &[base], &gated(&here, &|_| Some(3)));
+        assert_eq!((v4.tops, v4.search_unread, v4.why_not), ([0, 0, 1], 1, [0, 1, 0, 0, 0]));
+    }
+
+    /// The build map is by submission: a class (e) bottom level counts as
+    /// (c) once a later submission builds it, not for a build in the
+    /// submission that found it; the targets of "now" are the last noted
+    /// submission's only.
+    #[test]
+    fn v4_the_build_map_is_by_submission() {
+        let mut b = Builds::default();
+        b.note(7, &[(0x1000, 0), (0x2000, 0), (0x2000, TOP_STAGE)]);
+        assert_eq!((b.first(0x1000), b.first(0x3000), b.now.get(&0x2000).copied()), (Some(7), None, Some(1 | 1 << TOP_STAGE)));
+        assert!(b.near(0xf00) && !b.near(0x2000) && b.near(0x1fff));
+        b.wait_for(7, &[0x3000, 0x4000]);
+        b.note(7, &[(0x3000, 0)]);
+        assert_eq!((b.later, b.pending.len()), (0, 2), "built by the submission that found it missing: no later build");
+        b.note(8, &[]);
+        assert!(b.now.is_empty());
+        b.note(9, &[(0x4000, 2), (0x1000, 0)]);
+        assert_eq!((b.later, b.pending.clone()), (1, vec![(0x3000, 7)]));
+        assert_eq!((b.first(0x1000), b.map[&0x1000].1, b.first(0x4000), b.noted), (Some(7), 9, Some(9), 6));
+    }
+
+    /// The structure a builder bind writes: the stage's user-data dwords,
+    /// low then high; no target for other programs, for 0 and for addresses
+    /// no header lies at.
+    #[test]
+    fn v4_a_builder_bind_names_its_build_target() {
+        let mut values = vec![0u32; 40];
+        (values[16], values[17]) = (0x5f20_d300, 0xd);
+        (values[22], values[23]) = (0x01a6_f000, 0xd6);
+        (values[35], values[36]) = (0x0305_d100, 0x7);
+        assert_eq!(build_target("cs 5552dac6aa", &values), Some((0xd_5f20_d300, 0)));
+        assert_eq!(build_target("190fbf0e", &values), Some((0xd6_01a6_f000, TOP_STAGE)));
+        assert_eq!(build_target("5e687674", &values), Some((0x7_0305_d100, 2)));
+        assert_eq!(build_target("f607780a", &values), None);
+        assert_eq!(build_target("5552dac6", &values[..17]), None);
+        values[16] = 0x5f20_d340;
+        assert_eq!(build_target("5552dac6", &values), None, "not 256-byte aligned");
+        (values[16], values[17]) = (0, 0);
+        assert_eq!(build_target("5552dac6", &values), None);
+    }
+
+    /// Pages read besides come from the list's page table: the copy it names
+    /// gives the bottom levels' headers; a page it names nothing for is not
+    /// read (the GPU reads zeros there), the top level not judged and its
+    /// instances counted apart, with whether title memory holds a header;
+    /// without a table nothing is read besides.
+    #[test]
+    fn v4_pages_besides_come_from_the_page_table() {
+        let base = 0x10000u64;
+        let all = pages_of(&mini_top());
+        let compared = vec![all[0].clone()];
+        let here = |at: u64| (at == base).then_some(1u8);
+        let never = |_: u64| None;
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let table_of = |source: Source| -> Table {
+            let (all, asked) = (all.clone(), asked.clone());
+            Arc::new(move |pages: &[u64]| {
+                asked.lock().unwrap().extend_from_slice(pages);
+                pages
+                    .iter()
+                    .map(|&page| {
+                        let bytes = all.iter().find(|(at, _)| *at as u64 == page).map(|(_, b)| b.clone());
+                        Got { page, source, from: page as usize, bytes: bytes.filter(|_| source != Source::Nothing) }
+                    })
+                    .collect()
+            })
+        };
+        let table = table_of(Source::Copy);
+        let (_, v3, v4) = validate(&slices(&compared), &[base], &Ctx { table: Some(&table), ..gated(&here, &never) });
+        assert_eq!((v4.tops, v4.classes), ([1, 0, 0], [3, 0, 0, 0]));
+        assert_eq!(v4.pages, Besides { copies: 1, ..Default::default() });
+        assert_eq!((v3.tops[1], v3.besides_from_copies), ([1, 0, 0], 1), "v3 sees the same bytes");
+        assert_eq!(*asked.lock().unwrap(), vec![0x20000], "each page asked for once");
+        // The table names nothing there; title memory holds the headers.
+        let table = table_of(Source::Nothing);
+        let m = mini_top();
+        let title = |at: u64| m.get(&at).copied();
+        let (_, _, v4) = validate(&slices(&compared), &[base], &Ctx { table: Some(&table), title: &title, ..gated(&here, &never) });
+        assert_eq!((v4.tops, v4.why_not, v4.blas_unmapped, v4.title_header), ([0, 0, 1], [0, 0, 1, 0, 0], 3, 3));
+        assert_eq!(v4.pages, Besides { unmapped: 1, ..Default::default() });
+        assert!(v4.first_not_judged[0].contains("read from no page of the table; title memory holds a bottom-level header"), "{:?}", v4.first_not_judged);
+        // A top level the submission did not build asks for no page.
+        asked.lock().unwrap().clear();
+        let (_, _, v4) = validate(&slices(&compared), &[base], &Ctx { table: Some(&table), ..gated(&|_| None, &never) });
+        assert_eq!((v4.stale, v4.pages, asked.lock().unwrap().len()), (1, Besides::default(), 0));
+        // No table: the bottom levels are not read.
+        let (_, _, v4) = validate(&slices(&compared), &[base], &gated(&here, &never));
+        assert_eq!((v4.tops, v4.why_not), ([0, 0, 1], [0, 1, 0, 0, 0]));
+    }
+
+    /// Fable Aufruf 8 point 7: a bottom level whose dword 15 has bits 24-29
+    /// set is not judged (v3c: valid or invalid by a rule that says nothing
+    /// about those bits), and counted.
+    #[test]
+    fn v4_dword_15_bits_24_to_29_leave_a_bottom_level_not_judged() {
+        let base = 0x5000;
+        let mut w = bit30_bvh();
+        assert!(!matches!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::NotJudged(_)));
+        w[15] |= 0x0100_0000;
+        let v = check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("bits 24-29")), "{v:?}");
+        let mut c = V4::default();
+        c.add_bottom(Bottom::Rehydrated, &check_bottom_v3(&read_of(&w, base), base, Bottom::Rehydrated, None));
+        assert_eq!(c.d15_unknown, 1);
+        // Bits 30 and 31 alone are the scale word the rule covers.
+        w[15] = 0xc07f_7f7f;
+        assert!(!matches!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::NotJudged(_)));
+    }
+
+    /// A fresh bottom level of `n` box16 nodes in a chain (node i at 64 *
+    /// (1 + i), its child 0 the next node, box (0,0,0)-(1,1,1)); the last
+    /// node's child is a triangle whose box is `last`.
+    fn chain(n: usize, last: [u32; 3]) -> Vec<u32> {
+        let mut w = vec![0u32; 16 * (n + 2)];
+        let one = 1f32.to_bits();
+        w[0] = 0x8004 << 16 | 6;
+        w[1] = n as u32 + 2;
+        w[3] = 1;
+        w[4..10].copy_from_slice(&[0, 0, 0, one, one, one]);
+        w[10] = 64;
+        w[12] = (64 >> 3) | 4;
+        w[13] = 64 * (n as u32 + 1);
+        w[15] = 0x007f_7f7f;
+        for i in 0..n {
+            let node = &mut w[16 * (1 + i)..16 * (2 + i)];
+            let next = (64 * (2 + i as u32)) >> 3;
+            node[..4].copy_from_slice(&[if i + 1 < n { next | 4 } else { next }, u32::MAX, u32::MAX, u32::MAX]);
+            node[4..7].copy_from_slice(&if i + 1 < n { [0x0000_0000, 0x3c00_0000, 0x3c00_3c00] } else { last });
+            for k in 1..4 {
+                node[4 + 3 * k..7 + 3 * k].copy_from_slice(&[0x7c00_7c00, 0xfc00_7c00, 0xfc00_fc00]);
+            }
+        }
+        w
+    }
+
+    /// v3 walks every box node: a child box outside its parent's in node
+    /// 5000 makes the structure invalid (v3c stopped after 4096 nodes and
+    /// called it valid).
+    #[test]
+    fn v4_a_defect_past_4096_box_nodes_is_found() {
+        let base = 0x10_0000;
+        let good = chain(5000, [0x0000_0000, 0x3c00_0000, 0x3c00_3c00]);
+        assert_eq!(check_v3(&read_of(&good, base), base, Centre::Bit30AllAxes), Verdict::Valid);
+        // The last node's child box (0,0,0)-(5,5,5) in a parent of
+        // (0,0,0)-(1,1,1).
+        let bad = chain(5000, [0x0000_0000, 0x4500_0000, 0x4500_4500]);
+        let v = check_v3(&read_of(&bad, base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("outside")), "{v:?}");
+        // The same defect within the first nodes was always found.
+        let bad = chain(100, [0x0000_0000, 0x4500_0000, 0x4500_4500]);
+        assert!(matches!(check_v3(&read_of(&bad, base), base, Centre::Bit30AllAxes), Verdict::Invalid(_)));
+    }
+
+    /// A box node of zeros passes the walk where the bounds hold the origin
+    /// (every slot a pointer to address 0 with a point box there): v4 counts
+    /// such bottom levels apart, the verdict stays.
+    #[test]
+    fn v4_children_into_the_header_are_counted() {
+        let base = 0x5000;
+        let mut w = mini_bvh();
+        w[0] = 0x8004 << 16 | 6;
+        for x in &mut w[16..32] {
+            *x = 0;
+        }
+        let c = check_bottom_v3(&read_of(&w, base), base, Bottom::Fresh, None);
+        assert_eq!((c.without_rule.clone(), c.into_header), (Verdict::Valid, 4));
+        let mut n = V4::default();
+        n.add_bottom(Bottom::Fresh, &c);
+        n.add_bottom(Bottom::Fresh, &check_bottom_v3(&read_of(&mini_bvh(), base), base, Bottom::Other, None));
+        assert_eq!(n.into_header, 1);
     }
 }

@@ -1160,6 +1160,10 @@ struct Deferred {
     /// With `VICTORY_BVH_GT`: what the list's bitmap marked, asked once the
     /// list has run, before anything goes back (`crate::bvh_gt`).
     gt: Vec<Box<dyn Fn() -> crate::bvh_gt::Marks + Send>>,
+    /// With `VICTORY_BVH_GT` (v4): the structures the list's builder
+    /// dispatches write (address, stage: `crate::bvh_gt::build_target`), in
+    /// record order.
+    gt_builds: Vec<(u64, u8)>,
     /// With `VICTORY_BVH_ARENA`: ranges (copy, address, bytes) the BVH
     /// builder wrote through views of title buffers larger than
     /// [`crate::arena::BACK`]: they stay out of title memory.
@@ -1548,6 +1552,12 @@ impl Host {
         // With `VICTORY_BVH_GT`: G of the pages the named program's lists
         // wrote, before anything goes back.
         let gt_target = crate::bvh_gt::target();
+        // v4: what the builder's dispatches of this submission wrote, of
+        // every submission (the build map is by submission, the GPU's order).
+        if gt_target.is_some() {
+            let builds: Vec<(u64, u8)> = runs.iter().flat_map(|l| l.take_gt_builds()).collect();
+            crate::bvh_gt::note_builds(*submitted, &builds);
+        }
         let mut gt = gt_target.and_then(|hash| {
             let lists: Vec<&HostList> = runs.iter().copied().filter(|l| l.uses_pipeline(hash)).collect();
             let marks = lists.iter().flat_map(|l| l.deferred().gt.iter().map(|f| f()).collect::<Vec<_>>()).collect();
@@ -2399,6 +2409,17 @@ impl HostList {
     /// once the list has run, before the copy-backs clear it.
     pub(crate) fn defer_gt(&self, marks: impl Fn() -> crate::bvh_gt::Marks + Send + 'static) {
         self.deferred().gt.push(Box::new(marks));
+    }
+
+    /// With `VICTORY_BVH_GT` (v4): a builder dispatch of the list writes the
+    /// structure at `at` (`stage`: `crate::bvh_gt::build_target`).
+    pub(crate) fn note_gt_build(&self, at: u64, stage: u8) {
+        self.deferred().gt_builds.push((at, stage));
+    }
+
+    /// The build targets [`HostList::note_gt_build`] kept, taken out.
+    pub(crate) fn take_gt_builds(&self) -> Vec<(u64, u8)> {
+        std::mem::take(&mut self.deferred().gt_builds)
     }
 
     /// With `VICTORY_BVH_CAPTURE`: a dispatch as recorded.

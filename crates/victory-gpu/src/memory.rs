@@ -126,6 +126,64 @@ impl Layout {
     }
 }
 
+/// What a page table names at one 64 KiB page ([`named_index`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum NamedIndex {
+    /// The copy with this index.
+    Copy(usize),
+    Arena,
+    /// The null views: shaders read zeros there, their stores are dropped.
+    Nothing,
+}
+
+/// What the page table with the level-1 indices `blocks`, the entries'
+/// copies `owner` and arena marks `arena` ([`write_table`]) names at the
+/// 64 KiB page of title address `at`, as shaders look it up: the block of
+/// the address's 256 MiB region, the page's entry there; a copy before an
+/// arena page (`VICTORY_BVH_GT` v4: the validator reads a page where the
+/// builder's and the ray tracing programs' shaders do).
+fn named_index(blocks: &[usize], owner: &[u32], arena: &[bool], at: usize) -> NamedIndex {
+    // Block 0 is the null one (level-1 index usize::MAX).
+    let Some(block) = blocks.iter().skip(1).position(|&l1| l1 == at >> 28) else {
+        return NamedIndex::Nothing;
+    };
+    let entry = (block + 1) * BLOCK + (at >> 16 & 0xFFF);
+    match owner.get(entry) {
+        Some(&k) if k != NO_OWNER => NamedIndex::Copy(k as usize),
+        _ if arena.get(entry).copied().unwrap_or(false) => NamedIndex::Arena,
+        _ => NamedIndex::Nothing,
+    }
+}
+
+/// `VICTORY_BVH_GT` v4: the bytes shaders reading through the page table
+/// `l` see at 64 KiB pages (title addresses), after a submission's fence:
+/// the GPU's bytes of the copy the table names (cut to the copy), of the
+/// arena page, or nothing where it names the null views.
+fn gt_table(l: Arc<Layout>) -> crate::bvh_gt::Table {
+    use crate::bvh_gt::{Got, Source};
+    Arc::new(move |pages: &[u64]| {
+        let mut out = Vec::with_capacity(pages.len());
+        let mut arena = Vec::new();
+        for &page in pages {
+            let page = page & !0xffff;
+            match named_index(&l.blocks, &l.owner, &l.arena, page as usize) {
+                NamedIndex::Copy(k) => {
+                    let got = l.copies.get(k).and_then(|c| c.gpu_bytes(page as usize));
+                    let from = got.as_ref().map_or(page as usize, |g| g.0);
+                    out.push(Got { page, source: Source::Copy, from, bytes: got.map(|g| g.1) });
+                }
+                NamedIndex::Arena => arena.push(page),
+                NamedIndex::Nothing => out.push(Got { page, source: Source::Nothing, from: page as usize, bytes: None }),
+            }
+        }
+        let mut fetched: HashMap<u64, Vec<u8>> = crate::arena::fetch(&arena).into_iter().collect();
+        for page in arena {
+            out.push(Got { page, source: Source::Arena, from: page as usize, bytes: fetched.remove(&page) });
+        }
+        out
+    })
+}
+
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
 struct Bitmap {
     _resource: ID3D12Resource,
@@ -867,7 +925,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             let marks = unsafe {
                 std::slice::from_raw_parts(gt_bitmap.data() as *const u32, BITMAP_WORDS)
             };
-            let mut m = crate::bvh_gt::Marks::default();
+            let mut m = crate::bvh_gt::Marks { table: Some(gt_table(l.clone())), ..Default::default() };
             for (w, &mark) in marks.iter().enumerate() {
                 let mut bits = mark;
                 while bits != 0 {
@@ -1260,6 +1318,60 @@ mod tests {
         let (with_none, _, _, none) = table_with(&copies, &[102], 100, &Extra::default());
         assert_eq!(plain, with_none);
         assert!(none.iter().all(|&a| !a));
+    }
+
+    /// `VICTORY_BVH_GT` v4 (Fable): the validator reads a page where the
+    /// table sends shaders. Of two copies holding a whole page the smaller
+    /// one has it ([`write_table`]), a copy comes before an arena page at
+    /// the same address (the arena keeps pages of memory a title buffer was
+    /// made over later), and a page of neither reads as nothing; each
+    /// answer is the one the shaders' look-up in the table's dwords gives.
+    /// v3c's rule in `bvh_gt::more_pages` (the arena directory's page first,
+    /// then the first copy of `shadow::all()` holding the whole page) needs
+    /// a GPU to run; modelled here as `v3c`, it names another source on two
+    /// of these pages.
+    #[test]
+    fn the_gt_table_names_what_shaders_read() {
+        let (big, small) = ((0x1_0000_0000u64, 16u64 << 20), (0x1_0010_0000u64, 1u64 << 20));
+        // The larger copy first and last in the list: the order of the
+        // copies does not decide.
+        for copies in [vec![big, small], vec![small, big]] {
+            let (b, s) = (copies.iter().position(|c| *c == big).unwrap(), copies.iter().position(|c| *c == small).unwrap());
+            let extra = Extra {
+                // An arena page under the small copy, one under the big copy
+                // alone, one in memory no copy holds.
+                pages: vec![(0x1_0010_0000, 7, 0), (0x1_0080_0000, 7, 0x1_0000), (0x2_0000_0000, 7, 0x2_0000)],
+                regions: vec![],
+            };
+            let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 10 + 2 * k).collect();
+            let (dwords, blocks, owner, arena) = table_with(&copies, &pairs, 4, &extra);
+            let owner: Vec<u32> = owner.iter().map(|o| o.map_or(NO_OWNER, |k| k as u32)).collect();
+            let named = |at: usize| named_index(&blocks, &owner, &arena, at);
+            assert_eq!(named(0x1_0010_0000), NamedIndex::Copy(s), "the smaller copy holding the whole page, not the arena's");
+            assert_eq!(named(0x1_0018_1234), NamedIndex::Copy(s));
+            assert_eq!(named(0x1_0080_0000), NamedIndex::Copy(b), "a copy before the arena page under it");
+            assert_eq!(named(0x1_0000_0000), NamedIndex::Copy(b));
+            assert_eq!(named(0x2_0000_0000), NamedIndex::Arena);
+            assert_eq!(named(0x2_0001_0000), NamedIndex::Nothing, "the region has a block, the page no entry");
+            assert_eq!(named(0x3_0000_0000), NamedIndex::Nothing, "no block");
+            assert_eq!(named(0x100_0000_0000), NamedIndex::Nothing, "past the table");
+            // v3c's rule: the arena directory first, then the first copy in
+            // the list holding the whole page.
+            let v3c = |at: u64| {
+                if extra.pages.iter().any(|p| p.0 == at) {
+                    NamedIndex::Arena
+                } else {
+                    copies.iter().position(|&(start, len)| start <= at && at + 0x1_0000 <= start + len).map_or(NamedIndex::Nothing, NamedIndex::Copy)
+                }
+            };
+            assert_eq!(v3c(0x1_0010_0000), NamedIndex::Arena, "v3c read the arena's stale page");
+            assert_eq!(v3c(0x1_0080_0000), NamedIndex::Arena);
+            assert_eq!(v3c(0x1_0018_0000), NamedIndex::Copy(0), "v3c: whichever copy comes first");
+            // The same answer as the shaders' look-up in the table's dwords.
+            for (at, pair) in [(0x1_0010_0000u64, pairs[s]), (0x1_0080_0000, pairs[b]), (0x2_0000_0000, 7), (0x2_0001_0000, 4), (0x3_0000_0000, 4)] {
+                assert_eq!(look_up(&dwords, at).0, pair, "{at:#x}");
+            }
+        }
     }
 
     /// Arena pages past the table's room read as missing; the table fits
