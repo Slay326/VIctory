@@ -166,6 +166,55 @@ pub(crate) struct ViewSource {
     pub(crate) unordered: bool,
 }
 
+/// `VICTORY_BVH_CAPTURE_TOPS_FIRST=1` (senior 119): see [`top_level_pages`].
+fn tops_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_CAPTURE_TOPS_FIRST").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Of `candidates` (addresses from the builder's root constants), those
+/// holding a top-level header (dword 0 = 6, no marks; `read(at, len)` gives
+/// the bytes the GPU sees, fewer or none where it has none): each such top
+/// level's address with its instance count, and the 64 KiB pages to take
+/// first: the whole top level (D1 * 64 + 64 bytes, box nodes may end there)
+/// and the page of each instance's bottom-level header (entry dword 15 << 8,
+/// Fable Aufruf 11 point 3). Sizes past 64 MiB or 65536 instances are not
+/// taken as a header.
+fn top_level_pages(read: &dyn Fn(u64, u64) -> Vec<u8>, candidates: impl Iterator<Item = u64>) -> (Vec<(u64, u32)>, BTreeSet<u64>) {
+    let words = |b: &[u8]| -> Vec<u32> { b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+    let mut tops = Vec::new();
+    let mut pages = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    for at in candidates {
+        let base = at & !0xff;
+        if !seen.insert(base) {
+            continue;
+        }
+        let h = words(&read(base, 64));
+        if h.len() < 16 || h[0] != 6 || !crate::bvh_gt::is_header(h[0], h[1]) {
+            continue;
+        }
+        let (size, n, list) = (u64::from(h[1]) * 64 + 64, h[3], u64::from(h[13]));
+        if size > 64 << 20 || n > 1 << 16 || list + u64::from(n) * 128 > size {
+            continue;
+        }
+        let mut p = base & !(PAGE - 1);
+        while p < base + size {
+            pages.insert(p);
+            p += PAGE;
+        }
+        let e = words(&read(base + list, u64::from(n) * 128));
+        for i in 0..(e.len() / 32) {
+            let blas = u64::from(e[32 * i + 15]) << 8;
+            if blas != 0 {
+                pages.insert(blas & !(PAGE - 1));
+            }
+        }
+        tops.push((base, n));
+    }
+    (tops, pages)
+}
+
 fn most_bytes() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| {
@@ -640,6 +689,46 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
             }
         }
     }
+    // `VICTORY_BVH_CAPTURE_TOPS_FIRST=1` (senior 119, Fable Aufruf 11 point
+    // 8; builder capture only): the top levels at the builder's constant
+    // addresses and their instances' bottom-level header pages, as the
+    // copies hold them now (the build before at the same address), are
+    // taken before the rest; onCap3 cut all 554 bottom levels.
+    let mut first_pages: BTreeSet<u64> = BTreeSet::new();
+    if reader_prefix().is_none() && tops_first() {
+        let shadows: HashMap<u32, Arc<Shadow>> = copy_segs.values().map(|(s, c)| (*s, c.clone())).collect();
+        let read = |at: u64, len: u64| -> Vec<u8> {
+            match capture.table.entry_at(at) {
+                Some((_, Entry::Copy { seg })) => shadows
+                    .get(&seg)
+                    .map(|c| super::reader::gpu_range(c, at, len))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        };
+        let mut candidates: BTreeSet<u64> = BTreeSet::new();
+        for r in records.iter().filter(|r| r.builder) {
+            for a in &r.args {
+                if let RootArg::Constants { dwords, .. } = a {
+                    let values: Vec<u32> = dwords.iter().map(|d| d.value).collect();
+                    candidates.extend(crate::arena::constant_addresses(&values));
+                }
+            }
+        }
+        let (tops, pages) = top_level_pages(&read, candidates.iter().copied());
+        meta(
+            &mut capture,
+            "tops first",
+            tops.iter().map(|(at, n)| format!("{at:#x}:{n}")).collect::<Vec<_>>().join(" "),
+        );
+        meta(&mut capture, "pages of top levels and bottom-level headers", pages.len());
+        for p in pages {
+            if let Some((_, Entry::Copy { seg })) = capture.table.entry_at(p) {
+                by_copy.entry(seg).or_default().insert(p);
+                first_pages.insert(p);
+            }
+        }
+    }
     let file = std::fs::File::create(dir.join("pre.pages")).ok()?;
     let mut pending = Pending {
         dir,
@@ -666,7 +755,7 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
     // The top levels' blocks first (arena pages, then copies), then the
     // rest: the budget cuts the rest, not the structures the reader walks
     // from (onCap2: its two top-level pages were cut).
-    let first_block = |a: &u64| priority.contains(&(a >> 28));
+    let first_block = |a: &u64| priority.contains(&(a >> 28)) || first_pages.contains(a);
     let (arena_first, arena_rest): (Vec<u64>, Vec<u64>) = arena_wanted.into_iter().partition(first_block);
     let mut copies_first: Vec<(u32, Vec<u64>)> = Vec::new();
     let mut copies_rest: Vec<(u32, Vec<u64>)> = Vec::new();
@@ -941,7 +1030,39 @@ pub(crate) fn post(mut p: Pending, runs: &[&HostList]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{indirect_arguments, is_target, view_blocks};
+    use super::{indirect_arguments, is_target, top_level_pages, view_blocks};
+
+    /// senior 119: a top level at a builder constant gives its own pages and
+    /// its instances' bottom-level header pages (dword 15 << 8); a
+    /// bottom-level header (marks set) and unread addresses give nothing.
+    #[test]
+    fn tops_first_takes_the_top_level_and_its_bottom_level_headers() {
+        let tlas = 0xd_5f20_c400u64;
+        let blas_hdr = 0x7_03fd_0100u64;
+        let mut mem = std::collections::BTreeMap::new();
+        let mut put = |at: u64, w: u32| {
+            mem.insert(at, w);
+        };
+        // Top-level header: D1 = 0x1071 (size 0x41c40 + 64), 2 instances, list at +0x11580.
+        for (i, w) in [6u32, 0x1071, 0, 2, 0, 0, 0, 0, 0, 0, 0x35a80, 0, 0x8385, 0x11580, 0x40, 0].into_iter().enumerate() {
+            put(tlas + 4 * i as u64, w);
+        }
+        for (i, b) in [0x7_03fd_0100u64, 0xb_1234_5600].into_iter().enumerate() {
+            put(tlas + 0x11580 + 128 * i as u64 + 60, (b >> 8) as u32);
+        }
+        for (i, w) in [0x8002_0006u32, 0x21a, 0, 0x14a].into_iter().enumerate() {
+            put(blas_hdr + 4 * i as u64, w);
+        }
+        let read = |at: u64, len: u64| -> Vec<u8> {
+            (0..len / 4).flat_map(|k| mem.get(&(at + 4 * k)).copied().unwrap_or(0).to_le_bytes()).collect()
+        };
+        let (tops, pages) = top_level_pages(&read, [tlas + 0x10, blas_hdr, 0x1234_0000].into_iter());
+        assert_eq!(tops, vec![(tlas, 2)]);
+        let want: Vec<u64> = (0..5).map(|k| 0xd_5f20_0000 + k * 0x1_0000).chain([0x7_03fd_0000, 0xb_1234_0000]).collect();
+        let mut want = want;
+        want.sort();
+        assert_eq!(pages.into_iter().collect::<Vec<_>>(), want);
+    }
     use crate::bvh_replay::format::{Groups, RootArg, INDIRECT_ARGUMENTS};
     use crate::bvh_replay::format::TableView;
 
