@@ -1150,12 +1150,50 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    log_dispatch_x(this, x, y, z, _flags);
     #[cfg(windows)]
     state::dispatch(this, x, y, z);
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
         count_dispatch();
+    }
+}
+
+/// Diagnostics (senior 82, Fable "Rehydrier-Kette" Auftrag 3): which
+/// programs the title dispatches with `DispatchX` and with which flags.
+/// The first 4 calls of each (shaders, flags) are logged one by one, then
+/// a summary (calls, x min/max, y, z) every 1024 DispatchX calls.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn log_dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Seen {
+        calls: u64,
+        x_min: u32,
+        x_max: u32,
+        yz: (u32, u32),
+    }
+    static SEEN: Mutex<Option<(u64, HashMap<(String, u32), Seen>)>> = Mutex::new(None);
+    let mut shaders = String::from("?");
+    with_state(this, |_, s| shaders = crate::pipeline::shaders_of(s.bound_pipeline() as This));
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (total, map) = g.get_or_insert_with(|| (0, HashMap::new()));
+    *total += 1;
+    let e = map.entry((shaders.clone(), flags)).or_insert_with(|| Seen { x_min: u32::MAX, ..Default::default() });
+    e.calls += 1;
+    e.x_min = e.x_min.min(x);
+    e.x_max = e.x_max.max(x);
+    e.yz = (y, z);
+    if e.calls <= 4 {
+        tracing::info!(target: "dispatchx", flags = format_args!("{flags:#x}"), x, y, z, shaders = %shaders, "DispatchX");
+    }
+    if *total % 1024 == 0 {
+        for ((sh, f), s) in map.iter() {
+            tracing::info!(target: "dispatchx", flags = format_args!("{f:#x}"), calls = s.calls, x_min = s.x_min, x_max = s.x_max, y = s.yz.0, z = s.yz.1, shaders = %sh, "DispatchX summary");
+        }
     }
 }
 

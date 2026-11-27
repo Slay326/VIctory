@@ -247,6 +247,12 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// The title pipeline set last (diagnostics: the DispatchX log).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bound_pipeline(&self) -> usize {
+        self.pipeline
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
