@@ -1114,3 +1114,206 @@ fn dirty_mark_width_and_branch_hoisting() {
         bc.verify_dirty_marks(bitmap, want, view_mark.then_some(usize::from(bytes > 1)));
     }
 }
+
+/// A refit's hand-off as the BVH builder's 5552dac6 does it: a `glc dlc`
+/// load of title memory, a plain load, `s_waitcnt_vscnt null, 0`, then an
+/// atomic add with the loaded value, lowered with the coherence diagnostics
+/// off and on (`super::set_coherent`, T4 local test branch).
+fn refit_handoff(coherent: bool) -> lower::Lowered {
+    refit_handoff_parts(if coherent { 7 } else { 0 })
+}
+
+/// [`refit_handoff`] with [`super::set_coherent_parts`].
+fn refit_handoff_parts(parts: u8) -> lower::Lowered {
+    const GLC: u32 = 1 << 16;
+    const DLC: u32 = 1 << 12;
+    let mut w = vec![v_mov_b32(1, ZERO)];
+    let [a, b] = global(0x0C, 2, 1, 0, 0, 0); // global_load_dword v2, v1, s[0:1]
+    w.extend([a | GLC | DLC, b]);
+    w.extend(global(0x0C, 3, 1, 0, 0, 8)); // global_load_dword v3, v1, s[0:1] offset:8
+    w.push(0xBBFD_0000); // s_waitcnt_vscnt null, 0
+    w.push(S_WAITCNT_ALL);
+    w.extend(global(0x32, 0, 1, 2, 0, 4)); // global_atomic_add v1, v2, s[0:1] offset:4
+    w.extend(global(0x32, 0, 1, 3, 0, 12)); // global_atomic_add v1, v3, s[0:1] offset:12
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    super::set_coherent_parts(parts);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: true,
+        host_wave_max: 32,
+        group_x_offset: false,
+        loop_limit: super::loop_limit(),
+    });
+    super::set_coherent(false);
+    l.expect("lower")
+}
+
+#[test]
+fn coherence_diagnostics_off_change_nothing_and_on_make_glc_loads_coherent_and_fence_at_vscnt() {
+    let off = refit_handoff(false);
+    let again = refit_handoff(false);
+    assert_eq!(off.dxil, again.dxil, "the translation is deterministic");
+    assert_eq!(off.coherent, (0, 0), "off: nothing coherent, no fence");
+    let on = refit_handoff(true);
+    // The glc dlc load only: the plain load and the atomics without glc
+    // stay as they are.
+    assert_eq!(on.coherent, (1, 1), "on: one coherent load, one fence at vscnt");
+    assert_ne!(on.dxil, off.dxil);
+    assert!(!super::coherent(), "the switch is reset for the thread");
+    #[cfg(windows)]
+    if let Some(text) = super::tests_dump_dxil(&on.dxil) {
+        assert!(text.contains("@dx.op.barrier(i32 80, i32 2)"), "a device-wide UAV fence");
+        assert!(text.contains("ResourceProperties { i32 20491, i32 0 }"), "a globally coherent raw UAV");
+        let plain = super::tests_dump_dxil(&off.dxil).expect("dxc");
+        assert!(!plain.contains("dx.op.barrier"));
+        assert!(!plain.contains("i32 20491"));
+    }
+}
+
+#[test]
+fn coherence_parts_each_change_only_their_own_part() {
+    use super::{COHERENT_FENCE as F, COHERENT_GLOBAL as G, COHERENT_UAV as U};
+    let off = refit_handoff_parts(0);
+    let uav = refit_handoff_parts(U);
+    let global = refit_handoff_parts(U | G);
+    let fence = refit_handoff_parts(F);
+    let all = refit_handoff_parts(U | G | F);
+    assert_eq!(off.coherent, (0, 0));
+    assert_eq!(uav.coherent, (1, 0), "UAV only: the glc load, no fence");
+    assert_eq!(global.coherent, (1, 0));
+    assert_eq!(fence.coherent, (0, 1), "fence only: loads stay SRV");
+    assert_eq!(all.coherent, (1, 1));
+    assert_ne!(uav.dxil, global.dxil, "globally coherent is a part of its own");
+    assert_ne!(uav.dxil, off.dxil);
+    assert_ne!(fence.dxil, off.dxil);
+    assert_eq!(refit_handoff_parts(G).dxil, off.dxil, "globally coherent alone does nothing");
+    #[cfg(windows)]
+    if let (Some(u), Some(g), Some(f)) = (
+        super::tests_dump_dxil(&uav.dxil),
+        super::tests_dump_dxil(&global.dxil),
+        super::tests_dump_dxil(&fence.dxil),
+    ) {
+        assert!(u.contains("ResourceProperties { i32 4107, i32 0 }") && !u.contains("i32 20491"));
+        assert!(!u.contains("dx.op.barrier"));
+        assert!(g.contains("ResourceProperties { i32 20491, i32 0 }"));
+        assert!(f.contains("@dx.op.barrier(i32 80, i32 2)") && !f.contains("i32 20491"));
+    }
+}
+
+/// A builder stage that only reads a page coherently (`glc dlc`) and
+/// stores elsewhere: one coherent load of `s[0:1]`, a plain store to
+/// `s[2:3]`, lowered with the coherence parts `parts` (0: off).
+fn coherent_read_only(parts: u8) -> lower::Lowered {
+    const GLC: u32 = 1 << 16;
+    const DLC: u32 = 1 << 12;
+    let mut w = vec![v_mov_b32(1, ZERO)];
+    let [a, b] = global(0x0C, 2, 1, 0, 0, 0); // global_load_dword v2, v1, s[0:1] glc dlc
+    w.extend([a | GLC | DLC, b]);
+    w.push(S_WAITCNT_ALL);
+    w.extend(global(0x1C, 0, 1, 2, 2, 0)); // global_store_dword v1, v2, s[2:3]
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    super::with_coherent(parts, || {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: true,
+            host_wave_max: 32,
+            group_x_offset: false,
+            loop_limit: super::loop_limit(),
+        })
+        .expect("lower")
+    })
+}
+
+/// Calls of `op` in a module, on any handle.
+fn calls_of(bc: &Bc, op: &str) -> usize {
+    bc.insts.values().filter(|(_, i)| matches!(i, BcInst::Call(n, _) if n == op)).count()
+}
+
+/// Fable H-05 point 5: a page a builder stage reads through its UAV
+/// (`VICTORY_BVH_COHERENT`) only to make the read coherent is not marked
+/// as written. The page bitmap is what copy-backs go by
+/// (`victory_gpu::shadow::copy_back_marks`): a write mark there would copy
+/// the page back after every dispatch and count it as GPU-written in the
+/// memory model's classification. The read keeps its mark for a miss only,
+/// exactly as through the SRV; the store elsewhere marks as before. (The
+/// bitcode reader skips void calls, so stores are not counted here.)
+#[test]
+fn a_page_read_coherently_through_its_uav_is_not_marked_written() {
+    use super::{COHERENT_FENCE as F, COHERENT_GLOBAL as G, COHERENT_UAV as U};
+    let off = coherent_read_only(0);
+    let bc_off = Bc::parse(&off.dxil);
+    let marks = |bc: &Bc| calls_of(bc, "dx.op.atomicBinOp.i32");
+    // Off: the load's miss mark, and the dword store's two marks (its first
+    // and last byte's page).
+    assert_eq!(marks(&bc_off), 3, "off: one read mark, two write marks");
+    // Every variant through the UAV (b, `VICTORY_BVH_COHERENT=1`, first).
+    for parts in [U | G, U, U | G | F] {
+        let on = coherent_read_only(parts);
+        assert_eq!(on.coherent.0, 1, "{parts}: the glc dlc load goes through the UAV");
+        assert_ne!(on.dxil, off.dxil, "{parts}: the switch took effect");
+        assert_eq!((on.memory, on.memory_writes), (off.memory, off.memory_writes));
+        assert_eq!(marks(&Bc::parse(&on.dxil)), marks(&bc_off), "{parts}: no write mark for the coherent read");
+    }
+}

@@ -437,6 +437,84 @@ pub struct Options {
     pub loop_limit: Option<u32>,
 }
 
+thread_local! {
+    static COHERENT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// [`set_coherent_parts`]: glc/dlc title memory through the page's UAV
+/// instead of its SRV.
+pub const COHERENT_UAV: u8 = 1;
+/// ... that UAV marked globally coherent (with [`COHERENT_UAV`]).
+pub const COHERENT_GLOBAL: u8 = 2;
+/// `s_waitcnt_vscnt` as a device-wide UAV fence.
+pub const COHERENT_FENCE: u8 = 4;
+
+/// Diagnostics (T4, local test branch): translations made on this thread
+/// after `set_coherent(true)` read and write title memory coherently where
+/// the console asks for it (`glc`/`dlc` loads, stores and atomics: through
+/// the page's globally coherent UAV, not its SRV) and fence UAVs device-wide
+/// at `s_waitcnt_vscnt` (a `DeviceMemoryBarrier`). Off by default; off, the
+/// translation is byte for byte as without the switch. Per thread, so a
+/// shader cache filled on other threads is never touched. The host turns it
+/// on only around translations of the BVH builder's stages with
+/// `VICTORY_BVH_COHERENT=1` ([`with_coherent`]; local test branch).
+pub fn set_coherent(on: bool) {
+    set_coherent_parts(if on { COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE } else { 0 });
+}
+
+/// [`set_coherent`] by parts (H-05 separation): [`COHERENT_UAV`],
+/// [`COHERENT_GLOBAL`] (only with the UAV), [`COHERENT_FENCE`]; 0 is off.
+pub fn set_coherent_parts(parts: u8) {
+    COHERENT.with(|c| c.set(parts & (COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE)));
+}
+
+/// The parts of [`set_coherent_parts`] on for this thread (0: off).
+pub fn coherent_parts() -> u8 {
+    COHERENT.with(std::cell::Cell::get)
+}
+
+/// Whether any part of [`set_coherent`] is on for this thread.
+pub fn coherent() -> bool {
+    coherent_parts() != 0
+}
+
+/// `f` run with [`set_coherent_parts`]`(parts)` on this thread, and the
+/// thread's parts from before restored after it (also when `f` panics).
+pub fn with_coherent<R>(parts: u8, f: impl FnOnce() -> R) -> R {
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_coherent_parts(self.0);
+        }
+    }
+    let _restore = Restore(coherent_parts());
+    set_coherent_parts(parts);
+    f()
+}
+
+/// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc is
+/// installed (next to the validator, or `VICTORY_PC_DXC`).
+#[cfg(all(test, windows))]
+pub(crate) fn tests_dump_dxil(container: &[u8]) -> Option<String> {
+    let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => validator::Validator::default_path()?.with_file_name("dxc.exe"),
+    };
+    if !dxc.exists() {
+        return None;
+    }
+    let file = std::env::temp_dir().join(format!(
+        "victory-coherent-{}-{:?}.dxil",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&file, container).ok()?;
+    let out = std::process::Command::new(dxc).arg("-dumpbin").arg(&file).output().ok()?;
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "dxc -dumpbin failed: {}", String::from_utf8_lossy(&out.stderr));
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {

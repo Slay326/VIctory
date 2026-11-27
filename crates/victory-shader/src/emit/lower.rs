@@ -61,6 +61,10 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Title memory accesses made coherent, and device-wide UAV fences
+    /// ([`super::set_coherent`]).
+    #[cfg(test)]
+    pub coherent: (u32, u32),
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
@@ -364,6 +368,11 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// [`super::set_coherent`] is on and the current instruction asks for
+    /// coherent memory (`glc` or `dlc`).
+    coherent_now: bool,
+    /// Coherent title memory accesses and device-wide fences made.
+    coherent_made: (u32, u32),
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -902,6 +911,8 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            coherent_now: false,
+            coherent_made: (0, 0),
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -1709,6 +1720,8 @@ impl<'a> Lower<'a> {
             view_marks: self.s.view_writes.is_some(),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            coherent: self.coherent_made,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
@@ -4240,6 +4253,24 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        // Diagnostics (`super::set_coherent`): coherent title memory where
+        // the console bypasses its caches, a device-wide UAV fence where it
+        // waits for its stores (before the arrival atomics of a refit).
+        let parts = super::coherent_parts();
+        self.coherent_now = parts & super::COHERENT_UAV != 0
+            && match &inst.fields {
+                Fields::Buffer { cache, .. } | Fields::Flat { cache, .. } => {
+                    cache.glc || cache.dlc
+                }
+                _ => false,
+            };
+        if parts & super::COHERENT_FENCE != 0 && name == "s_waitcnt_vscnt" {
+            let mode = self.s.m.i32(2);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            self.coherent_made.1 += 1;
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5531,7 +5562,14 @@ impl<'a> Lower<'a> {
         let null = self.s.memory_null();
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if write {
+        let (view, props) = if self.coherent_now {
+            // Diagnostics (`super::set_coherent`): the UAV, globally
+            // coherent (resource properties bit 14), for reads too.
+            self.coherent_made.0 += 1;
+            let one = k(self, 1);
+            let global = if super::coherent_parts() & super::COHERENT_GLOBAL != 0 { 0x4000 } else { 0 };
+            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000 | global, 0))
+        } else if write {
             let one = k(self, 1);
             (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))
         } else {
