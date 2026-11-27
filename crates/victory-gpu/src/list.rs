@@ -1178,7 +1178,11 @@ fn log_dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     }
     static SEEN: Mutex<Option<(u64, HashMap<(String, u32), Seen>)>> = Mutex::new(None);
     let mut shaders = String::from("?");
-    with_state(this, |_, s| shaders = crate::pipeline::shaders_of(s.bound_pipeline() as This));
+    let mut pipeline = 0usize;
+    with_state(this, |_, s| {
+        pipeline = s.bound_pipeline();
+        shaders = crate::pipeline::shaders_of(pipeline as This);
+    });
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let (total, map) = g.get_or_insert_with(|| (0, HashMap::new()));
     *total += 1;
@@ -1188,7 +1192,8 @@ fn log_dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     e.x_max = e.x_max.max(x);
     e.yz = (y, z);
     if e.calls <= 4 {
-        tracing::info!(target: "dispatchx", flags = format_args!("{flags:#x}"), x, y, z, shaders = %shaders, "DispatchX");
+        let threads = crate::pipeline::compute_threads(pipeline as This);
+        tracing::info!(target: "dispatchx", flags = format_args!("{flags:#x}"), x, y, z, threads = ?threads, shaders = %shaders, "DispatchX");
     }
     if *total % 1024 == 0 {
         for ((sh, f), s) in map.iter() {

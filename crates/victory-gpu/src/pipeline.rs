@@ -373,6 +373,23 @@ pub(crate) fn is_skipped(this: This) -> bool {
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
+/// Diagnostics (senior 82, DispatchX log): the thread-group size of the
+/// pipeline's compute program, read from its container.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn compute_threads(this: This) -> Option<[u32; 3]> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).shaders.iter().find_map(|s| {
+        let c = victory_shader::Container::parse(&s.container).ok()?;
+        let part = c.part(victory_shader::FourCC::DXIL).or(c.part(victory_shader::FourCC::ACCC))?;
+        victory_shader::native_programs(part.data).ok()?.into_iter().find_map(|p| match p.io {
+            victory_shader::native::StageIo::Cs(io) => Some(io.threads),
+            _ => None,
+        })
+    })
+}
+
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".into();
