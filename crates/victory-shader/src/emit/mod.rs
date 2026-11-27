@@ -233,6 +233,8 @@ mod split_tests;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
+#[cfg(all(test, windows))]
+mod threadlimit_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -402,6 +404,13 @@ pub const GROUP_X_OFFSET: u32 = 5;
 /// console compute program has.
 pub const GROUP_X_OFFSET_INDEX: u32 = 16;
 
+/// [`UserData::dword`] of the entry that takes the threads in x a dispatch
+/// runs ([`Options::thread_limit`]; `u32::MAX` for a dispatch counted in
+/// groups). No root parameter has that many dwords, so no title entry is
+/// like it; the entry's user-data dword ([`UserData::index`]) is one the
+/// program's own entries leave free, chosen per program.
+pub const THREAD_LIMIT: u32 = u32::MAX;
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -435,6 +444,14 @@ pub struct Options {
     /// and loops to the limit for seconds). `None`: [`loop_limit`]; the
     /// translation is then the same as before the option existed.
     pub loop_limit: Option<u32>,
+    /// A compute program runs only the threads whose id in x over the whole
+    /// dispatch (group id times the group's size, plus the thread's id) is
+    /// below the user-data entry [`THREAD_LIMIT`]: the others start outside
+    /// EXEC, as the console's do when a dispatch counts x in threads and its
+    /// last wave is partly filled. The host then dispatches the groups that
+    /// hold that many threads. A program it cannot be done for fails to
+    /// translate.
+    pub thread_limit: bool,
 }
 
 thread_local! {
@@ -528,7 +545,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -540,13 +557,129 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    let limit = match options.thread_limit {
+        true => Some(thread_limit::prepend(&mut native)?),
+        false => None,
+    };
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let mut io = io::raise(&p, &native)?;
     let st = st?;
+    let Some(limit) = limit else {
+        return emit_with(&c, &native, &p, &st, &io, &res, options);
+    };
+    // The entry's user-data dword: first one past every root parameter's,
+    // then the lowest the program's own entries leave free (so the user
+    // data, a root parameter of the host's, grows as little as it can).
+    let first = thread_limit::past_the_layout(&native);
+    thread_limit::inputs(&p, limit, first, &mut io)?;
+    let made = emit_with(&c, &native, &p, &st, &io, &res, options)?;
+    let index = thread_limit::free_index(&made.user_data, options.group_x_offset);
+    if index == first {
+        return Ok(made);
+    }
+    thread_limit::inputs(&p, limit, index, &mut io)?;
     emit_with(&c, &native, &p, &st, &io, &res, options)
+}
+
+/// [`Options::thread_limit`]: the compare that takes the threads past the
+/// limit out of EXEC, put in front of the program, and what it reads.
+pub(crate) mod thread_limit {
+    use super::{GROUP_X_OFFSET_INDEX, THREAD_LIMIT, UserData};
+    use crate::ShaderError;
+    use crate::io::{Input, Io};
+    use crate::ir::{self, Reg};
+    use crate::native::{HwStage, NativeProgram, RootType, StageIo};
+
+    const fn refused(what: &'static str) -> ShaderError {
+        ShaderError::Unsupported { offset: 0, what }
+    }
+
+    /// Puts `v_cmpx_gt_u32 exec, s, v` in front of a compute program's code
+    /// and returns the registers: `s` an SGPR the hardware does not set and
+    /// the program does not read before it writes it, `v` a VGPR past the
+    /// program's (`vgprs` grows by it). The lowering gives them the limit
+    /// and the thread's id in x over the dispatch ([`inputs`]). Every lane
+    /// mask of the program then derives from an EXEC without the lanes past
+    /// the limit, as on the console, including what waves exchange where a
+    /// console wave runs as two of the host's.
+    /// Jumps are relative, and data after the code is read relative to
+    /// `s_getpc_b64`, so moving the whole code changes neither.
+    pub(crate) fn prepend(native: &mut NativeProgram) -> Result<(u8, u8), ShaderError> {
+        let StageIo::Cs(cs) = &native.io else {
+            return Err(refused("a thread limit for a program that is not compute"));
+        };
+        if native.stage != HwStage::Cs {
+            return Err(refused("a thread limit for a program that is not compute"));
+        }
+        let v = u8::try_from(native.vgprs).map_err(|_| refused("a thread limit: no VGPR is free"))?;
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        // The compare runs once: nothing may jump back to the code's start.
+        if p.blocks.first().is_none_or(|b| !b.preds.is_empty()) {
+            return Err(refused("a thread limit for a program that jumps to its start"));
+        }
+        let set = cs.initialized_sgprs();
+        let s = (set..=105)
+            .rev()
+            .find(|&s| !p.inputs.iter().any(|i| i.0 == Reg::S(s)))
+            .ok_or(refused("a thread limit: no SGPR is free"))?;
+        let word: u32 = 0x7DA8_0000 | u32::from(v) << 9 | u32::from(s);
+        native.code.splice(0..0, word.to_le_bytes());
+        native.vgprs += 1;
+        Ok((s, v))
+    }
+
+    /// The first user-data dword past every root parameter's (and past the
+    /// group offset's).
+    pub(crate) fn past_the_layout(native: &NativeProgram) -> u32 {
+        native
+            .layout
+            .iter()
+            .map(|r| u32::from(r.user_data) + r.sgprs.max(2))
+            .max()
+            .unwrap_or(0)
+            .max(GROUP_X_OFFSET_INDEX + 1)
+    }
+
+    /// The lowest user-data dword no entry of `user_data` but the limit's
+    /// own is in, the group offset's left out where the program takes one.
+    pub(crate) fn free_index(user_data: &[UserData], group_x_offset: bool) -> u32 {
+        let taken = |i: u32| {
+            group_x_offset && i == GROUP_X_OFFSET_INDEX
+                || user_data.iter().any(|u| u.index == i && !is_entry(u))
+        };
+        (0..).find(|&i| !taken(i)).unwrap_or(u32::MAX)
+    }
+
+    /// Whether `u` is the entry that takes the thread limit.
+    pub(crate) fn is_entry(u: &UserData) -> bool {
+        u.root == RootType::Constants && u.dword == THREAD_LIMIT
+    }
+
+    /// Names the compare's registers as inputs of `p` (built from the code
+    /// [`prepend`] changed): the limit from user-data dword `index`, and
+    /// the thread's id.
+    pub(crate) fn inputs(p: &ir::Program, (s, v): (u8, u8), index: u32, io: &mut Io) -> Result<(), ShaderError> {
+        for (reg, input) in [(Reg::S(s), Input::ThreadLimit(index)), (Reg::V(v), Input::ThreadLimitId)] {
+            let value = p
+                .inputs
+                .iter()
+                .find(|i| i.0 == reg)
+                .ok_or(refused("a thread limit: its compare is not read"))?
+                .1;
+            io.inputs.retain(|i| i.0 != value);
+            io.inputs.push((value, input));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `u` is the user-data entry that takes a dispatch's thread limit
+/// ([`Options::thread_limit`], [`THREAD_LIMIT`]).
+pub fn is_thread_limit(u: &UserData) -> bool {
+    thread_limit::is_entry(u)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.

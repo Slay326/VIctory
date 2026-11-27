@@ -66,6 +66,12 @@ pub enum Input {
     ThreadIdInGroup(u8),
     /// Compute: the thread-group info SGPR (wave index and count).
     GroupInfo,
+    /// Compute, `emit::Options::thread_limit`: the threads in x the
+    /// dispatch runs, from this user-data dword (an SGPR no hardware sets).
+    ThreadLimit(u32),
+    /// Compute, `emit::Options::thread_limit`: the thread's id in x over
+    /// the whole dispatch (a VGPR past the program's).
+    ThreadLimitId,
     /// Mesh: v5, the group id times the group size (read as uniform).
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.

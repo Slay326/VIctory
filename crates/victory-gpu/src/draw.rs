@@ -55,6 +55,10 @@ pub(crate) struct IndexView {
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// The threads in x the dispatch being bound runs, for a program
+    /// translated to take a thread limit ([`State::dispatch_x`]); none for
+    /// every other draw and dispatch (such a program then runs them all).
+    thread_limit: Option<u32>,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -787,6 +791,8 @@ impl State {
                         Some(&(_, offset)) => offset,
                         // Set by the split dispatch's signature (`execute_indirect`).
                         None if takes_group_offset(t.group_x_offset, u) => 0,
+                        // Per dispatch (`dispatch_x`): its threads in x, or all.
+                        None if victory_shader::emit::is_thread_limit(u) => self.thread_limit.unwrap_or(u32::MAX),
                         None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
@@ -1111,6 +1117,30 @@ impl State {
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
         }
+    }
+
+    /// Runs a `DispatchX` on the host: as [`State::dispatch`], but where
+    /// the flags count x in threads and the program is translated to take a
+    /// thread limit (`VICTORY_DISPATCHX_THREADS`), the groups holding x
+    /// threads run and the program leaves out the threads past x, as the
+    /// console's partly filled last wave does. Without the switch, or for
+    /// a program not translated so, x runs as groups, as before.
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let limit = crate::pipeline::host_pipeline(self.pipeline as This)
+            .filter(|p| p.compute)
+            .and_then(|p| p.stages.iter().find_map(|s| s.translated().thread_limit));
+        let (groups, threads) = x_groups(flags, x, limit);
+        if limit.is_none() && flags & X_IN_GROUPS == 0 && crate::shader_cache::dispatch_threads_on() {
+            once!(
+                pipeline = %crate::pipeline::host_pipeline(self.pipeline as This).map_or("", |p| p.name.as_str()),
+                flags = format_args!("{flags:#x}"),
+                x,
+                "VICTORY_DISPATCHX_THREADS: a DispatchX counts x in threads for a program not translated with a thread limit; run as groups (list its hash to translate it so)"
+            );
+        }
+        self.thread_limit = threads;
+        self.dispatch(list, groups, y, z);
+        self.thread_limit = None;
     }
 
     /// Runs a dispatch on the host.
@@ -2034,6 +2064,26 @@ fn group_offset(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
     })
 }
 
+/// `DispatchX` flag: x counts thread groups, as `Dispatch`'s does. Without
+/// it x counts threads (the title's BVH builder dispatches its two unpack
+/// passes so, x their nodes: flags 0x20 against 0x8020 for its passes
+/// whose x is groups; PC 2 flag log, 27.11.).
+// shortcut: the bit's meaning is read off the title's dispatches, not a
+// header; the other bits (0x20 in all of them) are not looked at.
+const X_IN_GROUPS: u32 = 0x8000;
+
+/// What a `DispatchX` of `x` with `flags` runs on the host: the groups in
+/// x, and the thread limit its program takes (none: every thread of them).
+/// `group` is the program's group size in x where it is translated to take
+/// a thread limit; other programs, and dispatches whose x counts groups,
+/// run x groups as they are.
+fn x_groups(flags: u32, x: u32, group: Option<u32>) -> (u32, Option<u32>) {
+    match group {
+        Some(group) if flags & X_IN_GROUPS == 0 && group != 0 => (x.div_ceil(group), Some(x)),
+        _ => (x, None),
+    }
+}
+
 /// The user-data dword of the group offset entry among a stage's entries,
 /// for a stage translated to take one (`group_x_offset`).
 fn group_offset_index(group_x_offset: bool, user_data: &[victory_shader::emit::UserData]) -> Option<u32> {
@@ -2332,6 +2382,47 @@ mod tests {
         assert_eq!(group_offset_index(true, &[title]), None);
         assert_eq!(group_offset_index(true, &[title, added]), Some(GROUP_X_OFFSET_INDEX));
         assert_eq!(group_offset_index(true, &[added, title]), Some(GROUP_X_OFFSET_INDEX));
+    }
+
+    /// A `DispatchX` whose flags count x in threads runs, for a program
+    /// translated with a thread limit, the groups that hold x threads and
+    /// passes x as the limit; with the groups flag, or for a program not
+    /// translated so, x groups run without a limit, as before.
+    #[test]
+    fn dispatch_x_threads_run_the_groups_that_hold_them() {
+        // The title's flags: 0x20 threads, 0x8020 groups.
+        for (x, groups) in [(0, 0), (1, 1), (63, 1), (64, 1), (65, 2), (1038, 17), (11632, 182)] {
+            assert_eq!(x_groups(0x20, x, Some(64)), (groups, Some(x)), "x = {x}");
+        }
+        // The group size is the program's, not 64.
+        assert_eq!(x_groups(0x20, 33, Some(32)), (2, Some(33)));
+        assert_eq!(x_groups(0x20, u32::MAX, Some(64)), (u32::MAX / 64 + 1, Some(u32::MAX)));
+        // x in groups: as it is, every thread (also for a program with the limit).
+        assert_eq!(x_groups(0x8020, 51076, Some(32)), (51076, None));
+        assert_eq!(x_groups(0x8020, 1, None), (1, None));
+        // Not translated with the limit: run as before.
+        assert_eq!(x_groups(0x20, 1038, None), (1038, None));
+    }
+
+    /// A translation's thread limit is read from its own entries: the
+    /// program's group size where it has the limit's entry, and none
+    /// without the entry (the switch on or off), so a program the switch
+    /// names but whose cached translation lacks the entry runs as before.
+    /// The entry is no group offset and no root view, and a title's root
+    /// constant is no limit.
+    #[test]
+    fn a_translations_thread_limit_is_its_own_entry() {
+        use victory_shader::emit::{GROUP_X_OFFSET, GROUP_X_OFFSET_INDEX, THREAD_LIMIT, UserData, is_thread_limit};
+        let title = UserData { index: 31, slot: 2, root: RootType::Constants, dword: 15 };
+        let offset =
+            UserData { index: GROUP_X_OFFSET_INDEX, slot: 0, root: RootType::Constants, dword: GROUP_X_OFFSET };
+        let limit = UserData { index: 7, slot: 0, root: RootType::Constants, dword: THREAD_LIMIT };
+        assert_eq!(crate::pipeline::thread_limit_of(&[title, offset, limit], Some(64)), Some(64));
+        assert_eq!(crate::pipeline::thread_limit_of(&[title, offset], Some(64)), None);
+        // Not a compute program (no group size): no limit to dispatch by.
+        assert_eq!(crate::pipeline::thread_limit_of(&[limit], None), None);
+        assert!(is_thread_limit(&limit) && !is_thread_limit(&title) && !is_thread_limit(&offset));
+        assert!(!takes_group_offset(true, &limit) && !is_root_view(&limit) && !is_root_view_offset(&limit));
     }
 
     /// A title's root constants starting at user-data dword 11 put their
@@ -3733,7 +3824,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             &st,
             &io,
             &res,
-            Options { view_marks: true, group_x_offset: false, loop_limit: None },
+            Options { view_marks: true, group_x_offset: false, loop_limit: None, thread_limit: false },
         )
         .unwrap();
         assert!(host_shader.view_marks);
@@ -3743,6 +3834,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 host: host_shader,
                 used: used_entries,
                 group_x_offset: false,
+                thread_limit: None,
             },
         );
         let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");

@@ -192,6 +192,11 @@ pub(crate) struct Translated {
     /// Translated to take a split dispatch's group offset
     /// (`victory_shader::emit::Options::group_x_offset`).
     pub(crate) group_x_offset: bool,
+    /// A compute program translated to take a thread limit
+    /// (`victory_shader::emit::Options::thread_limit`): the program's group
+    /// size in x. Read from the translation itself (it has the limit's
+    /// entry), not from the switch.
+    pub(crate) thread_limit: Option<u32>,
 }
 
 #[cfg(windows)]
@@ -282,7 +287,7 @@ fn with_resources(
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let program = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -291,12 +296,28 @@ fn with_resources(
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used, group_x_offset: false })
+    let group_x = program.as_ref().and_then(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) => Some(cs.threads[0]),
+        _ => None,
+    });
+    let thread_limit = thread_limit_of(&host.user_data, group_x);
+    let used = program.map(|p| p.used).unwrap_or_default();
+    Ok(Translated { host, used, group_x_offset: false, thread_limit })
+}
+
+/// [`Translated::thread_limit`] of a translation with the entries
+/// `user_data`, of a compute program with groups of `group_x` threads in x:
+/// set exactly when the translation has the limit's entry.
+#[cfg(windows)]
+pub(crate) fn thread_limit_of(
+    user_data: &[victory_shader::emit::UserData],
+    group_x: Option<u32>,
+) -> Option<u32> {
+    user_data.iter().find(|u| victory_shader::emit::is_thread_limit(u))?;
+    group_x.filter(|&x| x != 0)
 }
 
 #[repr(C)]
@@ -882,7 +903,8 @@ mod tests {
         // A stage outside the builder with the switch on, through the
         // translation the host makes: the DXIL of today.
         let container = crate::shader_cache::tests::coherent_container();
-        let options = victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None };
+        let options =
+            victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None, thread_limit: false };
         let today = victory_shader::emit::translate_with(&container, options).expect("translates");
         for level in [1, 2] {
             let other = crate::shader_cache::translate_container(
