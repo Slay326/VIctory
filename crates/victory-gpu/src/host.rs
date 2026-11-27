@@ -1292,25 +1292,34 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let waiting = crate::prepbd::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::prepbd::since(crate::prepbd::Part::LockWait, waiting);
         let started = std::time::Instant::now();
+        let breakdown = crate::prepbd::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        let part = crate::prepbd::now();
         crate::resource::evict_unused();
+        crate::prepbd::since(crate::prepbd::Part::Evict, part);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
+        let part = crate::prepbd::now();
         crate::descriptor::sync_heaps();
+        crate::prepbd::since(crate::prepbd::Part::SyncHeaps, part);
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // `VICTORY_BVH_ARENA`: pages asked for after the last submission,
         // before the page tables are brought up to date below.
+        let part = crate::prepbd::now();
         crate::arena::provide();
+        crate::prepbd::since(crate::prepbd::Part::Provide, part);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1342,9 +1351,11 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let part = crate::prepbd::now();
         let uploads = (!heaps.is_empty() || !textures.is_empty() || crate::resource::moves_pending())
             .then(|| crate::bindless::uploads(&heaps, &textures))
             .flatten();
+        crate::prepbd::since(crate::prepbd::Part::Uploads, part);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -1377,6 +1388,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let part = crate::prepbd::now();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1387,13 +1399,19 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        crate::prepbd::since(crate::prepbd::Part::Deferred, part);
+        let part = crate::prepbd::now();
         batch.flush();
+        crate::prepbd::since(crate::prepbd::Part::LastFlush, part);
         // Copies in the GPU's own memory: what changed goes up, ahead of
         // the lists on the queue; the bitmaps there come down behind them.
+        let part = crate::prepbd::now();
         let card_marks = crate::shadow::card_marks();
         let _carded = self.card_before(&card_marks);
         let card_marks_list = self.card_marks(&card_marks);
+        crate::prepbd::since(crate::prepbd::Part::Card, part);
         let prepared = std::time::Instant::now();
+        crate::prepbd::since(crate::prepbd::Part::Total, breakdown);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -2601,7 +2619,9 @@ impl HostList {
                     if !marked {
                         batch.flush();
                     }
+                    let part = crate::prepbd::now();
                     shadow.writing(*address, *len, *marked);
+                    crate::prepbd::since(crate::prepbd::Part::GpuWriteMark, part);
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.
@@ -3328,6 +3348,7 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            crate::prepbd::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
