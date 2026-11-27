@@ -438,8 +438,16 @@ pub struct Options {
 }
 
 thread_local! {
-    static COHERENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COHERENT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+
+/// [`set_coherent_parts`]: glc/dlc title memory through the page's UAV
+/// instead of its SRV.
+pub const COHERENT_UAV: u8 = 1;
+/// ... that UAV marked globally coherent (with [`COHERENT_UAV`]).
+pub const COHERENT_GLOBAL: u8 = 2;
+/// `s_waitcnt_vscnt` as a device-wide UAV fence.
+pub const COHERENT_FENCE: u8 = 4;
 
 /// Diagnostics (T4, local test branch): translations made on this thread
 /// after `set_coherent(true)` read and write title memory coherently where
@@ -449,12 +457,23 @@ thread_local! {
 /// translation is byte for byte as without the switch. Per thread, so a
 /// shader cache filled on other threads is never touched.
 pub fn set_coherent(on: bool) {
-    COHERENT.with(|c| c.set(on));
+    set_coherent_parts(if on { COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE } else { 0 });
 }
 
-/// Whether [`set_coherent`] is on for this thread.
-pub fn coherent() -> bool {
+/// [`set_coherent`] by parts (H-05 separation): [`COHERENT_UAV`],
+/// [`COHERENT_GLOBAL`] (only with the UAV), [`COHERENT_FENCE`]; 0 is off.
+pub fn set_coherent_parts(parts: u8) {
+    COHERENT.with(|c| c.set(parts & (COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE)));
+}
+
+/// The parts of [`set_coherent_parts`] on for this thread (0: off).
+pub fn coherent_parts() -> u8 {
     COHERENT.with(std::cell::Cell::get)
+}
+
+/// Whether any part of [`set_coherent`] is on for this thread.
+pub fn coherent() -> bool {
+    coherent_parts() != 0
 }
 
 /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc is

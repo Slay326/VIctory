@@ -1120,6 +1120,11 @@ fn dirty_mark_width_and_branch_hoisting() {
 /// atomic add with the loaded value, lowered with the coherence diagnostics
 /// off and on (`super::set_coherent`, T4 local test branch).
 fn refit_handoff(coherent: bool) -> lower::Lowered {
+    refit_handoff_parts(if coherent { 7 } else { 0 })
+}
+
+/// [`refit_handoff`] with [`super::set_coherent_parts`].
+fn refit_handoff_parts(parts: u8) -> lower::Lowered {
     const GLC: u32 = 1 << 16;
     const DLC: u32 = 1 << 12;
     let mut w = vec![v_mov_b32(1, ZERO)];
@@ -1150,7 +1155,7 @@ fn refit_handoff(coherent: bool) -> lower::Lowered {
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    super::set_coherent(coherent);
+    super::set_coherent_parts(parts);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -1193,5 +1198,35 @@ fn coherence_diagnostics_off_change_nothing_and_on_make_glc_loads_coherent_and_f
         let plain = super::tests_dump_dxil(&off.dxil).expect("dxc");
         assert!(!plain.contains("dx.op.barrier"));
         assert!(!plain.contains("i32 20491"));
+    }
+}
+
+#[test]
+fn coherence_parts_each_change_only_their_own_part() {
+    use super::{COHERENT_FENCE as F, COHERENT_GLOBAL as G, COHERENT_UAV as U};
+    let off = refit_handoff_parts(0);
+    let uav = refit_handoff_parts(U);
+    let global = refit_handoff_parts(U | G);
+    let fence = refit_handoff_parts(F);
+    let all = refit_handoff_parts(U | G | F);
+    assert_eq!(off.coherent, (0, 0));
+    assert_eq!(uav.coherent, (1, 0), "UAV only: the glc load, no fence");
+    assert_eq!(global.coherent, (1, 0));
+    assert_eq!(fence.coherent, (0, 1), "fence only: loads stay SRV");
+    assert_eq!(all.coherent, (1, 1));
+    assert_ne!(uav.dxil, global.dxil, "globally coherent is a part of its own");
+    assert_ne!(uav.dxil, off.dxil);
+    assert_ne!(fence.dxil, off.dxil);
+    assert_eq!(refit_handoff_parts(G).dxil, off.dxil, "globally coherent alone does nothing");
+    #[cfg(windows)]
+    if let (Some(u), Some(g), Some(f)) = (
+        super::tests_dump_dxil(&uav.dxil),
+        super::tests_dump_dxil(&global.dxil),
+        super::tests_dump_dxil(&fence.dxil),
+    ) {
+        assert!(u.contains("ResourceProperties { i32 4107, i32 0 }") && !u.contains("i32 20491"));
+        assert!(!u.contains("dx.op.barrier"));
+        assert!(g.contains("ResourceProperties { i32 20491, i32 0 }"));
+        assert!(f.contains("@dx.op.barrier(i32 80, i32 2)") && !f.contains("i32 20491"));
     }
 }

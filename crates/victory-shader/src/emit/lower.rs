@@ -4256,15 +4256,15 @@ impl<'a> Lower<'a> {
         // Diagnostics (`super::set_coherent`): coherent title memory where
         // the console bypasses its caches, a device-wide UAV fence where it
         // waits for its stores (before the arrival atomics of a refit).
-        let coherent = super::coherent();
-        self.coherent_now = coherent
+        let parts = super::coherent_parts();
+        self.coherent_now = parts & super::COHERENT_UAV != 0
             && match &inst.fields {
                 Fields::Buffer { cache, .. } | Fields::Flat { cache, .. } => {
                     cache.glc || cache.dlc
                 }
                 _ => false,
             };
-        if coherent && name == "s_waitcnt_vscnt" {
+        if parts & super::COHERENT_FENCE != 0 && name == "s_waitcnt_vscnt" {
             let mode = self.s.m.i32(2);
             let void = self.s.t.void;
             self.s
@@ -5567,7 +5567,8 @@ impl<'a> Lower<'a> {
             // coherent (resource properties bit 14), for reads too.
             self.coherent_made.0 += 1;
             let one = k(self, 1);
-            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000 | 0x4000, 0))
+            let global = if super::coherent_parts() & super::COHERENT_GLOBAL != 0 { 0x4000 } else { 0 };
+            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000 | global, 0))
         } else if write {
             let one = k(self, 1);
             (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))

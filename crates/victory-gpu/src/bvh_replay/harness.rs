@@ -1498,7 +1498,25 @@ fn retranslate(
     lanes: u32,
     views: u32,
 ) -> anyhow::Result<()> {
-    let coherent = std::env::var("VICTORY_SHADER_COHERENT").is_ok_and(|v| v.trim() == "1");
+    // H-05 separation: 1/all (UAV, globally coherent, fence), uav, uavgc,
+    // fence; unset or 0: off.
+    let parts = match std::env::var("VICTORY_SHADER_COHERENT")
+        .unwrap_or_default()
+        .trim()
+    {
+        "" | "0" => 0,
+        "1" | "all" => 7,
+        "uav" => 1,
+        "uavgc" => 3,
+        "fence" => 4,
+        v => bail!("VICTORY_SHADER_COHERENT={v}: 0, 1/all, uav, uavgc or fence"),
+    };
+    let coherent = format!(
+        "{}{}{}",
+        if parts & 1 != 0 { "U" } else { "-" },
+        if parts & 2 != 0 { "G" } else { "-" },
+        if parts & 4 != 0 { "F" } else { "-" }
+    );
     let data = std::fs::read(file).with_context(|| format!("{}", file.display()))?;
     let mut found: HashMap<String, Vec<u8>> = HashMap::new();
     let mut at = 0;
@@ -1524,7 +1542,7 @@ fn retranslate(
     }
     victory_shader::emit::set_host_wave_max(lanes);
     crate::descriptor::host::host_views(views);
-    victory_shader::emit::set_coherent(coherent);
+    victory_shader::emit::set_coherent_parts(parts);
     let options = victory_shader::emit::Options {
         view_marks: true,
         group_x_offset: false,
