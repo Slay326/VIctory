@@ -297,6 +297,47 @@ condition.
   (`VICTORY_MEMMODEL_SECTION`, from the stream's REGION record; handles
   change from run to run).
 
+### Withheld writes (block 5)
+
+**DECISION (Fable):** what a GPU-only page does when shader writes to it
+are withheld (`crate::memory::withholding`).
+
+**ANSWER (Fable, block 5):** pages that programs using title memory write
+are never GPU-only.
+- The gap, as found: when a list using title memory reads memory with no
+  copy, what such programs wrote is dropped from the host copies, which
+  take title memory's bytes again. That is known only after the list ran.
+  A closed page has no bytes from before in title memory (its copy-backs
+  were skipped), so the net could only publish what should have been
+  dropped and demote (`withheld`). The first stage 3 run on PC 2 with the
+  BVH on did that for 225 pages [M] and is invalid; on PC 1, 744 of the
+  single-holder pages also carry kept writes in the stage 1 stream [C].
+- Not a before-image: saving one for closed pages is the copy-back stage 3
+  saves, and before the lists run it is not known which pages they write.
+- Instead, by who writes. Only programs using title memory are withheld
+  (their own mark bitmap, the flag on their declared ranges, the pages
+  they write at computed addresses), and ranges of other programs that
+  overlap a declared one of theirs in the same copy. So
+  (`watch::net::program_writes`): before a submission's lists run, every
+  range it may withhold is told (`host::may_be_withheld`); after it, when
+  its writes go back, the pages such programs marked or wrote at computed
+  addresses. A told page is never closed again, at any of its addresses
+  (`refused_program`); one that is closed gets the GPU's bytes in title
+  memory and leaves the class (`program`, a demotion that is no
+  classification error). Withheld ranges are remembered the same way.
+- What is left: a page such a program writes for the first time in the
+  very submission that is withheld, through a view no list declared or at
+  a computed address, while the page is closed. Counted as before
+  (`demoted_withheld`); a run with any is invalid. Closing that too needs
+  the set of pages such a program can reach before it runs, which the
+  page table does not give (it names every copy).
+- Cost: with the BVH on, the builder's pages leave stage 3. How many of the
+  section's single-holder pages remain is measured by the run
+  (`closed_*` against `refused_program`), not predicted.
+- `VICTORY_MEMMODEL` does not become the default while `demoted_withheld`
+  can be reached; whether the remaining case is accepted or closed is
+  decided from the full runs' counts.
+
 ## 5. Host write sites (c5)
 
 Copy steps write title memory today and the copy catches up at the next
