@@ -1040,6 +1040,30 @@ pub fn validate(pages: &BTreeMap<u64, Vec<u8>>) -> BTreeMap<u64, (&'static str, 
         .collect()
 }
 
+/// The v2 counts of `pages` as one line (headers as [`crate::bvh_gt::scan`]
+/// finds them, nothing read besides).
+pub fn v2_text(pages: &BTreeMap<u64, Vec<u8>>) -> String {
+    let list: Vec<(usize, &[u8])> = pages.iter().map(|(&a, b)| (a as usize, &b[..])).collect();
+    let headers: Vec<u64> = crate::bvh_gt::scan(&list).headers.iter().map(|(at, _)| *at).collect();
+    let read = crate::bvh_gt::reader(&list);
+    let mut fresh_invalid = Vec::new();
+    for &at in &headers {
+        let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
+        if crate::bvh_gt::is_header(d0, d1) && crate::bvh_gt::bottom_kind(d0) == Some(crate::bvh_gt::Bottom::Fresh) {
+            let c = crate::bvh_gt::check_bottom(&read, at, crate::bvh_gt::Bottom::Fresh, None);
+            if !c.without_rule.valid {
+                fresh_invalid.push(format!("{at:#x} {}", c.without_rule.why.as_deref().unwrap_or("?")));
+            }
+        }
+    }
+    format!(
+        "{}; fresh invalid {}: {}",
+        crate::bvh_gt::v2_of(&list, &headers, false).text(),
+        fresh_invalid.len(),
+        fresh_invalid.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// "valid by kind" as the game's log line writes it.
 pub fn by_kind(v: &BTreeMap<u64, (&'static str, bool, String)>) -> String {
     let mut k: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
@@ -1311,6 +1335,12 @@ pub fn main(args: &[String]) -> anyhow::Result<i32> {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    // Diag (senior 101): the v2 counts (`crate::bvh_gt::v2_of`, as the
+    // game's "BVH GT s.. v2" line, no pages read besides) per run and of G.
+    for (k, r) in results.iter().enumerate() {
+        println!("v2 run {k}: {}", v2_text(&r.pages));
+    }
+    println!("v2 G: {}", v2_text(&g));
     // Validator on the harness's result, against G.
     let hv = validate(&first.pages);
     println!("harness: valid by kind {}", by_kind(&hv));
@@ -1658,12 +1688,23 @@ fn retranslate(
         loop_limit: crate::pipeline::builder_loop_limit().or(Some(4096)),
         thread_limit: false,
     };
+    // Diag (senior 101, off by default): VICTORY_HARNESS_COHERENT_ONLY=<prefixes,...>
+    // translates only those of `only` with the coherence parts, the others
+    // without (as VICTORY_BVH_COHERENT=1 in the game: the refit 5552dac6 only).
+    let coherent_only: Option<Vec<String>> = std::env::var("VICTORY_HARNESS_COHERENT_ONLY")
+        .ok()
+        .map(|v| v.split(',').map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect());
     let mut done = 0;
     let mut limits: Vec<(u32, (u32, u32))> = Vec::new();
     for (pi, p) in l.capture.pipelines.iter_mut().enumerate() {
         if !only.iter().any(|h| p.hash.starts_with(h.as_str())) {
             continue;
         }
+        let parts_here = match &coherent_only {
+            Some(list) if !list.iter().any(|h| p.hash.starts_with(h.as_str())) => 0,
+            _ => parts,
+        };
+        victory_shader::emit::set_coherent_parts(parts_here);
         let Some(container) = found.get(&p.hash) else {
             println!(
                 "retranslate {}: container not found in {}",
@@ -1727,8 +1768,9 @@ fn retranslate(
             println!("retranslate {}: listed for the thread limit, translation has no limit entry", p.hash);
         }
         println!(
-            "retranslate {}: coherent {coherent}, wave lanes {lanes}, view heap {views}, {} bytes, captured {} bytes, byte-equal to the captured DXIL: {}",
+            "retranslate {}: coherent {}, wave lanes {lanes}, view heap {views}, {} bytes, captured {} bytes, byte-equal to the captured DXIL: {}",
             p.hash,
+            if parts_here == 0 { "---" } else { coherent.as_str() },
             host.dxil.len(),
             p.dxil.len(),
             if host.dxil == p.dxil { "YES" } else { "NO" }
