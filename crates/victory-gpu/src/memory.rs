@@ -951,6 +951,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
         if s.generation != now || (crate::arena::enabled() && s.arena_generation != crate::arena::generation()) {
+            let _rewrite = crate::prepbd::span(crate::prepbd::Part::MemoryRewrite);
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -958,6 +959,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     .flatten();
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
+    let _walk = crate::prepbd::span(crate::prepbd::Part::MemoryWalk);
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
             if !crate::watch::clean_bit(*bit) {

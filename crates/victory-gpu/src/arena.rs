@@ -821,6 +821,7 @@ pub(crate) fn provide() {
     if !enabled() {
         return;
     }
+    let part = crate::prepbd::now();
     let Some(host) = crate::host::host() else { return };
     let mut guard = arena();
     let a = guard.get_or_insert_with(new_arena);
@@ -844,6 +845,8 @@ pub(crate) fn provide() {
             a.generation += 1;
         }
     }
+    crate::prepbd::since(crate::prepbd::Part::ArenaRegions, part);
+    let part = crate::prepbd::now();
     let started = std::time::Instant::now();
     let mut wanted = std::mem::take(&mut a.wanted);
     let mut fills: Vec<(Slot, u64)> = Vec::new();
@@ -886,9 +889,13 @@ pub(crate) fn provide() {
     // (256-byte aligned addresses below 2^40 in qwords), a few pages each,
     // where committed title memory no copy holds lies. Its first run read
     // zeros there and its stages looped for seconds (runs 131349-133206).
+    crate::prepbd::since(crate::prepbd::Part::ArenaAround, part);
     let builder = std::mem::take(&mut a.builder_now);
+    let sorting = crate::prepbd::now();
     if builder {
+        let part = crate::prepbd::now();
         let found = scan_inputs(a);
+        crate::prepbd::since(crate::prepbd::Part::ArenaScan, part);
         for page in found {
             for p in page..page + PREPARED_PAGES {
                 if a.dir.get(p).is_some() || a.nothing.contains(&p) || a.not_title.contains(&p) {
@@ -952,6 +959,8 @@ pub(crate) fn provide() {
         }
     }
     let _ = looked;
+    crate::prepbd::since(crate::prepbd::Part::ArenaSort, sorting);
+    let part = crate::prepbd::now();
     let around_pages = first.len();
     let (mut given, mut no_room_now) = (0, false);
     for (k, (page, memory)) in first.into_iter().chain(committed).chain(reserved).enumerate() {
@@ -1020,12 +1029,16 @@ pub(crate) fn provide() {
             }
         }
     }
+    crate::prepbd::since(crate::prepbd::Part::ArenaGive, part);
+    let part = crate::prepbd::now();
     evict_for_persistent(a, evict_for, &mut fills);
     refresh_unwatched(a, &mut fills);
     let reads = std::mem::take(&mut a.builder_reads);
     if builder {
         refresh_builder_reads(a, &reads, &mut fills);
     }
+    crate::prepbd::since(crate::prepbd::Part::ArenaReads, part);
+    let part = crate::prepbd::now();
     // Pages that took title memory go up: write tracking is reset first, so
     // a write while they are read goes up at the next refresh.
     let pieces: Vec<(Slot, u64, u64)> = fills
@@ -1041,6 +1054,7 @@ pub(crate) fn provide() {
         upload(a, &pieces);
         a.stats.fill_us += started.elapsed().as_micros() as u64;
     }
+    crate::prepbd::since(crate::prepbd::Part::ArenaFill, part);
     // Logged at once: a submission that hangs never reaches a frame line.
     if a.stats.around_runs > around_runs || around_pages > 0 {
         tracing::info!(
@@ -1055,6 +1069,7 @@ pub(crate) fn provide() {
         );
     }
     if refresh_on() && !a.watched.is_empty() {
+        let _refresh = crate::prepbd::span(crate::prepbd::Part::ArenaRefresh);
         let started = std::time::Instant::now();
         refresh(a);
         a.stats.refresh_us += started.elapsed().as_micros() as u64;
@@ -1331,6 +1346,7 @@ fn scan_inputs(a: &mut Arena) -> BTreeSet<u64> {
             let n = (start + len - at).min(buffer.len() as u64) as usize;
             read_title(at, &mut buffer[..n]);
             a.stats.scanned += n as u64;
+            crate::prepbd::add(crate::prepbd::Part::ScanBytes, n as u64);
             for q in buffer[..n].as_chunks::<8>().0 {
                 let v = u64::from_le_bytes(*q);
                 if (1..256).contains(&(v >> 32)) && v & 0xff == 0 {
@@ -1376,6 +1392,7 @@ fn upload(a: &mut Arena, pieces: &[(Slot, u64, u64)]) {
     while k < pieces.len() {
         let mut used = 0usize;
         let mut batch = Vec::new();
+        let reading = crate::prepbd::now();
         while let Some(&(slot, at, len)) = pieces.get(k) {
             if used + len as usize > STAGE {
                 break;
@@ -1388,6 +1405,9 @@ fn upload(a: &mut Arena, pieces: &[(Slot, u64, u64)]) {
             used += len as usize;
             k += 1;
         }
+        crate::prepbd::since(crate::prepbd::Part::UploadRead, reading);
+        let waiting = crate::prepbd::now();
+        crate::prepbd::add(crate::prepbd::Part::UploadWaits, 1);
         let chunks = &a.chunks;
         let ran = crate::host::run_now(|list| {
             for &(slot, inside, from, len) in &batch {
@@ -1395,6 +1415,7 @@ fn upload(a: &mut Arena, pieces: &[(Slot, u64, u64)]) {
                 unsafe { list.CopyBufferRegion(&chunks[slot.chunk()], slot.offset() + inside, &stage, from, len) };
             }
         });
+        crate::prepbd::since(crate::prepbd::Part::UploadWait, waiting);
         if !ran {
             tracing::warn!(target: "victory_gpu::arena", "BVH arena pages could not be sent up");
             return;
@@ -1419,6 +1440,7 @@ fn refresh(a: &mut Arena) {
     let mut pieces = Vec::new();
     let mut found = vec![0usize; 4096];
     for (first, n, _) in runs {
+        let _watch = crate::prepbd::span(crate::prepbd::Part::ArenaWatch);
         // A few rounds while the answer fills `found`.
         for _ in 0..16 {
             let (mut count, mut granularity) = (found.len(), 0u32);

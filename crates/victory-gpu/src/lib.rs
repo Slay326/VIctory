@@ -48,6 +48,7 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
+mod prepbd;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
