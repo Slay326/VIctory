@@ -491,6 +491,11 @@ impl Drop for Tracked {
 /// Gives write access back to page `page` if we guarded it.
 fn open(g: &mut Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    // A page closed as GPU-only (`net`) holds old bytes: it stays closed and
+    // guarded, whoever asks; its next access syncs it.
+    if g.protected.contains(&page) && net::keeps_closed(page) {
+        return false;
+    }
     if !g.protected.remove(&page) {
         return false;
     }
@@ -851,7 +856,20 @@ impl Drop for Writing {
 pub fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Pages closed as GPU-only get the GPU's bytes first and are closed no
+    // more: before the guard lock (`net`'s lock order), and once more if
+    // one was closed between that and the lock. With the range busy under
+    // the lock, none is closed from here on.
+    net::host_touch(at, len);
     let mut g = guards();
+    for _ in 0..8 {
+        if !net::closed(first, last) {
+            break;
+        }
+        drop(g);
+        net::host_touch(at, len);
+        g = guards();
+    }
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
     Writing { first, last }
@@ -861,10 +879,12 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Pages closed as GPU-only are synced while our own view still knows
+    // the address, then forgotten.
+    net::remapped(first, last);
     // Our own address of what it showed is no longer its address (taken
     // before the guards, never under them: see `Own`).
     forget_views(at, at.saturating_add(len));
-    net::remapped(first, last);
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
@@ -892,6 +912,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // A page closed as GPU-only cannot drop them (see there).
+    net::withheld(first, last);
     let g = guards();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     mark(&g, first, last);
@@ -934,6 +956,14 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
         && protect(&mut g, &[page]).is_empty()
     {
         changed(&mut g, page, page + 1, false);
+    }
+    // Where they are closed as GPU-only, it is closed with them; if it
+    // cannot be, they are synced and closed no more.
+    let others: Vec<usize> = others.iter().map(|o| o / PAGE).collect();
+    let joined = net::aliased(page, &others);
+    drop(g);
+    if !joined {
+        net::unjoined(&others);
     }
 }
 
@@ -1071,6 +1101,27 @@ fn forget_views(at: usize, end: usize) {
 }
 
 impl Own {
+    /// Pages `[first, last)` widened to the whole of every title view we
+    /// know that they touch (what `forget_views` forgets for them).
+    fn reach(&self, first: usize, last: usize) -> (usize, usize) {
+        let (at, end) = (first * PAGE, last.saturating_mul(PAGE));
+        let before = self.views.range(..=at).next_back().filter(|(base, v)| *base + v.0 > at);
+        let (mut lo, mut hi) = (at, end);
+        for (&base, v) in before.into_iter().chain(self.views.range(at.saturating_add(1)..end)) {
+            lo = lo.min(base);
+            hi = hi.max(base + v.0);
+        }
+        (lo / PAGE, hi.div_ceil(PAGE))
+    }
+
+    /// The size in bytes of the section title memory `[at, at + len)` is a
+    /// view of, if we have a view of our own of it ([`Own::beside`]).
+    fn section_of(&self, at: usize, len: usize) -> Option<usize> {
+        self.beside(at, len)?;
+        let (_, &(_, section, _)) = self.views.range(..=at).next_back()?;
+        self.sections.get(&section).map(|&(_, bytes)| bytes)
+    }
+
     /// Our own address of title memory `[at, at + len)`, if it lies in one
     /// title view of a section we have a view of.
     fn beside(&self, at: usize, len: usize) -> Option<usize> {

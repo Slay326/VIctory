@@ -58,6 +58,9 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the GPU's own
     /// memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// Itself: a page it keeps as GPU-only (`crate::watch::net`) keeps it
+    /// alive.
+    me: std::sync::Weak<Shadow>,
 }
 
 /// What a copy in the GPU's memory ([`cards`]) has beside the buffer
@@ -504,6 +507,16 @@ impl Shadow {
         self.card_changed(at, at + bytes.len());
     }
 
+    /// Writes `bytes` into the CPU's side of the copy alone, telling nobody
+    /// (tests: bytes there that are older than the GPU's side).
+    #[cfg(test)]
+    pub(crate) fn write_cpu_side(&self, address: u64, bytes: &[u8]) {
+        let at = (address - self.start) as usize;
+        assert!(at + bytes.len() <= self.len as usize);
+        // SAFETY: inside the mapping (checked).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+    }
+
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
     /// which copy it is (diagnostics: what shaders see there).
     #[cfg(feature = "diagnostics")]
@@ -526,6 +539,16 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Its tracker, where its memory is tracked.
+    pub(crate) fn tracker(&self) -> Option<&crate::watch::Tracked> {
+        self.tracked.as_ref()
+    }
+
+    /// Itself, shared (none while it is being dropped).
+    pub(crate) fn shared(&self) -> Option<Arc<Shadow>> {
+        self.me.upgrade()
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
     /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
     /// the bytes of the page (cut to the copy) that differ from title memory
@@ -540,6 +563,10 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return 0;
+        }
+        // A page kept as GPU-only: what shaders wrote stays in the copy.
+        if crate::watch::net::skips(page / PAGE, crate::watch::net::Way::Computed, self) {
             return 0;
         }
         // A title write from here on saves the page's bytes from before it:
@@ -579,6 +606,11 @@ impl Shadow {
             // The GPU wrote the page: whether the title's CPU code touches
             // it from here on is what `VICTORY_PAGENET=measure` counts.
             crate::watch::net::arm(page / PAGE, crate::watch::net::Way::Computed);
+            // With the memory model, a whole page stays in the copy from
+            // here on if it may (title memory and the copy are equal now).
+            if from == page && to == page + PAGE {
+                crate::watch::net::close(page / PAGE, crate::watch::net::Way::Computed, self);
+            }
         }
         to - from
     }
@@ -594,7 +626,6 @@ impl Shadow {
     /// marked as for any copy-back beside the guard. True if every byte
     /// landed; false, with nothing written, for a page the copy does not
     /// hold whole or memory we have no view of our own of.
-    #[cfg_attr(not(test), allow(dead_code))] // called by the net's sync, which comes next
     pub(crate) fn copy_back_forced(&self, page: usize) -> bool {
         let Some(t) = &self.tracked else {
             return false;
@@ -603,9 +634,18 @@ impl Shadow {
         if !page.is_multiple_of(PAGE) || page < start || page + PAGE > end {
             return false;
         }
-        // A copy in the GPU's memory: the page comes down first.
-        if self.card.is_some() {
-            crate::host::card_fetch(&[(self, page - start, page + PAGE - start)]);
+        // A copy in the GPU's memory: the page comes down first. Unless
+        // bytes of it changed on the CPU's side and have not gone up yet:
+        // they go up before each submission, so none has run since, the
+        // CPU's side is the newer one (it was made equal to title memory
+        // when the page was closed, with what the title wrote meanwhile),
+        // and the page coming down would put the GPU's older bytes over it.
+        if let Some(card) = &self.card {
+            let (a, b) = (page - start, page + PAGE - start);
+            let ahead = card.dirty.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(from, to)| from < b && a < to);
+            if !ahead {
+                crate::host::card_fetch(&[(self, a, b)]);
+            }
         }
         // SAFETY: inside the mapping; the GPU is done with it (the caller
         // holds the submission lock).
@@ -743,7 +783,7 @@ impl Shadow {
         let on_card = card.is_some();
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
-        let shadow = Arc::new(Shadow {
+        let shadow = Arc::new_cyclic(|me| Shadow {
             buffer,
             data,
             gpu,
@@ -756,6 +796,7 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
             card,
+            me: me.clone(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -978,6 +1019,12 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let title = &mut title[..n];
+                // A page kept as GPU-only: what shaders wrote stays in the
+                // copy (asked before title memory is read).
+                if n == PIECE && crate::watch::net::skips((start + at) / PAGE, crate::watch::net::Way::Declared, self) {
+                    at += n;
+                    continue;
+                }
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
@@ -1017,6 +1064,7 @@ impl Shadow {
                         self.take_and_read(t, address, address, address + n);
                         // The GPU wrote the page (`copy_back_page`).
                         crate::watch::net::arm(address / PAGE, crate::watch::net::Way::Declared);
+                        crate::watch::net::close(address / PAGE, crate::watch::net::Way::Declared, self);
                     }
                 }
             }
@@ -1057,6 +1105,11 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // A page kept as GPU-only: what shaders wrote stays in the copy.
+        if crate::watch::net::skips(page / PAGE, crate::watch::net::Way::Marked, self) {
+            t.unarm(page / PAGE);
+            return 0;
+        }
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
             t.unarm(page / PAGE);
@@ -1093,6 +1146,12 @@ impl Shadow {
         // page read with nothing to put back is closed again if it was.
         if whole && (put != Put::Nothing || armed) {
             crate::watch::net::arm(page / PAGE, crate::watch::net::Way::Marked);
+        }
+        // With the memory model, the page stays in the copy from here on
+        // if it may: title memory and the copy are equal now (a page the
+        // title wrote meanwhile is refused as changed).
+        if whole && put != Put::Nothing {
+            crate::watch::net::close(page / PAGE, crate::watch::net::Way::Marked, self);
         }
         if put != Put::Nothing { to - from } else { 0 }
     }
@@ -1641,7 +1700,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     // (`Shadow::copy_back_marked`).
     let fetch: Vec<(&Shadow, usize, usize)> = pages
         .iter()
-        .filter(|(copy, _)| copy.carded())
+        .filter(|(copy, page)| copy.carded() && !crate::watch::net::kept(page / PAGE, copy))
         .map(|(copy, page)| {
             if let Some(t) = &copy.tracked {
                 t.arm(*page, *page + PAGE);
@@ -1697,7 +1756,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     if apart.len() >= PARALLEL_LEAST {
         std::thread::scope(|scope| {
             for _ in 1..threads {
-                scope.spawn(work);
+                // For the submitting thread, which holds the submission
+                // lock for them.
+                scope.spawn(|| crate::host::for_submitter(work));
             }
             work();
         });

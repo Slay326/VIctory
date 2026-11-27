@@ -56,6 +56,15 @@ impl Fixture {
         Some(Fixture { p, len, copy: Some(copy), section: None })
     }
 
+    /// [`Fixture::views`] with the copy in the GPU's memory (`cards`; none
+    /// where that is switched off).
+    fn views_in_gpu_memory(pages: usize, pattern: impl Fn(usize) -> u8) -> Option<Fixture> {
+        tests::LEAST.with(|l| l.set(Some(0)));
+        let f = Fixture::views(pages, pattern);
+        tests::LEAST.with(|l| l.set(None));
+        f.filter(|f| f.copy().carded())
+    }
+
     /// [`Fixture::new`] over the title's view of a section of physical
     /// pages (we have a view of our own of it, `crate::watch`), which the
     /// title has mapped a second time elsewhere.
@@ -401,7 +410,15 @@ fn schedule(seed: u64, len: usize) -> (Vec<ListPlan>, Vec<Step>) {
 /// Runs a schedule on a fresh fixture with every list `marked` or not,
 /// checking against a byte-wise model at each step. Err: what went wrong.
 fn run_schedule(seed: u64, marked: bool) -> Result<(), String> {
-    let Some(f) = Fixture::new(4, pattern) else {
+    run_schedule_on(seed, marked, false)
+}
+
+/// [`run_schedule`]; with `views`, over a section's views, where title
+/// memory is only looked at when the title looks (its writes, and all of
+/// it at the end): with the memory model on, pages are GPU-only in
+/// between, and what lists read is checked against the model instead.
+fn run_schedule_on(seed: u64, marked: bool, views: bool) -> Result<(), String> {
+    let Some(f) = (if views { Fixture::views(4, pattern) } else { Fixture::new(4, pattern) }) else {
         return Ok(()); // no host GPU here
     };
     let copy = f.copy();
@@ -429,7 +446,16 @@ fn run_schedule(seed: u64, marked: bool) -> Result<(), String> {
                     copy.update(f.p + l.from, l.to - l.from);
                 }
                 // What this list's shaders read: title memory now.
-                if let Some((at, c, t)) = f.first_difference(l.from & !3, l.to & !3) {
+                if views {
+                    let (a, b) = (l.from & !3, l.to & !3);
+                    let read = f.copy_bytes(a, b);
+                    if let Some(at) = (a..b).find(|&at| read[at - a] != model[at]) {
+                        return fail(format!(
+                            "step {i}: list {k} would read {:#x} at {at:#x}, the model has {:#x}",
+                            read[at - a], model[at]
+                        ));
+                    }
+                } else if let Some((at, c, t)) = f.first_difference(l.from & !3, l.to & !3) {
                     return fail(format!("step {i}: list {k} would read {c:#x} at {at:#x}, title memory has {t:#x}"));
                 }
                 copy.writing(f.p + l.from, l.to - l.from, marked);
@@ -456,6 +482,9 @@ fn run_schedule(seed: u64, marked: bool) -> Result<(), String> {
                     for &(at, value) in &l.gpu {
                         model[at] = value;
                     }
+                }
+                if views {
+                    continue;
                 }
                 let title = f.title_bytes(0, f.len);
                 if let Some(at) = (0..f.len).find(|&at| title[at] != model[at]) {
@@ -540,7 +569,33 @@ fn a_constant_written_between_two_lists_reaches_the_second() {
     }
 }
 
-// ------------------------------------------------- forced copy-back ---
+// ---------------------------------------------------------------- (d) ---
+//
+// The memory model (stage 3: `VICTORY_MEMMODEL=1`) and its safety net
+// (`crate::watch::net`, `crate::pagenet`), on real memory: a section of
+// physical pages the title has mapped twice, as its GPU heaps are. A page
+// is GPU-only once a copy-back has closed it; these tests then let the
+// title (or the engine) touch it in every way it can and look at what it
+// sees.
+
+use crate::pagenet::{DemoteReason, State};
+use crate::watch::net::tests as net;
+
+/// The memory model on for this thread until dropped.
+struct ModelOn;
+
+impl ModelOn {
+    fn new() -> ModelOn {
+        crate::watch::net::TEST_MODEL.set(true);
+        ModelOn
+    }
+}
+
+impl Drop for ModelOn {
+    fn drop(&mut self) {
+        crate::watch::net::TEST_MODEL.set(false);
+    }
+}
 
 /// The protection of the page at `at`.
 fn protection(at: usize) -> u32 {
@@ -571,6 +626,28 @@ impl Fixture {
         let view = unsafe { MapViewOfFile(section as _, FILE_MAP_READ, 0, 0, self.len) }.Value as usize;
         assert!(view != 0);
         view
+    }
+
+    /// One submission whose shaders write `gpu` through marked views of the
+    /// whole fixture, to its sync point.
+    fn marked(&self, gpu: &[(usize, u8)]) {
+        submission(self, Back::Marked, 0, self.len, gpu, &[]);
+    }
+
+    /// A fixture over views with the model on and every page GPU-only: one
+    /// marked submission wrote byte 8 of each page (0xa0 + page), the
+    /// copy-back closed them at both addresses.
+    fn gpu_only(pages: usize) -> Option<(ModelOn, Fixture)> {
+        let on = ModelOn::new();
+        let f = Fixture::views(pages, pattern)?;
+        let gpu: Vec<(usize, u8)> = (0..pages).map(|k| (k * PAGE + 8, 0xa0 + k as u8)).collect();
+        f.marked(&gpu);
+        for k in 0..pages {
+            assert_eq!(net::state(f.p / PAGE + k), State::GpuOnlyArmed, "page {k} closed by its copy-back");
+            assert_eq!(net::state(f.second() / PAGE + k), State::GpuOnlyArmed, "and where it shows too");
+            assert_eq!((protection(f.p + k * PAGE), protection(f.second() + k * PAGE)), (CLOSED, CLOSED));
+        }
+        Some((on, f))
     }
 }
 
@@ -635,56 +712,344 @@ fn a_forced_copy_back_lands_beside_closed_views_and_drops_nothing() {
     assert_eq!(pool.title(8), pattern(8), "nothing written");
 }
 
-// ---------------------------------------------------------------- (d) ---
-//
-// Demotion (night 2, stage 3: VICTORY_MEMMODEL=1, the safety net Fable
-// implements). Until it exists these are scaffolds: ignored, and they do
-// not count as tests. To enable one: replace the `todo!` with the safety
-// net's calls, remove `#[ignore]`, show it red with the demotion left out
-// and green with it.
-
-/// (d) A page treated as GPU-only (no mirror, no copy-back) that the title
-/// writes is detected (guard fault or write watch), synced before the next
-/// GPU read, demoted to shared, and the demotion is logged with its reason.
-///
-/// Expected: after the title write at offset 16 of a GPU-only page, the
-/// next refresh brings the title's byte to the copy (as test (a)), the
-/// page's class reads `Shared`, and the demotion count is 1 with reason
-/// "title write".
+/// (d) A page only the GPU uses stays in its copy: after the copy-back that
+/// closed it, what shaders write is not copied back (title memory keeps its
+/// older bytes, nobody reads them). The first title read, at either
+/// address, sees the GPU's newest bytes all the same, and from then on the
+/// page is shared for good: later GPU writes go back at each sync point, a
+/// title write next to them stays, and it is never closed again.
 #[test]
-#[ignore = "stage 3: no GPU-only class or demotion yet (Fable, safety net)"]
-fn a_title_write_to_a_gpu_only_page_demotes_it_and_is_synced() {
-    let Some(f) = Fixture::new(1, pattern) else {
+fn a_title_read_of_a_gpu_only_page_sees_the_gpus_bytes_and_demotes_it() {
+    let Some((_on, f)) = Fixture::gpu_only(2) else {
         return; // no host GPU here
     };
-    f.copy().update(f.p, f.len);
-    // Stage 3: classify the page GPU-only here (the switch's own call).
-    f.title_write(16, 0x42);
-    f.copy().update(f.p, f.len);
-    assert_eq!(f.copy_bytes(16, 20)[0], 0x42, "synced before the next GPU read");
-    todo!("stage 3: assert the page's class is Shared and one demotion (reason: title write) was logged");
+    let peek = f.peek();
+    let skipped = net::skipped();
+    f.marked(&[(16, 0xb0), (PAGE + 16, 0xb1)]);
+    assert_eq!(net::skipped(), skipped + 2, "both copy-backs skipped");
+    assert_eq!((read(peek + 16), read(peek + PAGE + 16)), (pattern(16), pattern(PAGE + 16)), "not in title memory");
+    assert_eq!((protection(f.p), protection(f.p + PAGE)), (CLOSED, CLOSED), "still closed");
+
+    // The title reads page 0 where it shows a second time.
+    assert_eq!(read(f.second() + 16), 0xb0, "the GPU's newest byte");
+    assert_eq!(read(f.second() + 8), 0xa0);
+    assert_eq!(read(f.p + 17), pattern(17));
+    assert_eq!((protection(f.p), protection(f.second())), (GUARDED, GUARDED), "open together, under the write guard");
+    assert_eq!((net::state(f.p / PAGE), net::state(f.second() / PAGE)), (State::Demoted, State::Demoted));
+    assert_eq!(net::demotion(f.second() / PAGE), Some((DemoteReason::CpuRead, 2)), "logged with its reason");
+    assert_eq!(net::state(f.p / PAGE + 1), State::GpuOnlyArmed, "page 1 is untouched");
+    assert_eq!(protection(f.p + PAGE), CLOSED);
+
+    // Shared from now on: both writers' bytes, at every sync point.
+    for round in 0..20u8 {
+        f.title_write(20, 0x55 ^ round);
+        f.marked(&[(24, 0xc0 + round)]);
+        assert_eq!((f.title(24), f.title(20)), (0xc0 + round, 0x55 ^ round), "round {round}");
+        assert_eq!(net::state(f.p / PAGE), State::Demoted, "never GPU-only again");
+        assert!(protection(f.p) != CLOSED && protection(f.second()) != CLOSED);
+    }
+    f.copy().update(f.p, PAGE);
+    assert_eq!(f.first_difference(0, PAGE), None);
+    assert_eq!(net::state(f.p / PAGE + 1), State::GpuOnlyArmed);
+    assert_eq!(read(f.p + PAGE + 16), 0xb1, "page 1, at its first read");
 }
 
-/// (d) A demoted page is never treated as GPU-only again: not after more
-/// frames without title writes, not after the classification runs again.
-///
-/// Expected: demote a page (as above), run 100 frames (`memory::log_frame`)
-/// with only GPU writes to it; it stays `Shared`, its GPU writes go back at
-/// each sync point (as test (b)), and the demotion count stays 1.
+/// (d) A title write to a GPU-only page keeps both writers' bytes: the
+/// GPU's go into title memory before the write lands, the write is then the
+/// write guard's (the page counts as changed), and the next refresh brings
+/// the title's byte to the copy before any GPU read.
 #[test]
-#[ignore = "stage 3: no GPU-only class or demotion yet (Fable, safety net)"]
-fn a_demoted_page_is_never_gpu_only_again() {
-    todo!("stage 3: demote a page, run frames and a reclassification, assert it stays Shared and copies back");
+fn a_title_write_to_a_gpu_only_page_demotes_it_and_is_synced() {
+    let Some((_on, f)) = Fixture::gpu_only(1) else {
+        return; // no host GPU here
+    };
+    f.marked(&[(4096 + 16, 0xb0)]);
+    f.title_write(4096 + 20, 0x42);
+    assert_eq!(net::state(f.p / PAGE), State::Demoted);
+    assert_eq!(net::demotion(f.p / PAGE), Some((DemoteReason::CpuWrite, 2)));
+    assert_eq!((f.title(4096 + 16), f.title(4096 + 20), f.title(8)), (0xb0, 0x42, 0xa0), "both writers' bytes");
+    f.copy().update(f.p, f.len);
+    assert_eq!(f.copy_bytes(4096 + 16, 4096 + 24), [0xb0, pattern(4096 + 17), pattern(4096 + 18), pattern(4096 + 19), 0x42, pattern(4096 + 21), pattern(4096 + 22), pattern(4096 + 23)]);
+    assert_eq!(f.first_difference(0, f.len), None, "synced before the next GPU read");
 }
 
-/// (d) A wrong classification costs speed, never correctness: with the
-/// whole buffer wrongly classed GPU-only, the interleaved schedules of
-/// test (c) still match the model, and every page the title wrote is
-/// demoted (count = pages the title wrote).
+/// (d) Two title threads reading a GPU-only page at once: one sync, both
+/// see the GPU's bytes, one demotion.
 #[test]
-#[ignore = "stage 3: no GPU-only class or demotion yet (Fable, safety net)"]
+fn two_threads_reading_a_gpu_only_page_sync_it_once() {
+    let Some((_on, f)) = Fixture::gpu_only(1) else {
+        return; // no host GPU here
+    };
+    f.marked(&[(16, 0xb0)]);
+    let syncs = net::syncs();
+    let (a, b) = (f.p + 16, f.second() + 16);
+    let seen: Vec<u8> = std::thread::scope(|scope| {
+        let threads: Vec<_> = [a, b, a, b]
+            .into_iter()
+            .map(|at| {
+                scope.spawn(move || {
+                    crate::watch::net::TEST_MODEL.set(true);
+                    read(at)
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    assert_eq!(seen, [0xb0; 4]);
+    assert_eq!(net::demotion(f.p / PAGE).or(net::demotion(f.second() / PAGE)).map(|d| d.1), Some(2));
+    assert_eq!(net::demotions_of(&[f.p / PAGE, f.second() / PAGE]), 1, "one sync for the page");
+    assert!(net::syncs() > syncs);
+}
+
+/// (d) The alias rule. A page another host copy holds, here at the page's
+/// other address, is not closed: that copy gets the GPU's bytes only by way
+/// of title memory, and keeps getting them. A copy that comes to a closed
+/// page later reads title memory first, which syncs the page and takes it
+/// out of the class.
+#[test]
+fn a_page_another_copy_holds_is_never_gpu_only() {
+    let _on = ModelOn::new();
+    let Some(f) = Fixture::views(2, pattern) else {
+        return; // no host GPU here
+    };
+    let second = f.second();
+    // Page 1 gets a second copy before anything is closed.
+    register(second + PAGE, (second + PAGE) as u64, PAGE as u64);
+    let early = find((second + PAGE) as u64, PAGE as u64).expect("a host GPU");
+    early.update(second + PAGE, PAGE);
+    let refused = net::refused(crate::watch::net::Refusal::Holders);
+    f.marked(&[(8, 0xa0), (PAGE + 8, 0xa1)]);
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed, "page 0: one holder");
+    assert_eq!(net::state(f.p / PAGE + 1), State::Shared, "page 1: two copies");
+    assert!(protection(f.p + PAGE) != CLOSED && protection(second + PAGE) != CLOSED);
+    assert!(net::refused(crate::watch::net::Refusal::Holders) > refused);
+    for round in 0..3u8 {
+        f.marked(&[(PAGE + 16, 0xb0 + round)]);
+        early.update(second + PAGE, PAGE);
+        assert_eq!(early.read_host((second + PAGE + 16) as u64, 1)[0] as u8, 0xb0 + round, "the other copy follows");
+        assert_eq!(net::state(f.p / PAGE + 1), State::Shared);
+    }
+
+    // Page 0 gets a second copy while it is closed.
+    f.marked(&[(16, 0xc0)]);
+    register(second, second as u64, PAGE as u64);
+    let late = find(second as u64, PAGE as u64).expect("a host GPU");
+    late.update(second, PAGE);
+    assert_eq!(late.read_host((second + 16) as u64, 1)[0] as u8, 0xc0, "it reads the GPU's newest bytes");
+    assert_eq!(net::state(f.p / PAGE), State::Demoted);
+    assert_eq!(net::demotion(second / PAGE).or(net::demotion(f.p / PAGE)).map(|d| d.0), Some(DemoteReason::Host));
+    f.marked(&[(24, 0xd0)]);
+    late.update(second, PAGE);
+    assert_eq!(late.read_host((second + 24) as u64, 1)[0] as u8, 0xd0, "and follows from then on");
+    drop((early, late));
+    unregister(second + PAGE, (second + PAGE) as u64);
+    unregister(second, second as u64);
+}
+
+/// (d) A page is only closed while title memory and the copy are equal: one
+/// its tracker has as changed (the title wrote it since the copy took it,
+/// or the copy is to take it again) is refused, and closed once taken.
+#[test]
+fn a_page_changed_since_it_was_taken_is_not_closed() {
+    use crate::watch::net::{Refusal, Way, close};
+    let _on = ModelOn::new();
+    let Some(f) = Fixture::views(1, pattern) else {
+        return; // no host GPU here
+    };
+    let copy = f.copy();
+    copy.update(f.p, f.len);
+    crate::watch::retake(f.p, PAGE);
+    let refused = net::refused(Refusal::Changed);
+    close(f.p / PAGE, Way::Marked, copy);
+    assert_eq!(net::state(f.p / PAGE), State::Shared);
+    assert!(protection(f.p) != CLOSED);
+    assert!(net::refused(Refusal::Changed) > refused);
+    copy.update(f.p, f.len);
+    close(f.p / PAGE, Way::Marked, copy);
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed);
+    assert_eq!((protection(f.p), protection(f.second())), (CLOSED, CLOSED));
+    assert_eq!(read(f.p + 8), pattern(8));
+}
+
+/// (d) The engine's own accesses to title memory sync a GPU-only page
+/// first: a kernel copy out of it reads the GPU's bytes, and a kernel write
+/// the runtime announces (a file read into the buffer, a copy step) lands
+/// on top of them.
+#[test]
+fn the_engines_own_accesses_sync_a_gpu_only_page() {
+    let Some((_on, f)) = Fixture::gpu_only(2) else {
+        return; // no host GPU here
+    };
+    f.marked(&[(16, 0xb0), (PAGE + 16, 0xb1)]);
+    let mut bytes = [0u8; 4];
+    assert!(crate::host::read_into((f.p + 16) as *const u8, &mut bytes), "readable for the engine");
+    assert_eq!(bytes[0], 0xb0);
+    assert_eq!(net::demotion(f.p / PAGE), Some((DemoteReason::Host, 2)));
+
+    {
+        let _writing = crate::watch::writing(f.second() + PAGE + 20, 4);
+        assert_eq!(net::state(f.p / PAGE + 1), State::Demoted, "synced before it opens");
+        // SAFETY: open for the write under way.
+        unsafe { ((f.second() + PAGE + 20) as *mut u8).write_volatile(0x42) };
+    }
+    assert_eq!((f.title(PAGE + 16), f.title(PAGE + 20), f.title(PAGE + 8)), (0xb1, 0x42, 0xa1));
+    assert_eq!(net::demotion(f.second() / PAGE + 1), Some((DemoteReason::Host, 2)));
+}
+
+/// (d) A copy in the GPU's memory has two sides, and only the GPU's holds
+/// what shaders wrote to a GPU-only page: a sync brings the page down
+/// before it goes into title memory, whatever the CPU's side has.
+#[test]
+fn a_gpu_only_page_of_a_copy_in_gpu_memory_is_synced_from_the_gpus_side() {
+    let _on = ModelOn::new();
+    let Some(f) = Fixture::views_in_gpu_memory(1, pattern) else {
+        return; // no host GPU here, or no copies in its memory
+    };
+    f.marked(&[(8, 0xa0)]);
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed);
+    // The shaders' next write, on the GPU's side (sent up as before a
+    // submission); the CPU's side is left with other bytes, as it is when
+    // no copy-back fetches the page any more.
+    f.copy().write_host((f.p + 16) as u64, &[0xb0]);
+    crate::host::card_up();
+    f.copy().write_cpu_side((f.p + 16) as u64, &[0xee]);
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed);
+    assert_eq!(read(f.second() + 16), 0xb0, "the GPU's side, not the CPU's");
+    assert_eq!(read(f.p + 8), 0xa0);
+    assert_eq!(net::state(f.p / PAGE), State::Demoted);
+}
+
+/// (d) A page closed right after a copy-back that took the title's bytes
+/// around the shaders' (the title wrote the page while the GPU ran): those
+/// bytes are on the CPU's side of a copy in the GPU's memory and go up only
+/// with the next submission. A sync before that must not bring the page
+/// down over them: title memory keeps what the title wrote.
+#[test]
+fn a_sync_before_the_next_submission_keeps_what_the_cpu_side_is_ahead_by() {
+    let _on = ModelOn::new();
+    let Some(f) = Fixture::views_in_gpu_memory(1, pattern) else {
+        return; // no host GPU here, or no copies in its memory
+    };
+    let copy = f.copy();
+    copy.update(f.p, f.len);
+    // The title writes; the refresh takes it to the CPU's side (no
+    // submission sends it up here), and the page is closed with title
+    // memory and the copy equal.
+    f.title_write(40, 0x42);
+    copy.update(f.p, f.len);
+    crate::watch::net::close(f.p / PAGE, crate::watch::net::Way::Marked, copy);
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed);
+    assert_eq!(read(f.second() + 40), 0x42, "the title's own byte survives the sync");
+    assert_eq!(net::state(f.p / PAGE), State::Demoted);
+}
+
+/// (d) A kernel copy that failed because a page was closed between the
+/// engine's look at it and the copy is tried once more, with the page
+/// synced; one that failed for any other reason is not.
+#[test]
+fn a_kernel_copy_that_met_a_page_closed_meanwhile_is_tried_again() {
+    use crate::watch::net::touched_again;
+    let Some((_on, f)) = Fixture::gpu_only(1) else {
+        return; // no host GPU here
+    };
+    f.marked(&[(16, 0xb0)]);
+    let bytes = [0u8; 4];
+    let ours = bytes.as_ptr() as usize;
+    assert!(!touched_again(ours, ours, 4), "nothing closed there: not tried again");
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed);
+    assert!(touched_again(f.second() + 16, ours, 4), "closed: synced, worth another try");
+    assert_eq!(net::demotion(f.second() / PAGE), Some((DemoteReason::Host, 2)));
+    assert_eq!(read(f.p + 16), 0xb0);
+    assert!(!touched_again(f.second() + 16, ours, 4));
+}
+
+/// (d) An address of a GPU-only page going away: the GPU's bytes are in the
+/// physical pages before it does (they may be mapped again anywhere), and
+/// their other addresses open. Every closed page of the title's view goes
+/// with it, also where only a part of the view is reported: our own
+/// address of the view is forgotten as a whole.
+#[test]
+fn unmapping_syncs_gpu_only_pages() {
+    let Some((_on, f)) = Fixture::gpu_only(2) else {
+        return; // no host GPU here
+    };
+    let peek = f.peek();
+    f.marked(&[(16, 0xb0), (PAGE + 16, 0xb1)]);
+    assert_eq!((read(peek + 16), read(peek + PAGE + 16)), (pattern(16), pattern(PAGE + 16)));
+    // The runtime reports the unmap of the copy's own address of page 0
+    // (before it unmaps; the test leaves the view mapped).
+    crate::watch::title_memory_remapped(f.p, PAGE);
+    assert_eq!((read(peek + 16), read(peek + 8)), (0xb0, 0xa0), "in the physical page");
+    assert_eq!(net::demotion(f.p / PAGE), Some((DemoteReason::Remap, 2)));
+    assert!(protection(f.second()) != CLOSED, "the other address is open");
+    assert_eq!(read(f.second() + 16), 0xb0);
+    assert_eq!(read(peek + PAGE + 16), 0xb1, "page 1 of the forgotten view too");
+    assert_eq!(net::state(f.p / PAGE + 1), State::Demoted);
+}
+
+/// (d) Shaders' writes to a GPU-only page that were to be dropped
+/// (withheld): there is nothing older to go back to, so the page keeps the
+/// GPU's bytes and leaves the class.
+#[test]
+fn withheld_writes_take_a_gpu_only_page_out_of_the_class() {
+    let Some((_on, f)) = Fixture::gpu_only(1) else {
+        return; // no host GPU here
+    };
+    let peek = f.peek();
+    f.marked(&[(16, 0xb0)]);
+    crate::watch::retake(f.second(), PAGE);
+    assert_eq!(net::demotion(f.second() / PAGE), Some((DemoteReason::Withheld, 2)));
+    assert_eq!(read(peek + 16), 0xb0);
+    assert!(protection(f.p) != CLOSED);
+}
+
+/// (d) A new mapping of a GPU-only page is closed with it: a read through
+/// it syncs like any other and opens all three addresses.
+#[test]
+fn a_new_mapping_of_a_gpu_only_page_is_closed_with_it() {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    let Some((_on, f)) = Fixture::gpu_only(1) else {
+        return; // no host GPU here
+    };
+    f.marked(&[(16, 0xb0)]);
+    let section = f.section.expect("over views").0;
+    // SAFETY: the fixture's section, mapped a third time as the title would.
+    let third = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, PAGE) }.Value as usize;
+    assert!(third != 0);
+    crate::watch::title_memory_remapped(third, PAGE);
+    crate::watch::title_memory_view(third, PAGE, section, 0);
+    crate::watch::title_memory_aliased(third, &[f.p, f.second()]);
+    assert_eq!(protection(third), CLOSED, "closed with the others");
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed, "which stay GPU-only");
+    assert_eq!(read(third + 16), 0xb0);
+    assert_eq!(net::demotion(third / PAGE), Some((DemoteReason::CpuRead, 3)));
+    assert!(protection(f.p) != CLOSED && protection(f.second()) != CLOSED && protection(third) != CLOSED);
+    crate::watch::title_memory_remapped(third, PAGE);
+}
+
+/// (d) A wrong classification costs speed, never correctness: the
+/// interleaved schedules of (c) over views with the model on. Every page a
+/// copy-back leaves equal to title memory is closed and its later
+/// copy-backs are skipped; the title writes anywhere between any two steps,
+/// and reads everything at the end. What each list's shaders read and what
+/// the title reads at the end must be exactly the byte-wise model's, on
+/// both ways back; and pages were in fact closed, skipped and demoted.
+#[test]
 fn a_wrong_gpu_only_class_costs_speed_not_correctness() {
-    todo!("stage 3: class the fixture GPU-only, run run_schedule over 64 seeds, assert Ok and the demotion count");
+    let _on = ModelOn::new();
+    let (closed, skipped, syncs) = (net::closed(), net::skipped(), net::syncs());
+    for marked in [true, false] {
+        let failed: Vec<String> = (0..64u64)
+            .filter_map(|k| run_schedule_on(0x6d0d_0000 + k * 0x9e37_79b9, marked, true).err())
+            .collect();
+        assert!(failed.is_empty(), "{} of 64 schedules failed (marked {marked}), first: {}", failed.len(), failed[0]);
+    }
+    if Fixture::views(1, pattern).is_none() {
+        return; // no host GPU here
+    }
+    assert!(net::closed() > closed, "pages were closed");
+    assert!(net::skipped() > skipped, "copy-backs were skipped");
+    assert!(net::syncs() > syncs, "and pages were synced and demoted");
 }
 
 /// Three submissions whose shaders write pages 0 to 2, going back on `way`,

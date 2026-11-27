@@ -1,6 +1,9 @@
 //! [`crate::pagenet`] on real title memory: which pages the title's CPU
 //! code touches after the GPU wrote them (`VICTORY_PAGENET=measure`; off
-//! unless asked for).
+//! unless asked for), and the memory model's safety net
+//! (`VICTORY_MEMMODEL=1`; off unless asked for), further down.
+//!
+//! Measuring:
 //!
 //! A page is armed (no access) when a copy-back has put the GPU's bytes
 //! into it and the copy has taken it again, so only a page under the write
@@ -38,11 +41,12 @@
 //! is reported beside.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use super::{GUARD_OWNER, Guards, PAGE, guards, this_thread};
-use crate::pagenet::{BLOCK, Fault, Mode, PageNet, Prot, Protect, Reason};
+use super::{GUARD_OWNER, Guards, PAGE, Tracked, guards, own, this_thread};
+use crate::pagenet::{Armed, BLOCK, DemoteReason, Fault, Mode, PageNet, Prot, Protect, Reason, State};
+use crate::shadow::Shadow;
 
 /// Title memory's protections, for [`PageNet`]. Only called with the guard
 /// lock held (by [`locked`], or by this thread further up).
@@ -88,13 +92,28 @@ impl Protect for Win {
         unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, to, &mut old) != 0 }
     }
 
-    // Measuring never syncs; the net's mode is not offered yet (`mode`).
+    /// Nothing to wait for: a sync runs inside [`idle`], where no
+    /// submission is under way and the last one's copy-backs are done.
     fn fence_wait(&self) {}
 
-    fn copy_back_forced(&self, _page: usize) {}
+    /// By the copy that closed the page ([`close`]), through our own view
+    /// of the page's section: the title's stays closed.
+    fn copy_back_forced(&self, page: usize) {
+        let owner = owners().get(&page).cloned();
+        if !owner.is_some_and(|copy| copy.copy_back_forced(page * PAGE)) {
+            // The page opens with title memory's older bytes: never
+            // silent (`report`).
+            FORCED_FAILED.fetch_add(1, Relaxed);
+        }
+    }
 
     fn frame(&self) -> u64 {
         FRAME.load(Relaxed)
+    }
+
+    /// Under the guard lock, taken here unless this thread holds it.
+    fn guarded<R>(&self, f: impl FnOnce() -> R) -> R {
+        locked(|_| f())
     }
 }
 
@@ -142,11 +161,12 @@ static BY_WAY: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }
 static IN_OURS: AtomicU64 = AtomicU64::new(0);
 static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 
-/// What `VICTORY_PAGENET` asks for. Only measuring: the net needs the
-/// engine's side of the sync, which is not there yet, and arming without it
-/// would hand the title stale pages.
-fn mode(value: Option<&str>) -> Option<Mode> {
-    match value {
+/// What `VICTORY_PAGENET` (its value) and `VICTORY_MEMMODEL` (on or not)
+/// ask for: measuring, or the memory model with its net, which wins where
+/// both are set (a page is closed for one reason at a time).
+fn mode(pagenet: Option<&str>, memmodel: bool) -> Option<Mode> {
+    match pagenet {
+        _ if memmodel => Some(Mode::Net),
         Some("measure") => Some(Mode::Measure),
         _ => None,
     }
@@ -157,24 +177,38 @@ thread_local! {
     /// Tests switch measuring on for their own thread: the crate's other
     /// tests run as without it.
     pub(crate) static TEST_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests switch the memory model on for their own thread (it wins over
+    /// measuring, as in `mode`).
+    pub(crate) static TEST_MODEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 static NET: OnceLock<Option<PageNet<Win>>> = OnceLock::new();
+/// The tests' net in the model's mode, beside the measuring one.
+#[cfg(test)]
+static MODEL: OnceLock<PageNet<Win>> = OnceLock::new();
 
 /// The net, if it was made: the fault handler's way to it, which must not
 /// read the environment or log.
 fn net_made() -> Option<&'static PageNet<Win>> {
     #[cfg(test)]
-    if !TEST_ON.get() {
-        return None;
+    {
+        if TEST_MODEL.get() {
+            return MODEL.get();
+        }
+        if !TEST_ON.get() {
+            return None;
+        }
     }
     NET.get().and_then(Option::as_ref)
 }
 
-/// The net, if measuring is on.
+/// The net, if measuring or the memory model is on.
 fn net() -> Option<&'static PageNet<Win>> {
     #[cfg(test)]
     {
+        if TEST_MODEL.get() {
+            return Some(MODEL.get_or_init(|| PageNet::new(Mode::Net, Win)));
+        }
         if !TEST_ON.get() {
             return None;
         }
@@ -184,8 +218,24 @@ fn net() -> Option<&'static PageNet<Win>> {
     #[cfg(not(test))]
     NET.get_or_init(|| {
         let asked = std::env::var("VICTORY_PAGENET").ok();
-        let mode = mode(asked.as_deref());
+        let mode = mode(asked.as_deref(), false);
         match (&asked, mode) {
+            (_, Some(Mode::Net)) => {
+                ours();
+                let section = section_wanted();
+                tracing::info!(
+                    section,
+                    "memory model on (VICTORY_MEMMODEL): pages only the GPU uses stay in its copy, closed to the title"
+                );
+                if section == 0 {
+                    tracing::warn!(
+                        "VICTORY_MEMMODEL: no section named (VICTORY_MEMMODEL_SECTION, its size in bytes): nothing is closed"
+                    );
+                }
+                if asked.is_some() {
+                    tracing::warn!("VICTORY_PAGENET is ignored with VICTORY_MEMMODEL");
+                }
+            }
             (Some(_), Some(mode)) => {
                 ours();
                 tracing::info!(
@@ -254,6 +304,9 @@ fn locked<R>(f: impl FnOnce(Option<&mut Guards>) -> R) -> R {
 /// the same memory, if all of them are under the write guard.
 pub(crate) fn arm(page: usize, way: Way) {
     let Some(net) = net() else { return };
+    if net.mode() != Mode::Measure {
+        return;
+    }
     locked(|g| {
         // Under the lock already: a copy-back does not run there.
         let Some(g) = g else { return };
@@ -293,6 +346,9 @@ pub(crate) fn armed(page: usize) -> bool {
 /// retried. Called by the write guard's handler before it looks itself.
 pub(crate) fn fault(at: usize, write: bool, code: usize) -> bool {
     let Some(net) = net_made() else { return false };
+    if net.mode() == Mode::Net {
+        return fault_of_closed(net, at, write);
+    }
     let before = net.any_armed();
     let handled = locked(|_| net.on_fault_from(at, write, false)) == Fault::Handled;
     if handled && before {
@@ -322,6 +378,12 @@ pub(crate) fn host_touch(at: usize, len: usize) {
     if len == 0 || !net.any_armed() {
         return;
     }
+    if net.mode() == Mode::Net {
+        // Title memory there is older than the GPU's copy: synced first.
+        let (first, last) = (at / PAGE, at.saturating_add(len - 1) / PAGE + 1);
+        demote_closed(net, first, last, DemoteReason::Host);
+        return;
+    }
     locked(|_| {
         for page in at / PAGE..=at.saturating_add(len - 1) / PAGE {
             net.host_access(page);
@@ -334,6 +396,16 @@ pub(crate) fn host_touch(at: usize, len: usize) {
 /// taken for an armed page's.
 pub(crate) fn remapped(first: usize, last: usize) {
     let Some(net) = net() else { return };
+    if net.mode() == Mode::Net && net.any_armed() {
+        // Every page of the title views the range touches: our own address
+        // of such a view is forgotten as a whole after this, and a closed
+        // page of it could not be synced any more.
+        let (first, last) = own().reach(first, last);
+        // While our own view still knows the address: the GPU's bytes go
+        // into the pages before the title's view of them is gone, and the
+        // other addresses showing them open with it.
+        demote_closed(net, first, last, DemoteReason::Remap);
+    }
     let known: Vec<usize> = net
         .armed_counts()
         .range(first..last)
@@ -361,6 +433,9 @@ pub(crate) fn frame() {
         return;
     }
     let Some(net) = net() else { return };
+    if net.mode() == Mode::Net {
+        return;
+    }
     let report = report(net, frame);
     tracing::info!(target: "victory_gpu::pagenet", "{}", report.lines().next().unwrap_or_default());
     if let Some(path) = std::env::var_os("VICTORY_PAGENET_OUT")
@@ -442,12 +517,385 @@ fn report(net: &PageNet<Win>, frame: u64) -> String {
     out
 }
 
+// ------------------------------------------------------------------------
+// The memory model's net.
+//
+// A page only the GPU uses stays in its host copy: once a copy-back has
+// made title memory and the copy equal, the page is closed at every address
+// showing it ([`close`]) and its later copy-backs are skipped ([`skips`]).
+// Title memory there grows old. It is brought up to date, and the page
+// leaves the class for good, at the first of:
+// - an access by any thread at any of its addresses (the fault);
+// - the engine itself reading or writing it in title memory
+//   ([`host_touch`]): another copy or a texture's staging taking the page, a
+//   copy step, a kernel write the runtime announces;
+// - one of its addresses going away ([`remapped`]), or a new one that
+//   cannot be closed ([`aliased`]);
+// - shaders' writes to it being withheld ([`withheld`]).
+//
+// Which pages: only where exactly one tracker, the closing copy's, holds the
+// physical page over all its addresses ([`eligible`]). Another host copy of
+// the page gets what the GPU wrote only by way of title memory (the
+// copy-back marks it changed, and it reads the page again): with the
+// copy-back skipped it would go stale without any CPU access, which no
+// fault catches. A tracker that comes later starts with every page changed
+// and reads title memory before it uses a byte, which syncs.
+//
+// Locks, in order: the runtime's page lock (it calls `remapped` and
+// `aliased` holding it); the submission lock and `SYNC` ([`idle`]); `OWN`
+// (the forced copy-back); the guard lock; the net's own. A sync never
+// starts on a thread that holds the guard lock or is syncing already
+// ([`may_sync`]): the paths that take the guard lock sync what they are
+// about to touch before they take it.
+//
+// shortcut: as for measuring, a system call of the title's reading from a
+// closed page fails instead of faulting; with the model on that is a title
+// read that sees an error where it should see the GPU's bytes. Not counted:
+// a run with the model is compared with one without for new failing calls.
+
+thread_local! {
+    /// This thread is syncing: what it touches meanwhile is the sync's own.
+    static IN_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One sync at a time, also among the threads the submission lock lets
+/// through together (the submitting thread and its copy-back workers).
+static SYNC: Mutex<()> = Mutex::new(());
+
+/// Runs `f` with no submission under way, the last one's copy-backs done,
+/// and no other sync running: what [`Protect::fence_wait`] waits for.
+fn idle<R>(f: impl FnOnce() -> R) -> R {
+    crate::host::submission_idle(|| {
+        let _one = SYNC.lock().unwrap_or_else(|e| e.into_inner());
+        IN_SYNC.set(true);
+        let done = f();
+        IN_SYNC.set(false);
+        done
+    })
+}
+
+/// Why a page was not closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Not in the section the model was given, or in no view we have one
+    /// of our own of.
+    Section,
+    /// Another tracker holds the page, at this or another address.
+    Holders,
+    /// An address showing it is not under the write guard.
+    Unguarded,
+    /// The title wrote it since the copy took it.
+    Changed,
+    /// The net refused: demoted before, or an address could not be closed.
+    Net,
+}
+
+const REFUSALS: usize = 5;
+
+/// Pages closed by [`Way`], copy-backs skipped by [`Way`], pages not closed
+/// by [`Refusal`].
+static CLOSED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static SKIPPED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static REFUSED: [AtomicU64; REFUSALS] = [const { AtomicU64::new(0) }; REFUSALS];
+/// Syncs whose copy did not land: the page opened with older bytes.
+static FORCED_FAILED: AtomicU64 = AtomicU64::new(0);
+/// Closed pages met on a thread that could not sync ([`may_sync`]).
+static CANNOT_SYNC: AtomicU64 = AtomicU64::new(0);
+/// Closed pages the write guard was about to open, left closed.
+static OPEN_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// The size in bytes of the section whose pages may be closed (0: none;
+/// `usize::MAX`: any).
+static SECTION: AtomicUsize = AtomicUsize::new(if cfg!(test) { usize::MAX } else { 0 });
+
+fn section_wanted() -> usize {
+    SECTION.load(Relaxed)
+}
+
+/// The copies holding the GPU's bytes of closed pages, by the page each
+/// closed (its group's page): kept alive while the page is closed, since
+/// nothing else has those bytes.
+static OWNERS: Mutex<BTreeMap<usize, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Owners of pages demoted since, let go at the next frame (not in a fault
+/// handler).
+static RETIRED: Mutex<Vec<Arc<Shadow>>> = Mutex::new(Vec::new());
+
+fn owners() -> std::sync::MutexGuard<'static, BTreeMap<usize, Arc<Shadow>>> {
+    OWNERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The group of `group` was synced: its owner is not needed any more.
+fn retire(net: &PageNet<Win>, group: Option<usize>) {
+    let Some(group) = group else { return };
+    if net.group_of(group).is_some() {
+        return;
+    }
+    let owner = owners().remove(&group);
+    if let Some(owner) = owner {
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(owner);
+    }
+}
+
+/// Whether this thread can sync a closed page now: not while it holds the
+/// guard lock (the submission lock comes first) and not inside a sync.
+/// Counted where it cannot: the access then sees the closed page (a kernel
+/// copy fails, a fault goes on to the next handler).
+fn may_sync() -> bool {
+    if IN_SYNC.get() {
+        return false;
+    }
+    if GUARD_OWNER.load(Relaxed) == this_thread() {
+        CANNOT_SYNC.fetch_add(1, Relaxed);
+        return false;
+    }
+    true
+}
+
+/// A fault at `at` with the model on: a closed page is synced and demoted
+/// with the pages closed with it, then the access is retried.
+fn fault_of_closed(net: &PageNet<Win>, at: usize, write: bool) -> bool {
+    let page = at / PAGE;
+    match net.state(page) {
+        State::GpuOnlyArmed | State::Syncing => {}
+        // Opened by another thread since this one faulted.
+        State::Demoted => return net.on_fault_from(at, write, false) == Fault::Handled,
+        _ => return false,
+    }
+    if !may_sync() {
+        return false;
+    }
+    let group = net.group_of(page);
+    let handled = idle(|| net.on_fault_from(at, write, false)) == Fault::Handled;
+    retire(net, group);
+    handled
+}
+
+/// The closed pages of `[first, last)` are synced and demoted.
+fn demote_closed(net: &PageNet<Win>, first: usize, last: usize, reason: DemoteReason) {
+    let closed = net.closed_in(first, last);
+    if closed.is_empty() || !may_sync() {
+        return;
+    }
+    for page in closed {
+        let group = net.group_of(page);
+        idle(|| net.demote(page, reason));
+        retire(net, group);
+    }
+}
+
+/// The pages to close with `page` (itself first), if the copy tracked by
+/// `t` may keep it to itself: its tracker is the only one over every
+/// address showing the page, all of them are under the write guard, and the
+/// title has not written the page since the copy took it (title memory and
+/// the copy are equal).
+fn eligible(g: &Guards, page: usize, t: &Tracked) -> Result<Vec<usize>, Refusal> {
+    let mut others = g.alias_of.get(&page).cloned().unwrap_or_default();
+    others.retain(|&o| o != page);
+    others.sort_unstable();
+    others.dedup();
+    let alone = g.holders.get(&page).is_some_and(|h| h.len() == 1 && Arc::ptr_eq(&h[0], &t.changed));
+    if !alone || others.iter().any(|o| g.holders.contains_key(o)) {
+        return Err(Refusal::Holders);
+    }
+    if !g.protected.contains(&page) || others.iter().any(|o| !g.protected.contains(o)) {
+        return Err(Refusal::Unguarded);
+    }
+    if t.changed.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&page) {
+        return Err(Refusal::Changed);
+    }
+    Ok(std::iter::once(page).chain(others).collect())
+}
+
+/// A copy-back on `way` made title memory and `copy` equal in the whole
+/// page `page` (a page number), which `copy` has taken: from now on the
+/// page is GPU-only, closed at every address showing it, if it may be
+/// ([`eligible`], and in the model's section).
+pub(crate) fn close(page: usize, way: Way, copy: &Shadow) {
+    let Some(net) = net() else { return };
+    if net.mode() != Mode::Net {
+        return;
+    }
+    let wanted = section_wanted();
+    let (Some(t), Some(me)) = (copy.tracker(), copy.shared()) else {
+        return;
+    };
+    if wanted == 0 || net.is_gpu_only(page) {
+        return;
+    }
+    let section = own().section_of(page * PAGE, PAGE);
+    if !section.is_some_and(|bytes| wanted == usize::MAX || bytes == wanted) {
+        REFUSED[Refusal::Section as usize].fetch_add(1, Relaxed);
+        return;
+    }
+    // The owner is known before the page closes: a fault right after finds
+    // the copy to sync from.
+    let fresh = {
+        let mut owners = owners();
+        let fresh = !owners.contains_key(&page);
+        if fresh {
+            owners.insert(page, me);
+        }
+        fresh
+    };
+    let armed = locked(|g| {
+        // Under the lock already: a copy-back does not run there.
+        let g = g?;
+        match eligible(g, page, t) {
+            Ok(group) => Some(net.arm_group(&group)),
+            Err(why) => {
+                REFUSED[why as usize].fetch_add(1, Relaxed);
+                None
+            }
+        }
+    });
+    match armed {
+        Some(Armed::Now) => {
+            CLOSED[way as usize].fetch_add(1, Relaxed);
+        }
+        Some(Armed::Refused) => {
+            REFUSED[Refusal::Net as usize].fetch_add(1, Relaxed);
+        }
+        Some(Armed::Already) | None => {}
+    }
+    if fresh && armed != Some(Armed::Now) {
+        let owner = owners().remove(&page);
+        drop(owner);
+    }
+}
+
+/// Whether the copy-back on `way` of page `page` (a page number) of `copy`
+/// is skipped: the page is GPU-only and `copy` is the one keeping it. Asked
+/// before the copy-back touches title memory.
+pub(crate) fn skips(page: usize, way: Way, copy: &Shadow) -> bool {
+    let ours = kept(page, copy);
+    if ours {
+        SKIPPED[way as usize].fetch_add(1, Relaxed);
+    }
+    ours
+}
+
+/// Whether page `page` (a page number) is GPU-only and `copy` is the one
+/// keeping it.
+pub(crate) fn kept(page: usize, copy: &Shadow) -> bool {
+    let Some(net) = net() else { return false };
+    if net.mode() != Mode::Net || !net.any_armed() || !net.is_gpu_only(page) {
+        return false;
+    }
+    owners().get(&page).is_some_and(|owner| std::ptr::eq(Arc::as_ptr(owner), copy))
+}
+
+/// What shaders wrote into pages `[first, last)` is to be dropped from the
+/// copies (`super::retake`): closed pages there have no older bytes to go
+/// back to, so they keep the GPU's and leave the class.
+pub(super) fn withheld(first: usize, last: usize) {
+    let Some(net) = net() else { return };
+    if net.mode() == Mode::Net && net.any_armed() {
+        demote_closed(net, first, last, DemoteReason::Withheld);
+    }
+}
+
+/// The runtime mapped page `page` where `others` show it already (called
+/// with the guard lock held, `page` guarded if they are): it is closed with
+/// them if they are closed. False if it could not be: the caller demotes
+/// them once the guard lock is free ([`unjoined`]).
+pub(super) fn aliased(page: usize, others: &[usize]) -> bool {
+    let Some(net) = net_made() else { return true };
+    if net.mode() != Mode::Net || !net.any_armed() {
+        return true;
+    }
+    others.iter().all(|&other| net.join(other, page))
+}
+
+/// After [`aliased`] failed, with the guard lock free again.
+pub(super) fn unjoined(others: &[usize]) {
+    let Some(net) = net() else { return };
+    for &other in others {
+        demote_closed(net, other, other + 1, DemoteReason::Remap);
+    }
+}
+
+/// Whether a page of `[first, last)` is closed as GPU-only now (called with
+/// the guard lock held: none is closed while the caller holds it).
+pub(super) fn closed(first: usize, last: usize) -> bool {
+    let Some(net) = net_made() else { return false };
+    net.mode() == Mode::Net && !net.closed_in(first, last).is_empty()
+}
+
+/// A kernel copy between `a` and `b` (`len` bytes each) failed: true if a
+/// page of either was closed as GPU-only meanwhile (closed after
+/// [`host_touch`] looked) and is synced now, so the copy is worth trying
+/// once more. A copy that failed for another reason is not retried.
+pub(crate) fn touched_again(a: usize, b: usize, len: usize) -> bool {
+    let Some(net) = net() else { return false };
+    if len == 0 || net.mode() != Mode::Net || !net.any_armed() {
+        return false;
+    }
+    let pages = |at: usize| (at / PAGE, at.saturating_add(len - 1) / PAGE + 1);
+    let was = [a, b].iter().any(|&at| !net.closed_in(pages(at).0, pages(at).1).is_empty());
+    if was {
+        host_touch(a, len);
+        host_touch(b, len);
+    }
+    was
+}
+
+/// Whether the write guard must leave page `page` closed (called with the
+/// guard lock held, before it opens the page): it is GPU-only, and opening
+/// it here would show the title old bytes. The page stays as it is; the
+/// next access faults and syncs.
+pub(super) fn keeps_closed(page: usize) -> bool {
+    let Some(net) = net_made() else { return false };
+    if net.mode() != Mode::Net || !net.any_armed() || net.group_of(page).is_none() {
+        return false;
+    }
+    OPEN_REFUSED.fetch_add(1, Relaxed);
+    true
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     /// For the engine's tests: (title reads, title writes) counted at the
     /// 4 KiB block of `at`, and whether the page of `at` is closed.
     pub(crate) fn seen(at: usize) -> ((u64, u64), bool) {
         (counts(at), protection(at / PAGE) == Some(PAGE_NOACCESS))
+    }
+
+    /// The model's net (made by the first test that switches it on).
+    fn model() -> &'static PageNet<Win> {
+        MODEL.get_or_init(|| PageNet::new(Mode::Net, Win))
+    }
+
+    /// Where page `page` stands in the model's net.
+    pub(crate) fn state(page: usize) -> State {
+        model().state(page)
+    }
+
+    /// The demotion recorded for page `page` (the page whose access did
+    /// it): its reason and how many addresses left together.
+    pub(crate) fn demotion(page: usize) -> Option<(DemoteReason, usize)> {
+        model().demotions().iter().find(|d| d.page == page).map(|d| (d.reason, d.pages))
+    }
+
+    /// How many demotions are recorded for `pages`.
+    pub(crate) fn demotions_of(pages: &[usize]) -> usize {
+        model().demotions().iter().filter(|d| pages.contains(&d.page)).count()
+    }
+
+    /// Of every test running, only ever more: copy-backs skipped, pages
+    /// closed, syncs, pages refused for `why`.
+    pub(crate) fn skipped() -> u64 {
+        SKIPPED.iter().map(|n| n.load(Relaxed)).sum()
+    }
+
+    pub(crate) fn closed() -> u64 {
+        CLOSED.iter().map(|n| n.load(Relaxed)).sum()
+    }
+
+    pub(crate) fn syncs() -> u64 {
+        model().stats().syncs
+    }
+
+    pub(crate) fn refused(why: Refusal) -> u64 {
+        REFUSED[why as usize].load(Relaxed)
     }
 
     /// Copy-backs on `way` so far that armed their page, and that did not
@@ -473,7 +921,9 @@ pub(crate) mod tests {
 
     #[test]
     fn only_measure_switches_it_on() {
-        assert_eq!(mode(Some("measure")), Some(Mode::Measure));
+        assert_eq!(mode(Some("measure"), false), Some(Mode::Measure));
+        assert_eq!(mode(None, true), Some(Mode::Net));
+        assert_eq!(mode(Some("measure"), true), Some(Mode::Net), "the model wins");
         for off in [
             None,
             Some(""),
@@ -482,7 +932,7 @@ pub(crate) mod tests {
             Some("net"),
             Some("Measure"),
         ] {
-            assert_eq!(mode(off), None, "{off:?}");
+            assert_eq!(mode(off, false), None, "{off:?}");
         }
     }
 
@@ -624,6 +1074,37 @@ pub(crate) mod tests {
             Some(0x11),
             "saved from the closed page"
         );
+        drop(t);
+        free(p);
+    }
+
+    /// The write guard never opens a page closed as GPU-only, whoever asks
+    /// it to (title memory there is old): the page stays closed and under
+    /// the guard, and its next access syncs.
+    #[test]
+    fn the_write_guard_leaves_a_gpu_only_page_closed() {
+        let (p, t) = taken(1, 0x33);
+        TEST_MODEL.set(true);
+        let net = net().expect("on");
+        assert_eq!(net.mode(), Mode::Net);
+        assert_eq!(locked(|_| net.arm_group(&[p / PAGE])), Armed::Now);
+        assert_eq!(protection(p / PAGE), Some(PAGE_NOACCESS));
+        {
+            let mut g = guards();
+            assert!(!super::super::open(&mut g, p / PAGE), "refused");
+            super::super::changed(&mut g, p / PAGE, p / PAGE + 1, false);
+            assert!(g.protected.contains(&(p / PAGE)), "still the guard's");
+        }
+        assert_eq!(protection(p / PAGE), Some(PAGE_NOACCESS), "still closed");
+        assert_eq!(net.state(p / PAGE), State::GpuOnlyArmed);
+        // The next access syncs (no copy keeps this page: nothing lands,
+        // which is counted) and opens it for good.
+        let failed = FORCED_FAILED.load(Relaxed);
+        // SAFETY: a committed page of ours, closed: the handler opens it.
+        assert_eq!(unsafe { (p as *const u8).read_volatile() }, 0x33);
+        assert_eq!(net.state(p / PAGE), State::Demoted);
+        assert!(FORCED_FAILED.load(Relaxed) > failed, "a sync with nothing to copy from is never silent");
+        TEST_MODEL.set(false);
         drop(t);
         free(p);
     }
