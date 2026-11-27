@@ -703,6 +703,8 @@ impl Gt {
             "BVH GT s{s} v4 run so far: {}; class e instances built by a later submission (c) {later}, still never built {waiting} (not kept {dropped}); build targets known {known} (not kept {full}), binds noted {noted}",
             total4.text(),
         );
+        tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} v4b boxes: {}; {}", self.v4.box_text(), self.v4.boxes.join(", "));
+        tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} v4b boxes run so far: {}", total4.box_text());
         for (k, t) in self.t.iter().enumerate() {
             let Some(t) = t else { continue };
             let first: Vec<String> = t.first.iter().map(|(a, g, t)| format!("{a:#x} G={g:#010x} T={t:#010x}")).collect();
@@ -1368,6 +1370,65 @@ pub(crate) struct TopCheck {
     /// bottom-level header.
     pub(crate) never_null: u32,
     pub(crate) first_never: Option<String>,
+    /// v4b box content (Fable Aufruf 11): the boxes in the slots of box
+    /// nodes that lead to box nodes, [`BOX_ZERO`] all six 0, [`BOX_EMPTY`]
+    /// not finite, +-FLT_MAX or min > max, [`BOX_GOOD`] else; the boxes in
+    /// the slots that lead to reached instances, finite or not; and whether
+    /// such a finite box holds the instance's bottom-level header box
+    /// transformed, by Fable's layout (translation dwords 16-18, 3x3 by rows
+    /// 19-27) and by dwords 0-11 (3x4 by rows): [holds, does not, not
+    /// judged (header box not read or not finite, entry not read)].
+    pub(crate) inner: [u32; 3],
+    pub(crate) inst_box: [u32; 2],
+    pub(crate) holds: [u32; 3],
+    pub(crate) holds_rows: [u32; 3],
+    /// The first instance box that does not hold its bottom level's box.
+    pub(crate) first_outside: Option<String>,
+    /// Of `inst_box` and `holds`, the instances on still packed bottom
+    /// levels (senior 119: 98 % of them at the build's end).
+    pub(crate) inst_box_packed: [u32; 2],
+    pub(crate) holds_packed: [u32; 3],
+}
+
+/// Indices of [`TopCheck::inner`].
+pub(crate) const BOX_ZERO: usize = 0;
+pub(crate) const BOX_EMPTY: usize = 1;
+pub(crate) const BOX_GOOD: usize = 2;
+
+/// [`TopCheck::inner`] class of a slot box.
+pub(crate) fn box_class(b: &Aabb) -> usize {
+    let all = || b.0.iter().chain(b.1.iter());
+    if all().all(|&v| v == 0.0) {
+        BOX_ZERO
+    } else if all().any(|v| !v.is_finite() || v.abs() >= f32::MAX) || (0..3).any(|a| b.0[a] > b.1[a]) {
+        BOX_EMPTY
+    } else {
+        BOX_GOOD
+    }
+}
+
+/// The box `b` (min, max) moved by `m` (3x3 by rows) and `t`: the box
+/// around its eight corners.
+pub(crate) fn transform_box(b: &Aabb, m: &[f32; 9], t: &[f32; 3]) -> Aabb {
+    let mut out = ([0f32; 3], [0f32; 3]);
+    for r in 0..3 {
+        let (mut lo, mut hi) = (t[r], t[r]);
+        for c in 0..3 {
+            let (x, y) = (m[3 * r + c] * b.0[c], m[3 * r + c] * b.1[c]);
+            lo += x.min(y);
+            hi += x.max(y);
+        }
+        out.0[r] = lo;
+        out.1[r] = hi;
+    }
+    out
+}
+
+/// Whether `outer` holds `inner`, with slack for box16's half floats
+/// (1/256 of the larger magnitude, at least 1e-3).
+pub(crate) fn box_holds(outer: &Aabb, inner: &Aabb) -> bool {
+    let slack = |v: f32, w: f32| (v.abs().max(w.abs()) / 256.0).max(1e-3);
+    (0..3).all(|a| outer.0[a] <= inner.0[a] + slack(outer.0[a], inner.0[a]) && outer.1[a] >= inner.1[a] - slack(outer.1[a], inner.1[a]))
 }
 
 /// Indices of [`TopCheck::classes`] (v4, Fable Aufruf 8 point 2): (a) a
@@ -1541,6 +1602,7 @@ fn check_top_core(
             };
             match child & 7 {
                 4 | 5 if at(child) != 0 && at(child) < bytes && (!node_end || at(child) + size_of(child) <= bytes) => {
+                    t.inner[box_class(&b)] += 1;
                     stack.push((child, child_title))
                 }
                 6 if at(child) >= list && (at(child) - list) % 128 == 0 && (at(child) - list) / 128 < u64::from(h[3]) => {
@@ -1569,6 +1631,7 @@ fn check_top_core(
                         _ => None,
                     };
                     let mut blas_title = tw(blas) || tw(blas + 4);
+                    let mut head_at = blas;
                     // v4: one class per reached instance.
                     if let Some(x) = x {
                         let title_header = || {
@@ -1595,6 +1658,7 @@ fn check_top_core(
                                         t.first_b = Some(format!("instance {index} {blas:#x}: header at +{:#x}", head - blas));
                                     }
                                     kind = Some(k);
+                                    head_at = head;
                                     blas_title |= tw(head) || tw(head + 4) || tw(head + 56);
                                 }
                                 Search::NotRead(a) => {
@@ -1659,6 +1723,35 @@ fn check_top_core(
                         b.0[a].is_finite() && b.1[a].is_finite() && b.0[a].abs() < f32::MAX && b.1[a].abs() < f32::MAX && b.0[a] <= b.1[a]
                     });
                     t.finite[k] += u32::from(finite);
+                    // v4b box content: the slot's box against the bottom
+                    // level's header box, moved by the instance.
+                    t.inst_box[usize::from(!finite)] += 1;
+                    let packed = kind == Bottom::Packed;
+                    t.inst_box_packed[usize::from(!finite)] += u32::from(packed);
+                    let hb = (4..10).map(|i| read(head_at + 4 * i).map(f32::from_bits)).collect::<Option<Vec<f32>>>();
+                    let ew = (0..28).map(|i| read(entry + 4 * i).map(f32::from_bits)).collect::<Option<Vec<f32>>>();
+                    match (hb, ew) {
+                        (Some(hb), Some(ew))
+                            if finite && hb.iter().all(|v| v.is_finite() && v.abs() < f32::MAX) && (0..3).all(|a| hb[a] <= hb[3 + a]) =>
+                        {
+                            let hbox: Aabb = ([hb[0], hb[1], hb[2]], [hb[3], hb[4], hb[5]]);
+                            let fable = transform_box(&hbox, &std::array::from_fn(|i| ew[19 + i]), &[ew[16], ew[17], ew[18]]);
+                            let rows = transform_box(&hbox, &[ew[0], ew[1], ew[2], ew[4], ew[5], ew[6], ew[8], ew[9], ew[10]], &[ew[3], ew[7], ew[11]]);
+                            let (a, r) = (box_holds(&b, &fable), box_holds(&b, &rows));
+                            t.holds[usize::from(!a)] += 1;
+                            t.holds_packed[usize::from(!a)] += u32::from(packed);
+                            t.holds_rows[usize::from(!r)] += 1;
+                            if !a && t.first_outside.is_none() {
+                                t.first_outside =
+                                    Some(format!("instance {index}: box {b:?}, bottom level {head_at:#x} box {hbox:?} moved (16-27) {fable:?}, (0-11) {rows:?}"));
+                            }
+                        }
+                        _ => {
+                            t.holds[2] += 1;
+                            t.holds_packed[2] += u32::from(packed);
+                            t.holds_rows[2] += 1;
+                        }
+                    }
                     if kind == Bottom::Rehydrated && !finite {
                         let w = format!("instance {index} on rehydrated {blas:#x}: box {b:?}");
                         note_defect(&mut defect, &mut defect_title, &w, child_title || node_title || blas_title);
@@ -2585,6 +2678,23 @@ pub(crate) struct V4 {
     pub(crate) never_built: Vec<u64>,
     pub(crate) first: Vec<String>,
     pub(crate) first_not_judged: Vec<String>,
+    /// v4b box content over the built top levels walked (judged or not):
+    /// [`TopCheck::inner`], `inst_box`, `holds`, `holds_rows` summed; top
+    /// levels whose box content is good (no inner box zero or empty, every
+    /// reached instance's box finite and holding its bottom level's box by
+    /// Fable's layout, at least one judged) and not; one line per top level
+    /// (at most 8 a submission).
+    pub(crate) inner: [u64; 3],
+    pub(crate) inst_box: [u64; 2],
+    pub(crate) holds: [u64; 3],
+    pub(crate) holds_rows: [u64; 3],
+    pub(crate) box_tops: [u32; 2],
+    pub(crate) boxes: Vec<String>,
+    /// Of `inst_box` and `holds`, the instances on packed bottom levels;
+    /// top levels good / bad when those are left out.
+    pub(crate) inst_box_packed: [u64; 2],
+    pub(crate) holds_packed: [u64; 3],
+    pub(crate) box_tops_unpacked: [u32; 2],
 }
 
 impl V4 {
@@ -2619,6 +2729,21 @@ impl V4 {
         self.pages.past_budget += o.pages.past_budget;
         self.d15_unknown += o.d15_unknown;
         self.into_header += o.into_header;
+        for (a, b) in self.inner.iter_mut().zip(&o.inner).chain(self.holds.iter_mut().zip(&o.holds)).chain(self.holds_rows.iter_mut().zip(&o.holds_rows)) {
+            *a += b;
+        }
+        for (a, b) in self.inst_box.iter_mut().zip(&o.inst_box) {
+            *a += b;
+        }
+        for (a, b) in self.box_tops.iter_mut().zip(&o.box_tops).chain(self.box_tops_unpacked.iter_mut().zip(&o.box_tops_unpacked)) {
+            *a += b;
+        }
+        for (a, b) in self.inst_box_packed.iter_mut().zip(&o.inst_box_packed) {
+            *a += b;
+        }
+        for (a, b) in self.holds_packed.iter_mut().zip(&o.holds_packed) {
+            *a += b;
+        }
     }
 
     fn add_bottom(&mut self, kind: Bottom, c: &BottomV3) {
@@ -2643,6 +2768,7 @@ impl V4 {
         for (a, b) in self.classes.iter_mut().zip(&t.classes) {
             *a += u64::from(*b);
         }
+        self.add_boxes(at, t);
         self.search_unread += u64::from(t.search_unread);
         self.blas_unmapped += u64::from(t.blas_unmapped);
         self.near += u64::from(t.near);
@@ -2682,6 +2808,79 @@ impl V4 {
         self.twice += u64::from(t.twice);
         self.bad_slots += u64::from(t.bad_slots);
         self.nodes_twice += u64::from(t.nodes_twice);
+    }
+
+    /// v4b: the box content of the built top level at `at`.
+    fn add_boxes(&mut self, at: u64, t: &TopCheck) {
+        for (a, b) in self.inner.iter_mut().zip(&t.inner).chain(self.holds.iter_mut().zip(&t.holds)).chain(self.holds_rows.iter_mut().zip(&t.holds_rows)) {
+            *a += u64::from(*b);
+        }
+        for (a, b) in self.inst_box.iter_mut().zip(&t.inst_box) {
+            *a += u64::from(*b);
+        }
+        for (a, b) in self.inst_box_packed.iter_mut().zip(&t.inst_box_packed) {
+            *a += u64::from(*b);
+        }
+        for (a, b) in self.holds_packed.iter_mut().zip(&t.holds_packed) {
+            *a += u64::from(*b);
+        }
+        let inner_ok = t.inner[BOX_ZERO] == 0 && t.inner[BOX_EMPTY] == 0;
+        let good = inner_ok && t.inst_box[1] == 0 && t.holds[1] == 0 && t.holds[0] > 0;
+        self.box_tops[usize::from(!good)] += 1;
+        let good_unpacked =
+            inner_ok && t.inst_box[1] == t.inst_box_packed[1] && t.holds[1] == t.holds_packed[1] && t.holds[0] > t.holds_packed[0];
+        self.box_tops_unpacked[usize::from(!good_unpacked)] += 1;
+        if self.boxes.len() < 8 {
+            self.boxes.push(format!(
+                "top {at:#x} {}: inner boxes zero/empty/good {}/{}/{}, instance boxes finite/+-FLT_MAX {}/{}, hold the bottom level's box (16-27) yes/no/not judged {}/{}/{}, (0-11) {}/{}/{}; on packed bottom levels: instance boxes finite/+-FLT_MAX {}/{}, hold (16-27) {}/{}/{}; without them {}{}",
+                if good { "good" } else { "bad" },
+                t.inner[0],
+                t.inner[1],
+                t.inner[2],
+                t.inst_box[0],
+                t.inst_box[1],
+                t.holds[0],
+                t.holds[1],
+                t.holds[2],
+                t.holds_rows[0],
+                t.holds_rows[1],
+                t.holds_rows[2],
+                t.inst_box_packed[0],
+                t.inst_box_packed[1],
+                t.holds_packed[0],
+                t.holds_packed[1],
+                t.holds_packed[2],
+                if good_unpacked { "good" } else { "bad" },
+                t.first_outside.as_ref().map_or(String::new(), |f| format!("; first outside: {f}")),
+            ));
+        }
+    }
+
+    /// v4b: the box content counts as one log line's text.
+    pub(crate) fn box_text(&self) -> String {
+        format!(
+            "box content of the built top levels good/bad {}/{}; inner boxes zero/empty/good {}/{}/{}; instance boxes finite/+-FLT_MAX {}/{}; hold the bottom level's box (16-27) yes/no/not judged {}/{}/{}, (0-11) {}/{}/{}; on packed bottom levels: instance boxes finite/+-FLT_MAX {}/{}, hold (16-27) {}/{}/{}; top levels good/bad without them {}/{}",
+            self.box_tops[0],
+            self.box_tops[1],
+            self.inner[0],
+            self.inner[1],
+            self.inner[2],
+            self.inst_box[0],
+            self.inst_box[1],
+            self.holds[0],
+            self.holds[1],
+            self.holds[2],
+            self.holds_rows[0],
+            self.holds_rows[1],
+            self.holds_rows[2],
+            self.inst_box_packed[0],
+            self.inst_box_packed[1],
+            self.holds_packed[0],
+            self.holds_packed[1],
+            self.holds_packed[2],
+            self.box_tops_unpacked[0],
+            self.box_tops_unpacked[1],
+        )
     }
 
     /// The counts as one log line's text.
@@ -4145,5 +4344,92 @@ mod tests {
         let (t, v) = check_top_v3(&read_map(&mini_top()), base);
         assert_eq!((t.never, t.never_null, t.first_never), (0, 0, None));
         assert_eq!(v, Verdict::Valid);
+    }
+
+    /// v4b box content (Fable Aufruf 11): slot boxes all 0 / empty / good.
+    #[test]
+    fn v4b_box_classes_and_moved_boxes() {
+        assert_eq!(box_class(&([0.0; 3], [0.0; 3])), BOX_ZERO);
+        assert_eq!(box_class(&([f32::MAX; 3], [-f32::MAX; 3])), BOX_EMPTY);
+        assert_eq!(box_class(&([1.0, 0.0, 0.0], [0.0, 1.0, 1.0])), BOX_EMPTY, "min > max");
+        assert_eq!(box_class(&([0.0, 0.0, f32::NAN], [1.0; 3])), BOX_EMPTY);
+        assert_eq!(box_class(&([0.0; 3], [1.0, 1.0, 0.0])), BOX_GOOD, "flat but finite");
+        let unit: Aabb = ([-0.5; 3], [0.5; 3]);
+        let id = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(transform_box(&unit, &id, &[0.5; 3]), ([0.0; 3], [1.0; 3]));
+        // A quarter turn about z by rows: x' = -y, y' = x.
+        let turn = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(transform_box(&([0.0; 3], [2.0, 1.0, 1.0]), &turn, &[0.0; 3]), ([-1.0, 0.0, 0.0], [0.0, 2.0, 1.0]));
+        assert!(box_holds(&([0.0; 3], [1.0; 3]), &([0.0; 3], [1.0; 3])));
+        assert!(box_holds(&([0.0; 3], [1.0; 3]), &([0.0; 3], [1.0005, 1.0, 1.0])), "half-float slack");
+        assert!(!box_holds(&([0.0; 3], [1.0; 3]), &([0.0; 3], [1.1, 1.0, 1.0])));
+        assert!(!box_holds(&([0.0; 3], [1.0; 3]), &([-0.1, 0.0, 0.0], [1.0; 3])));
+    }
+
+    /// v4b box content of a walked top level: inner slot boxes counted by
+    /// class, instance boxes finite or +-FLT_MAX, and whether a finite one
+    /// holds its bottom level's header box moved by the entry (dwords
+    /// 16-27 Fable's layout, 0-11 by rows); the V4 line names it.
+    #[test]
+    fn v4b_box_content_of_a_top_level() {
+        let base = 0x10000u64;
+        let f = |x: f32| x.to_bits();
+        let mut m = mini_top();
+        // Bottom level 0x20000 (instance 0, slot box [0,1]^3): header box
+        // [-0.5,0.5]^3; entry 0: identity by rows 19-27, translation 0.5.
+        for (i, v) in [-0.5f32, -0.5, -0.5, 0.5, 0.5, 0.5].into_iter().enumerate() {
+            m.insert(0x20000 + 16 + 4 * i as u64, f(v));
+        }
+        let entry = base + 192;
+        for (k, v) in [(16, 0.5f32), (17, 0.5), (18, 0.5), (19, 1.0), (23, 1.0), (27, 1.0), (0, 1.0), (5, 1.0), (10, 1.0), (3, 0.5), (7, 0.5), (11, 0.5)] {
+            m.insert(entry + 4 * k, f(v));
+        }
+        // An inner box16 node at +576 (slot 3 of the root), its slots empty,
+        // its box in the root all 0.
+        m.insert(base + 64 + 12, (576 >> 3) | 4);
+        for k in 0..16u64 {
+            m.insert(base + 576 + 4 * k, if k < 4 { u32::MAX } else { 0 });
+        }
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert_eq!(v, Verdict::Valid, "{t:?}");
+        assert_eq!(t.inner, [1, 0, 0], "inner box all 0");
+        assert_eq!(t.inst_box, [2, 1], "instance 1's slot box is +-FLT_MAX");
+        assert_eq!((t.inst_box_packed, t.holds_packed), ([0, 1], [0, 0, 1]), "instance 1 lies on a packed bottom level (0x8102)");
+        assert_eq!((t.holds, t.holds_rows), ([1, 0, 2], [1, 0, 2]));
+        let mut c = V4::default();
+        c.add_boxes(base, &t);
+        assert_eq!(c.box_tops, [0, 1], "an inner box all 0 makes it bad");
+        assert!(c.boxes[0].contains("inner boxes zero/empty/good 1/0/0, instance boxes finite/+-FLT_MAX 2/1, hold the bottom level's box (16-27) yes/no/not judged 1/0/2"), "{}", c.boxes[0]);
+        // The inner box good, instance 1's box still +-FLT_MAX: bad.
+        for (k, v) in [0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0].into_iter().enumerate() {
+            m.insert(base + 64 + 16 + 4 * (18 + k as u64), f(v));
+        }
+        let (t, _) = check_top_v3(&read_map(&m), base);
+        assert_eq!((t.inner, t.inst_box), ([0, 0, 1], [2, 1]));
+        let mut c = V4::default();
+        c.add_boxes(base, &t);
+        assert_eq!(c.box_tops, [0, 1], "an instance box +-FLT_MAX makes it bad");
+        assert_eq!(c.box_tops_unpacked, [1, 0], "but not when instances on packed bottom levels are left out");
+        assert!(c.boxes[0].contains("on packed bottom levels: instance boxes finite/+-FLT_MAX 0/1, hold (16-27) 0/0/1; without them good"), "{}", c.boxes[0]);
+        // Instance 1's box finite too: good.
+        for (k, v) in [0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0].into_iter().enumerate() {
+            m.insert(base + 64 + 16 + 4 * (6 + k as u64), f(v));
+        }
+        let (t, _) = check_top_v3(&read_map(&m), base);
+        assert_eq!((t.inner, t.inst_box), ([0, 0, 1], [3, 0]));
+        let mut c = V4::default();
+        c.add_boxes(base, &t);
+        assert_eq!(c.box_tops, [1, 0], "{:?}", c.boxes);
+        // Translation 5 by Fable's layout: the slot box no longer holds it
+        // (by rows still), named as the first outside.
+        m.insert(entry + 4 * 16, f(5.0));
+        let (t, _) = check_top_v3(&read_map(&m), base);
+        assert_eq!((t.holds, t.holds_rows), ([0, 1, 2], [1, 0, 2]));
+        assert!(t.first_outside.as_deref().is_some_and(|w| w.starts_with("instance 0: box")), "{:?}", t.first_outside);
+        let mut c = V4::default();
+        c.add_boxes(base, &t);
+        assert_eq!(c.box_tops, [0, 1]);
+        c.add(&c.clone());
+        assert!(c.box_text().starts_with("box content of the built top levels good/bad 0/2; inner boxes zero/empty/good 0/0/2"), "{}", c.box_text());
     }
 }
