@@ -517,3 +517,60 @@ fn the_stream_keeps_the_order_of_events() {
         ]
     );
 }
+
+/// A record of a submission never comes before its SUBMIT, when another
+/// thread records while the submission is being counted (the R2 stream of
+/// PC 1 had an ACCESS of submission 15056 one record before its SUBMIT).
+/// The other thread records exactly between the count and the SUBMIT if it
+/// can; it may wait up to 300 ms there.
+#[test]
+fn a_record_from_another_thread_never_comes_before_its_submit() {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+    let dir = std::env::temp_dir().join(format!("memclass-order-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.vmcs");
+    let a = 0x7ff6_5678_0000usize;
+    {
+        let c = Classifier::new(Config { stream: Some(path.clone()), stream_frames: 0, ..config(16) });
+        let (go, go_rx) = channel::<()>();
+        let (done, done_rx) = channel::<()>();
+        let done_rx = Mutex::new(done_rx);
+        assert!(
+            c.between_number_and_submit
+                .set(Box::new(move || {
+                    go.send(()).unwrap();
+                    match done_rx.lock().unwrap().recv_timeout(Duration::from_millis(300)) {
+                        Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                        Err(e) => panic!("{e}"),
+                    }
+                }))
+                .is_ok()
+        );
+        let c = &c;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                go_rx.recv().unwrap();
+                c.tag(f::GPU_W_MARK, a, K64);
+                done.send(()).unwrap();
+            });
+            let sub = c.submit(1);
+            drop(sub);
+        });
+        c.finish();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let (_, records) = decode(&bytes);
+    let records = without_copystat(records);
+    let submit = records.iter().position(|r| matches!(r, Record::Submit { seq: 1, .. }));
+    let access = records.iter().position(|r| matches!(r, Record::Access { flag: f::GPU_W_MARK, .. }));
+    let (Some(submit), Some(access)) = (submit, access) else { panic!("missing records: {records:?}") };
+    match records[access] {
+        Record::Access { seq: 1, .. } => {
+            assert!(submit < access, "ACCESS of submission 1 before its SUBMIT: {records:?}")
+        }
+        Record::Access { seq: 0, .. } => assert!(access < submit, "{records:?}"),
+        _ => panic!("{records:?}"),
+    }
+}
