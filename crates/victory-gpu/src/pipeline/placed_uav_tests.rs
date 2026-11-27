@@ -82,6 +82,7 @@ fn store_shader() -> Arc<Shader> {
         translated: OnceLock::from(Some(Translated {
             host,
             used: native.used,
+            group_x_offset: false,
         })),
     })
 }
