@@ -439,7 +439,23 @@ impl Gt {
         v4.targets = now.len() as u32;
         let tops: Vec<u64> = now.iter().filter(|(_, stages)| **stages & 1 << TOP_STAGE != 0).map(|(at, _)| *at).collect();
         v4.top_targets = tops.len() as u32;
-        v4.top_targets_unseen = tops.iter().filter(|at| !headers.contains(at)).count() as u32;
+        // v4b (senior 116): a built top level with no header among the
+        // compared ones is an empty one (190fbf0e writes 0 nodes, 0
+        // instances, no root: 2 of 4 per submission in the s52-2/s52-3/
+        // s60-1 captures), lies on a page not compared (past
+        // VICTORY_BVH_GT_PAGES), or is truly missing.
+        {
+            let pairs: Vec<(usize, &[u8])> = pages.iter().map(|p| (p.from, &p.g[..])).collect();
+            let read_g = reader(&pairs);
+            for at in &tops {
+                match target_seen(&read_g, &headers, *at) {
+                    Seen::Header => {}
+                    Seen::Empty => v4.top_targets_empty += 1,
+                    Seen::NotCompared => v4.top_targets_uncompared += 1,
+                    Seen::NoHeader => v4.top_targets_unseen += 1,
+                }
+            }
+        }
         with_builds(|b| b.wait_for(submission, &v4.never_built));
         V2_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V2::default).add(&v2);
         V3_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V3::default).add(&v3);
@@ -1347,6 +1363,11 @@ pub(crate) struct TopCheck {
     /// v4: the first instance's bottom-level address with no header in the
     /// GPU's bytes (classes d, e, or no page of the table).
     pub(crate) first_no_header: Option<u64>,
+    /// v4b: of the instances never reached, those whose entry's dword 15
+    /// (bottom level) is 0 or not read; the first one's entry and
+    /// bottom-level header.
+    pub(crate) never_null: u32,
+    pub(crate) first_never: Option<String>,
 }
 
 /// Indices of [`TopCheck::classes`] (v4, Fable Aufruf 8 point 2): (a) a
@@ -1656,6 +1677,24 @@ fn check_top_core(
     t.reached = count.len() as u32;
     t.twice = count.values().filter(|&&k| k > 1).count() as u32;
     t.never = t.instances.saturating_sub(t.reached);
+    // v4b (senior 116): of the instances never reached, those whose entry
+    // names no bottom level (dword 15 = 0) or was not read, and the first
+    // one's entry and bottom-level header, to tell a builder that leaves
+    // inactive instances out from one that loses them.
+    if t.never > 0 && list != 0 {
+        for index in (0..u64::from(h[3]).min(MOST_INSTANCES)).filter(|i| !count.contains_key(i)) {
+            let entry = base + list + 128 * index;
+            let e15 = read(entry + 60);
+            t.never_null += u32::from(e15.is_none_or(|w| w == 0));
+            if t.first_never.is_none() {
+                let words = |at: u64, n: u64| {
+                    (0..n).map(|i| read(at + 4 * i).map_or("--".to_string(), |w| format!("{w:08x}"))).collect::<Vec<_>>().join(" ")
+                };
+                let blas = e15.map_or(0, |w| u64::from(w) << 8);
+                t.first_never = Some(format!("first never: instance {index} entry [{}]; bottom level {blas:#x} header [{}]", words(entry, 32), words(blas, 16)));
+            }
+        }
+    }
     if why.is_none() && t.twice > 0 {
         why = Some(format!("{} instances reached more than once", t.twice));
     }
@@ -1735,6 +1774,44 @@ pub(crate) fn build_target(name: &str, values: &[u32]) -> Option<(u64, u8)> {
     let (stage, &(_, i)) = BUILD_TARGETS.iter().enumerate().find(|(_, (hash, _))| name.contains(hash))?;
     let at = u64::from(*values.get(i)?) | u64::from(*values.get(i + 1)?) << 32;
     (at != 0 && at & 0xff == 0).then_some((at, stage as u8))
+}
+
+/// v4b (senior 116): an empty top level as 190fbf0e writes it (s52-2 s5925,
+/// s52-3 s5874, s60-1 s5244: 2 of the 4 top-level targets of each
+/// submission, dwords 6 0 0 0, +-FLT_MAX start bounds, root 0xffffffff):
+/// version 6 without marks, 0 nodes, 0 instances, no root, the bounds still
+/// the start values. Not a header for [`is_header`] (1 node at least).
+pub(crate) fn empty_top(h: &[u32]) -> bool {
+    h.len() >= 16
+        && h[0] == 6
+        && h[1] == 0
+        && h[3] == 0
+        && h[12] == u32::MAX
+        && h[4..7].iter().all(|&w| w == 0x7f7f_ffff)
+        && h[7..10].iter().all(|&w| w == 0xff7f_ffff)
+}
+
+/// What the compared bytes hold at a built top level's address (v4b).
+#[derive(Debug, PartialEq)]
+pub(crate) enum Seen {
+    Header,
+    Empty,
+    NotCompared,
+    NoHeader,
+}
+
+/// [`Seen`] of the top-level target `at`, `headers` the compared ones'.
+pub(crate) fn target_seen(read: &dyn Fn(u64) -> Option<u32>, headers: &[u64], at: u64) -> Seen {
+    if headers.contains(&at) {
+        return Seen::Header;
+    }
+    if read(at).is_none() {
+        return Seen::NotCompared;
+    }
+    match (0..16).map(|i| read(at + 4 * i)).collect::<Option<Vec<u32>>>() {
+        Some(h) if empty_top(&h) => Seen::Empty,
+        _ => Seen::NoHeader,
+    }
 }
 
 /// v4: what the builder built, by submission (the GPU's order; the binds
@@ -2200,7 +2277,8 @@ pub(crate) fn check_top_v3_with(
     } else if let Some(o) = &t.first_order {
         Verdict::NotJudged(o.clone())
     } else if t.never > 0 {
-        Verdict::Invalid(format!("{} of {} instances never reached", t.never, t.instances))
+        let more = t.first_never.as_ref().map_or(String::new(), |f| format!(" ({} with no bottom level; {f})", t.never_null));
+        Verdict::Invalid(format!("{} of {} instances never reached{more}", t.never, t.instances))
     } else {
         Verdict::Valid
     };
@@ -2242,7 +2320,7 @@ pub(crate) fn top_v3_over(
     let (mut t, v) = check_top_v3_with(&read, at, &from_title, None);
     t.any_title = used.get();
     let decided = match &v {
-        Verdict::Invalid(w) if w.ends_with("instances never reached") => t.tree_from_title,
+        Verdict::Invalid(w) if w.contains("instances never reached") => t.tree_from_title,
         Verdict::Invalid(_) => t.defect_from_title,
         Verdict::Valid => t.tree_from_title,
         Verdict::NotJudged(_) => false,
@@ -2468,6 +2546,11 @@ pub(crate) struct V4 {
     pub(crate) targets: u32,
     pub(crate) top_targets: u32,
     pub(crate) top_targets_unseen: u32,
+    /// v4b: of the top-level stage's targets, empty top levels
+    /// ([`empty_top`]) and those whose header word lies on no compared
+    /// page; neither counts in `top_targets_unseen`.
+    pub(crate) top_targets_empty: u32,
+    pub(crate) top_targets_uncompared: u32,
     /// Top levels built by the submission: [valid, invalid, not judged].
     pub(crate) tops: [u32; 3],
     /// Plausible top-level headers the submission did not build (not
@@ -2509,6 +2592,8 @@ impl V4 {
         self.targets += o.targets;
         self.top_targets += o.top_targets;
         self.top_targets_unseen += o.top_targets_unseen;
+        self.top_targets_empty += o.top_targets_empty;
+        self.top_targets_uncompared += o.top_targets_uncompared;
         for (a, b) in self.tops.iter_mut().zip(&o.tops).chain(self.why_not.iter_mut().zip(&o.why_not)) {
             *a += b;
         }
@@ -2602,10 +2687,12 @@ impl V4 {
     /// The counts as one log line's text.
     pub(crate) fn text(&self) -> String {
         format!(
-            "build targets {} (top-level stage {}, of them no header among the compared ones {}); top levels built here valid/invalid/not judged {}/{}/{}; top-level headers not built here (not judged) {}, no top level {}; not judged for: box node or instance not read {}, bottom level not read {}, bottom level in no page of the table {}, class e instance {}, other {}; judged: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}; instances of the built ones a header / b header past the parent table / d no header, a build target / e no header, never a build target {}/{}/{}/{} (header search not read {}, bottom level in no page of the table {}, e with a build target within 64 KiB {}; without a header but one in title memory {}); pages read besides: from the table's copy {}, its arena page {}, in no page of the table {}, not fetched {}, past the budget {}; bottom levels not judged for dword 15 bits 24-29 {}, valid with a child pointer into the header {}",
+            "build targets {} (top-level stage {}, of them no header among the compared ones {}; empty top levels {}, not on a compared page {}); top levels built here valid/invalid/not judged {}/{}/{}; top-level headers not built here (not judged) {}, no top level {}; not judged for: box node or instance not read {}, bottom level not read {}, bottom level in no page of the table {}, class e instance {}, other {}; judged: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}; instances of the built ones a header / b header past the parent table / d no header, a build target / e no header, never a build target {}/{}/{}/{} (header search not read {}, bottom level in no page of the table {}, e with a build target within 64 KiB {}; without a header but one in title memory {}); pages read besides: from the table's copy {}, its arena page {}, in no page of the table {}, not fetched {}, past the budget {}; bottom levels not judged for dword 15 bits 24-29 {}, valid with a child pointer into the header {}",
             self.targets,
             self.top_targets,
             self.top_targets_unseen,
+            self.top_targets_empty,
+            self.top_targets_uncompared,
             self.tops[0],
             self.tops[1],
             self.tops[2],
@@ -3997,5 +4084,66 @@ mod tests {
         n.add_bottom(Bottom::Fresh, &c);
         n.add_bottom(Bottom::Fresh, &check_bottom_v3(&read_of(&mini_bvh(), base), base, Bottom::Other, None));
         assert_eq!(n.into_header, 1);
+    }
+
+    // v4b (senior 116). Red proof: scripts\s116\red116.py (mutations of
+    // the rules below make these red).
+
+    /// The empty top level 190fbf0e writes (s52-2 s5925 0xd60a2c200, word
+    /// for word): not a header, told apart from a page not compared and
+    /// from bytes with no header; one node, an instance or a root makes it
+    /// no empty one.
+    #[test]
+    fn v4b_empty_top_levels_are_told_apart() {
+        let base = 0xd_60a2_c200u64;
+        let empty: [u32; 16] = [6, 0, 0, 0, 0x7f7f_ffff, 0x7f7f_ffff, 0x7f7f_ffff, 0xff7f_ffff, 0xff7f_ffff, 0xff7f_ffff, 0, 0, u32::MAX, 0x80, 0x40, 0x007f_7f7f];
+        assert!(!is_header(empty[0], empty[1]));
+        assert!(empty_top(&empty));
+        assert_eq!(target_seen(&read_of(&empty, base), &[], base), Seen::Empty);
+        assert_eq!(target_seen(&read_of(&empty, base), &[base], base), Seen::Header);
+        assert_eq!(target_seen(&read_of(&empty, base), &[], base + 0x1_0000), Seen::NotCompared);
+        assert_eq!(target_seen(&read_of(&[0; 16], base), &[], base), Seen::NoHeader);
+        assert_eq!(target_seen(&read_of(&empty[..8], base), &[], base), Seen::NoHeader, "header only half read");
+        for (i, w) in [(1, 1), (3, 1), (12, (64 >> 3) | 5), (4, 0), (9, 0), (0, 0x8000_0006)] {
+            let mut h = empty;
+            h[i] = w;
+            assert!(!empty_top(&h), "dword {i} = {w:#x}");
+            assert_eq!(target_seen(&read_of(&h, base), &[], base), Seen::NoHeader, "dword {i}");
+        }
+        let mut v = V4 { top_targets: 5, top_targets_unseen: 1, top_targets_empty: 2, top_targets_uncompared: 1, ..V4::default() };
+        v.add(&v.clone());
+        assert!(v.text().contains("top-level stage 10, of them no header among the compared ones 2; empty top levels 4, not on a compared page 2)"), "{}", v.text());
+    }
+
+    /// An instance never reached names its index, entry and bottom-level
+    /// header in the verdict, and counts as "no bottom level" when its
+    /// dword 15 is 0.
+    #[test]
+    fn v4b_never_reached_names_the_instance() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.insert(base + 64 + 8, u32::MAX);
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert_eq!((t.never, t.never_null), (1, 0));
+        let w = v.why().to_string();
+        assert!(w.starts_with("1 of 3 instances never reached (0 with no bottom level; first never: instance 2 entry [00000000"), "{w}");
+        assert!(w.contains("00000202 00000000"), "entry dword 15 = 0x202: {w}");
+        assert!(w.contains("bottom level 0x20200 header [80040006 00000004 --"), "{w}");
+        // Its dword 15 = 0: no bottom level.
+        m.insert(base + 192 + 256 + 60, 0);
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert_eq!((t.never, t.never_null), (1, 1));
+        assert!(v.why().contains("(1 with no bottom level; first never: instance 2"), "{}", v.why());
+        // Its entry not read: counted with them, words shown as --.
+        for k in 0..32 {
+            m.remove(&(base + 192 + 256 + 4 * k));
+        }
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert_eq!((t.never, t.never_null), (1, 1));
+        assert!(v.why().contains("entry [-- --"), "{}", v.why());
+        // All reached: nothing named.
+        let (t, v) = check_top_v3(&read_map(&mini_top()), base);
+        assert_eq!((t.never, t.never_null, t.first_never), (0, 0, None));
+        assert_eq!(v, Verdict::Valid);
     }
 }
