@@ -753,6 +753,37 @@ fn run_prefix(
         // SAFETY: a live buffer.
         unsafe { table.GetGPUVirtualAddress() }
     };
+    // Diag (senior 92, off by default): VICTORY_HARNESS_TIMESTAMPS=1 brackets
+    // every replayed dispatch with GPU timestamps and prints its duration.
+    let stamps = std::env::var("VICTORY_HARNESS_TIMESTAMPS").is_ok_and(|v| v.trim() == "1");
+    let replayed: Vec<usize> = c
+        .dispatches
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| o.all || d.builder)
+        .take(upto)
+        .map(|(k, _)| k)
+        .collect();
+    let ts = if stamps {
+        let count = 2 * replayed.len().max(1) as u32;
+        let mut qh: Option<ID3D12QueryHeap> = None;
+        // SAFETY: plain query heap creation.
+        unsafe {
+            gpu.device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: count,
+                    NodeMask: 0,
+                },
+                &mut qh,
+            )?
+        };
+        let rb = gpu.buffer(u64::from(count) * 8, D3D12_HEAP_TYPE_READBACK, false)?;
+        Some((qh.context("no query heap")?, rb, count))
+    } else {
+        None
+    };
+    let mut shapes: Vec<(String, String)> = Vec::new();
     let took = gpu.run(|list| {
         // SAFETY: an open list; every object lives until the run is waited for.
         unsafe {
@@ -849,6 +880,24 @@ fn run_prefix(
                 if d.barrier || o.barriers {
                     list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
                 }
+                let qi = shapes.len() as u32;
+                if let Some((qh, _, _)) = &ts {
+                    list.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * qi);
+                    shapes.push((
+                        c.pipelines
+                            .get(d.pipeline as usize)
+                            .map_or("?".to_string(), |p| p.hash.chars().take(8).collect()),
+                        match (&d.groups, limit) {
+                            (Groups::Direct([x, y, z]), Some((_, g, t))) => {
+                                format!("groups {g}x{y}x{z} (captured x {x}) thread limit {t}")
+                            }
+                            (Groups::Direct([x, y, z]), None) => {
+                                format!("groups {x}x{y}x{z} thread limit none")
+                            }
+                            (Groups::Indirect { most, .. }, _) => format!("indirect most {most}"),
+                        },
+                    ));
+                }
                 match &d.groups {
                     Groups::Direct([_, y, z]) if limit.is_some() => {
                         list.Dispatch(limit.map_or(0, |l| l.1), *y, *z)
@@ -875,10 +924,36 @@ fn run_prefix(
                         );
                     }
                 }
+                if let Some((qh, _, _)) = &ts {
+                    list.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, 2 * qi + 1);
+                }
+            }
+            if let Some((qh, rb, count)) = &ts {
+                list.ResolveQueryData(qh, D3D12_QUERY_TYPE_TIMESTAMP, 0, *count, rb, 0);
             }
         }
         Ok(())
     })?;
+    if let Some((_, rb, _)) = &ts {
+        // SAFETY: plain query; the readback buffer is done (the run was waited for).
+        let freq = unsafe { gpu.queue.GetTimestampFrequency()? } as f64;
+        let p = Gpu::map(rb)?;
+        // SAFETY: 2 * shapes.len() resolved u64 stamps.
+        let t = unsafe { std::slice::from_raw_parts(p.cast::<u64>(), 2 * shapes.len()) };
+        let mut most: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
+        for (i, (h, shape)) in shapes.iter().enumerate() {
+            let us = t[2 * i + 1].saturating_sub(t[2 * i]) as f64 * 1e6 / freq;
+            println!("timestamp dispatch {} (capture index {}) ({h}): {us:.1} us, {shape}", i + 1, replayed[i]);
+            let e = most.entry(h.as_str()).or_insert((0.0, 0));
+            if us > e.0 {
+                *e = (us, i);
+            }
+        }
+        for (h, (us, i)) in most {
+            println!("timestamp longest {h}: {us:.1} us at dispatch {}, {}", i + 1, shapes[i].1);
+        }
+        println!("timestamp list total wall {:.1} ms", took.as_secs_f64() * 1000.0);
+    }
     // Results: the bitmap, then every marked page's bytes.
     let readback = gpu.buffer(STAGE, D3D12_HEAP_TYPE_READBACK, false)?;
     let rb = Gpu::map(&readback)?;
