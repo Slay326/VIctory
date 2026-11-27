@@ -232,8 +232,6 @@ mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
 #[cfg(all(test, windows))]
-mod threadlimit_tests;
-#[cfg(all(test, windows))]
 mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
@@ -524,23 +522,13 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`translate`] made as `options` say.
-/// Diagnostics only (BVH harness, senior 82): a patch applied to the native
-/// code of every program [`translate_with`] translates while it is set.
-static DIAG_CODE_PATCH: std::sync::Mutex<Option<fn(&mut Vec<u8>) -> Result<(), ()>>> =
-    std::sync::Mutex::new(None);
-
-/// Sets or clears [`DIAG_CODE_PATCH`] (diagnostics only; not a production path).
-pub fn set_diag_code_patch(patch: Option<fn(&mut Vec<u8>) -> Result<(), ()>>) {
-    *DIAG_CODE_PATCH.lock().unwrap_or_else(|e| e.into_inner()) = patch;
-}
-
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let mut native = crate::native_programs(dxil.data)?
+    let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -552,9 +540,6 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    if let Some(patch) = *DIAG_CODE_PATCH.lock().unwrap_or_else(|e| e.into_inner()) {
-        patch(&mut native.code).map_err(|_| ShaderError::Malformed("diagnostic code patch"))?;
-    }
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
