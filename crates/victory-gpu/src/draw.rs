@@ -786,11 +786,7 @@ impl State {
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         // Set by the split dispatch's signature (`execute_indirect`).
-                        None if u.dword == victory_shader::emit::GROUP_X_OFFSET
-                            && u.root == RootType::Constants =>
-                        {
-                            0
-                        }
+                        None if takes_group_offset(t.group_x_offset, u) => 0,
                         None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
@@ -2033,13 +2029,34 @@ fn group_offset(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
     }
     p.stages.iter().find_map(|s| {
         let (param, _) = s.user_data?;
-        s.translated()
-            .host
-            .user_data
-            .iter()
-            .find(|u| u.dword == victory_shader::emit::GROUP_X_OFFSET && u.root == RootType::Constants)
-            .map(|u| (param, u.index))
+        let t = s.translated();
+        group_offset_index(t.group_x_offset, &t.host.user_data).map(|index| (param, index))
     })
+}
+
+/// The user-data dword of the group offset entry among a stage's entries,
+/// for a stage translated to take one (`group_x_offset`).
+fn group_offset_index(group_x_offset: bool, user_data: &[victory_shader::emit::UserData]) -> Option<u32> {
+    user_data
+        .iter()
+        .find(|u| takes_group_offset(group_x_offset, u))
+        .map(|u| u.index)
+}
+
+/// Whether `u` is the user-data entry the translation adds for a split
+/// dispatch's group offset (`victory_shader::emit::GROUP_X_OFFSET`) in a
+/// stage translated with it, and no title entry: a title's root constants
+/// have a dword 5 too, and one whose parameter starts at user-data dword 11
+/// puts it at dword 16 as well.
+// shortcut: told apart by the stage's translation option and the entry's
+// fields; a mark outside the dwords a parameter has would change the
+// translation (and every shader cache).
+fn takes_group_offset(group_x_offset: bool, u: &victory_shader::emit::UserData) -> bool {
+    group_x_offset
+        && u.index == victory_shader::emit::GROUP_X_OFFSET_INDEX
+        && u.slot == 0
+        && u.root == RootType::Constants
+        && u.dword == victory_shader::emit::GROUP_X_OFFSET
 }
 
 /// The command signature of a split dispatch (`crate::indirect`): per
@@ -2294,6 +2311,41 @@ fn fresh_range(entries: impl Iterator<Item = u32> + Clone, mirrored: u32) -> (u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title's root constants have a dword 5 as well: only the entry the
+    /// translation adds (user-data dword 16, slot 0) takes the split
+    /// dispatch's group offset; the title's keeps its value, and a program
+    /// without the offset is not split.
+    #[test]
+    fn only_the_added_entry_is_the_group_offset() {
+        use victory_shader::emit::{GROUP_X_OFFSET, GROUP_X_OFFSET_INDEX, UserData};
+        let title = UserData { index: 5, slot: 2, root: RootType::Constants, dword: GROUP_X_OFFSET };
+        let added =
+            UserData { index: GROUP_X_OFFSET_INDEX, slot: 0, root: RootType::Constants, dword: GROUP_X_OFFSET };
+        assert!(!takes_group_offset(true, &title));
+        assert!(takes_group_offset(true, &added));
+        // Same dword of another kind of parameter, or at another slot: not it.
+        assert!(!takes_group_offset(true, &UserData { root: RootType::Descriptor, ..added }));
+        assert!(!takes_group_offset(true, &UserData { slot: 1, ..added }));
+        // Dword 0 of the title's constants at user-data dword 16 (5e687674).
+        assert!(!takes_group_offset(true, &UserData { dword: 0, ..added }));
+        assert_eq!(group_offset_index(true, &[title]), None);
+        assert_eq!(group_offset_index(true, &[title, added]), Some(GROUP_X_OFFSET_INDEX));
+        assert_eq!(group_offset_index(true, &[added, title]), Some(GROUP_X_OFFSET_INDEX));
+    }
+
+    /// A title's root constants starting at user-data dword 11 put their
+    /// dword 5 at dword 16, the same fields as the added entry: in a program
+    /// translated without the group offset it keeps its value, and the
+    /// program is not split.
+    #[test]
+    fn a_title_dword_at_sixteen_is_no_group_offset_without_the_option() {
+        use victory_shader::emit::{GROUP_X_OFFSET, GROUP_X_OFFSET_INDEX, UserData};
+        let title =
+            UserData { index: GROUP_X_OFFSET_INDEX, slot: 0, root: RootType::Constants, dword: GROUP_X_OFFSET };
+        assert!(!takes_group_offset(false, &title));
+        assert_eq!(group_offset_index(false, &[title]), None);
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
@@ -3690,6 +3742,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::pipeline::Translated {
                 host: host_shader,
                 used: used_entries,
+                group_x_offset: false,
             },
         );
         let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
