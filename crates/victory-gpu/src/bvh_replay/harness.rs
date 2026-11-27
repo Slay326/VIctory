@@ -73,6 +73,11 @@ pub struct Options {
     /// captured program and compare its unordered table views with the
     /// game's bytes after the fence ([`reader_verdict`]).
     pub reader: bool,
+    /// senior 122, `--sentinel` (with `--reader`): the unordered table views
+    /// start as [`SENTINEL`] bytes instead of the game's bytes before the
+    /// program, so a byte the harness writes shows even when it writes the
+    /// value that was there ([`compare_view_sentinel`]).
+    pub sentinel: bool,
 }
 
 /// Where the stage dumps cut the builder's dispatches.
@@ -138,6 +143,7 @@ impl Options {
             retranslate: None,
             only: vec!["5552dac6".to_string()],
             reader: false,
+            sentinel: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -149,6 +155,7 @@ impl Options {
                 "--warp" => o.warp = true,
                 "--diagnose" => o.diagnose = true,
                 "--reader" => o.reader = true,
+                "--sentinel" => o.sentinel = true,
                 "--retranslate" => {
                     o.retranslate = Some(PathBuf::from(
                         it.next().context("--retranslate needs a file")?,
@@ -177,7 +184,7 @@ impl Options {
         }
         if o.capture.as_os_str().is_empty() {
             bail!(
-                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..] [--retranslate <dll> [--only h,h]] [--reader]"
+                "usage: bvh-harness <capture folder> [--runs N] [--all] [--barriers] [--card] [--warp] [--dump <folder>] [--diagnose] [--cuts stages|each|k,k,..] [--retranslate <dll> [--only h,h]] [--reader [--sentinel]]"
             );
         }
         Ok(o)
@@ -355,12 +362,35 @@ pub fn compare_view(pre: &[u8], game: &[u8], harness: &[u8]) -> ViewVerdict {
     v
 }
 
+/// senior 122: the byte a `--sentinel` run puts in every unordered table
+/// view before the program runs.
+pub const SENTINEL: u8 = 0xA5;
+
+/// senior 122: [`compare_view`] for a `--sentinel` run. `harness` started as
+/// [`SENTINEL`] bytes: a byte still [`SENTINEL`] was not written and stands
+/// for `pre` (what the game's memory held); `harness_changed` counts the
+/// bytes the harness wrote, even with the value `pre` had. (A byte the
+/// harness writes as 0xA5 counts as not written.)
+pub fn compare_view_sentinel(pre: &[u8], game: &[u8], harness: &[u8]) -> ViewVerdict {
+    let written = harness.iter().filter(|&&h| h != SENTINEL).count();
+    let seen: Vec<u8> = harness
+        .iter()
+        .enumerate()
+        .map(|(i, &h)| if h == SENTINEL { pre.get(i).copied().unwrap_or(SENTINEL) } else { h })
+        .collect();
+    ViewVerdict { harness_changed: written, ..compare_view(pre, game, &seen) }
+}
+
 /// The verdict over all views: "BYTE-EQUAL", "WITHIN 1" (every byte at most
 /// 1 apart: unorm rounding of another GPU), else "DIFFERENT"; "NO VIEW"
-/// without any unordered view with game bytes.
+/// without any unordered view with game bytes; senior 122: "NOT TESTED"
+/// when neither the game nor the harness changed a byte (equal bytes then
+/// prove nothing: a program that does nothing would pass too).
 pub fn reader_verdict(views: &[ViewVerdict]) -> &'static str {
     if views.is_empty() {
         "NO VIEW"
+    } else if views.iter().all(|v| v.game_changed == 0 && v.harness_changed == 0) {
+        "NOT TESTED"
     } else if views.iter().all(|v| v.differ == 0) {
         "BYTE-EQUAL"
     } else if views.iter().all(|v| v.most <= 1 && v.bytes > 0) {
@@ -747,6 +777,7 @@ fn run_prefix(
     // filled with the bytes before the program's first list; the views as
     // the game's host made them, over the buffer from its byte 0.
     let mut tbufs: BTreeMap<(u64, u64), (ID3D12Resource, bool)> = BTreeMap::new();
+    let mut sentinel_views = 0usize;
     let mut table_base: HashMap<(usize, usize), u32> = HashMap::new();
     let mut heap_views: Vec<(u32, TableView)> = Vec::new();
     for (dk, d) in &replayed {
@@ -788,8 +819,14 @@ fn run_prefix(
                     if n > STAGE {
                         bail!("table view {:#x}: {n} bytes past the upload stage", v.address);
                     }
+                    // senior 122, `--sentinel`: unordered views start as
+                    // SENTINEL bytes (a range a read view named first keeps
+                    // the game's bytes; counted in `sentinel_views`).
+                    let sentinel = vec![SENTINEL; if o.sentinel && v.kind == 2 { n as usize } else { 0 }];
+                    let fill = if sentinel.is_empty() { &v.pre[..n as usize] } else { &sentinel[..] };
+                    sentinel_views += usize::from(!sentinel.is_empty());
                     // SAFETY: inside the mapped upload buffer; the GPU is done with it.
-                    unsafe { std::ptr::copy_nonoverlapping(v.pre.as_ptr(), up, n as usize) };
+                    unsafe { std::ptr::copy_nonoverlapping(fill.as_ptr(), up, n as usize) };
                     gpu.run(|list| {
                         // SAFETY: live buffers, ranges inside them.
                         unsafe { list.CopyBufferRegion(&b, 0, &upload, 0, n) };
@@ -1317,6 +1354,10 @@ fn run_prefix(
             pages.insert(at, bytes);
         }
     }
+    if o.sentinel {
+        let uavs = tbufs.values().filter(|t| t.1).count();
+        println!("sentinel: {sentinel_views} unordered table buffers started as {SENTINEL:#04x}, {} with the game's bytes", uavs.saturating_sub(sentinel_views));
+    }
     // Unordered table views (reader captures).
     let mut view_bytes = BTreeMap::new();
     for (&key, (b, uav)) in &tbufs {
@@ -1392,7 +1433,8 @@ fn reader_main(gpu: &mut Gpu, l: &mut Loaded, o: &Options, incomplete: bool) -> 
                 println!("run {k}: {name} at {:#x}: no harness bytes", key.0);
                 continue;
             };
-            let v = compare_view(pre, post, &h[..post.len().min(h.len())]);
+            let h = &h[..post.len().min(h.len())];
+            let v = if o.sentinel { compare_view_sentinel(pre, post, h) } else { compare_view(pre, post, h) };
             println!(
                 "run {k}: {name} at {:#x} ({} bytes): differ {} (most {}), changed by the game {}, by the harness {}, first differing {:?}, {:.1} ms",
                 key.0, v.bytes, v.differ, v.most, v.game_changed, v.harness_changed, v.first, r.gpu_ms
@@ -1421,6 +1463,7 @@ fn reader_main(gpu: &mut Gpu, l: &mut Loaded, o: &Options, incomplete: bool) -> 
         println!("RESULT: {verdict}");
         match verdict {
             "BYTE-EQUAL" | "WITHIN 1" => 0,
+            "NOT TESTED" => 3,
             _ => 1,
         }
     };
@@ -2004,7 +2047,7 @@ mod tests {
         assert_eq!(Cuts::List(vec![4, 0, 99, 4]).points(&p), vec![1, 4, 7]);
     }
 
-    use super::{compare_view, reader_verdict, unsupported, view_unusable};
+    use super::{compare_view, compare_view_sentinel, reader_verdict, unsupported, view_unusable, SENTINEL};
     use crate::bvh_replay::format::*;
 
     fn view(kind: u8, register: u32, dw: u32, bytes: usize) -> TableView {
@@ -2098,6 +2141,53 @@ mod tests {
         let v = compare_view(&pre, &game, &game[..7]);
         assert_eq!(v.differ, 1);
         assert_eq!(reader_verdict(&[]), "NO VIEW");
+    }
+
+    /// senior 122 (Fable audit 3.3): equal bytes where neither side changed
+    /// anything are "NOT TESTED", never "BYTE-EQUAL" (onCap3: u52 before =
+    /// after = 127 on the game side).
+    #[test]
+    fn reader_verdict_without_any_change_is_not_tested() {
+        let pre = vec![127u8; 8];
+        let v = compare_view(&pre, &pre, &pre);
+        assert_eq!((v.differ, v.game_changed, v.harness_changed), (0, 0, 0));
+        assert_eq!(reader_verdict(&[v.clone()]), "NOT TESTED");
+        // One view with a change is enough to test.
+        let mut game = pre.clone();
+        game[3] = 0;
+        let w = compare_view(&pre, &game, &game);
+        assert_eq!(reader_verdict(&[v, w]), "BYTE-EQUAL");
+    }
+
+    /// senior 122: with the sentinel the harness's writes show even when it
+    /// writes the value the game's memory held; an untouched sentinel byte
+    /// stands for that value.
+    #[test]
+    fn sentinel_counts_writes_of_the_old_value() {
+        // The game rewrote probes 2 and 5 with 127 (= what was there).
+        let pre = vec![127u8; 8];
+        let game = pre.clone();
+        let mut h = vec![SENTINEL; 8];
+        h[2] = 127;
+        h[5] = 127;
+        let v = compare_view_sentinel(&pre, &game, &h);
+        assert_eq!((v.differ, v.game_changed, v.harness_changed), (0, 0, 2));
+        assert_eq!(reader_verdict(&[v]), "BYTE-EQUAL");
+        // A program that writes nothing is not tested, not equal.
+        let v = compare_view_sentinel(&pre, &game, &[SENTINEL; 8]);
+        assert_eq!((v.differ, v.harness_changed), (0, 0));
+        assert_eq!(reader_verdict(&[v]), "NOT TESTED");
+        // A wrong write shows as a difference against the game.
+        h[5] = 0;
+        let v = compare_view_sentinel(&pre, &game, &h);
+        assert_eq!((v.differ, v.most, v.first.clone(), v.harness_changed), (1, 127, vec![5], 2));
+        assert_eq!(reader_verdict(&[v]), "DIFFERENT");
+        // The game wrote a byte the harness left alone: different.
+        let mut game2 = pre.clone();
+        game2[1] = 0;
+        let v = compare_view_sentinel(&pre, &game2, &[SENTINEL; 8]);
+        assert_eq!((v.differ, v.game_changed, v.harness_changed), (1, 1, 0));
+        assert_eq!(reader_verdict(&[v]), "DIFFERENT");
     }
 }
 
