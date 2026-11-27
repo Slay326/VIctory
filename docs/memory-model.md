@@ -1,7 +1,8 @@
 # Memory model (stage 2 draft)
 
-Status: DRAFT for review. Decisions still open are marked
-**DECISION (Fable):**; nothing marked so is settled. Number marks:
+Status: DRAFT for review. Decisions are marked **DECISION (Fable):** and
+answered below each (block 2, block 3); after block 3 none is open except
+where an answer says what it waits for. Number marks:
 [M] measured, [C] computed by a script from measured data, [E] estimated.
 
 ## 1. Target model
@@ -34,6 +35,12 @@ stream (diagnostics, may be off) and not PageNet (page state, no notion of
 a submission). Record format: open until stage 3 has run; stage 3 needs
 none (see the lock order answer: its sync point is the `submitted` lock).
 Order: see section 6.
+
+**ANSWER (Fable, block 3):** closed for stage 3. The net as built (c4,
+50140bb) needs no per-submission record: every sync runs with `submitted`
+held, and the lock names its holder. The record format is left open on
+purpose until the stage 3 result is in (see section 6); it does not block
+this document.
 
 ## 2. Stage 1 findings (classification)
 
@@ -153,6 +160,27 @@ Open, to be checked in code before c4: that no code under `submitted`
 waits for a title thread (then a title thread faulting while holding a
 title lock could deadlock). Assumed not; not verified.
 
+**ANSWER (Fable, block 3):** built as answered, with three changes (c4,
+50140bb), all read in code and covered by tests:
+- Full order: the runtime's page lock (it reports unmaps and new mappings
+  holding it) -> `submitted` -> one sync at a time -> `OWN` (the forced
+  copy-back) -> guard -> PageNet. `victory-gpu` never calls into the
+  runtime (its one callback is the failure report), so nothing holds
+  `submitted` and waits for the page lock [read in code].
+- The fault looks at the page's state with no lock, takes `submitted`
+  first, and the guard only for the last step (demote and open). Threads
+  faulting on a page being synced wait on `submitted`, not on a state.
+- No sync ever starts under the guard lock: whatever takes the guard lock
+  for a write it announces syncs before taking it, and the guard never
+  opens a closed page (it stays closed; the next access syncs).
+- The copy-back's worker threads count as the holder of `submitted`.
+Under `submitted` the code waits for the GPU's fences and for its own
+worker threads only [read in code: `execute`, `card_fetch`,
+`copy_back_marks`]. Not verified, and on the gate sheet: that no title or
+runtime thread touches title memory by raw pointer while it holds a lock
+the submitting thread takes inside `submitted` (descriptor copies, site
+12, are the candidate). Such a case hangs; it cannot corrupt.
+
 ### H-02 (copy_back_page drops GPU bytes)
 
 Finding: if the title wrote anywhere in a 64 KiB page during a submission
@@ -177,6 +205,13 @@ forward (only if the PC 2 intersection run ties H-02 to BVH zeros).
 **ANSWER (Fable, block 2):** no diff to review yet. Not pulled forward: the
 PC 1 stream shows no H-02 case with the fixed replayer [M]; it stays tied
 to the result of the PC 2 intersection run.
+
+**ANSWER (Fable, block 3):** closed for this document: prearm is not part
+of stage 3 and no diff exists. Stage 3 does not depend on it: a page is
+closed only after a copy-back that left title memory and the copy equal,
+and a page the title wrote meanwhile is refused (counted as
+`refused_changed`). If a prearm diff is written later it gets its own
+review; H-02 stays a separate item.
 
 ## 4. First block: the 744 MB section
 
@@ -236,6 +271,32 @@ b777960 and one more fact (below).
   copy, and what share of its "up" bytes follows a copy-back's mark rather
   than a title write.
 
+**ANSWER (Fable, block 3):** GO for the 744 MB section, with the alias
+condition.
+- Evidence: measure runs of b777960 on both PCs, about 640 and 650 world
+  frames: 949,594 and 796,882 arms of the section's pages, 0 read and 0
+  write faults [M]. That is "very likely GPU-only"; the proof is the net.
+- The hypothesis above is confirmed [C, alias_copies.py]: 93.6 % (PC 1)
+  and 99.9 % (PC 2) of the section's "up" bytes follow a GPU write at
+  another address of the same physical page, 0 % a title write; 74 % and
+  49 % of the physical pages with "up" bytes are held by more than one
+  copy.
+- So, as built (c4/c5): a page is closed only while exactly one tracker,
+  the closing copy's, holds its physical page over all its addresses, and
+  all of them are under the write guard. Pages with more holders stay on
+  today's path, counted as `refused_holders`, not as demotions. A holder
+  that comes later reads title memory first, which syncs and demotes
+  (`host`). All addresses of a page close together and leave together by
+  one sync; a new mapping is closed with them; an unmap syncs first
+  (`remap`); withheld shader writes take the page out (`withheld`).
+- Consequence for the prediction: stage 3 takes only the single-holder
+  pages out of mirroring and copy-back. Most of the section's "up" traffic
+  is alias catch-up and stays. Stage 3 mainly proves the net; the gain of
+  this section needs "one copy per physical page" (section 6).
+- The block is named at run time by the section's size in bytes
+  (`VICTORY_MEMMODEL_SECTION`, from the stream's REGION record; handles
+  change from run to run).
+
 ## 5. Host write sites (c5)
 
 Copy steps write title memory today and the copy catches up at the next
@@ -264,6 +325,14 @@ log shows in steady traffic. Sites 4/5 fault on the thread holding
 `submitted`, site 1 asks the net before its kernel copy (lock order
 answer, points 4 and 5); site 10 as site 1.
 
+**ANSWER (Fable, block 3):** built so (c4/c5). All host writes and reads
+of a closed page demote with reason `host`; the log does not tell the
+sites apart yet (one counter). Added beyond the table: site 15 (the
+runtime's writes through its own view) is told before the write with the
+model on (`title_memory_will_change`), since its report comes only after
+the bytes landed and a sync then would have overwritten them; the pages
+count as being written until the report, so none is closed meanwhile.
+
 ## 6. Migration stages
 
 - Stage 3, `VICTORY_MEMMODEL=1`, default OFF: stop mirroring and copying
@@ -280,6 +349,15 @@ answer, points 4 and 5); site 10 as site 1.
   in parallel, no code. Fixed only with the stage 3 result: if its gain on
   PC 1 is well under the prediction, the time is in the synchronous wait
   and bookkeeping goes first.
+
+  **ANSWER (Fable, block 3):** changed by the alias result. Candidate
+  order for stage 4, fixed with the stage 3 numbers: (1) one copy per
+  physical page for the 744 MB section (the alias catch-up is its "up"
+  traffic and the reason most of its pages cannot be GPU-only), (2) the
+  GPU-only part of the 6.5 GB section, (3) per-submission bookkeeping.
+  (1) goes first if `refused_holders` is the large number in the stage 3
+  log on both PCs; if instead few pages are refused and the gain is still
+  small, the time is in the synchronous wait and (3) goes first.
 
 ## 7. Risks
 
@@ -306,6 +384,21 @@ Gate before the first stage 3 game run (all required):
    parsed, switch default off.
 7. Prediction (ms, MB) written down before the run; fixed capture frames
    for the PC 2 image check.
+
+Added with the code (block 3, `block1/pagenet` aad9013):
+- Point 4 is met in the unit tests: 24 mutations of the net, all red
+  (`pagenet-mutate4.py`).
+- Point 6 covers three variables: `VICTORY_MEMMODEL`,
+  `VICTORY_MEMMODEL_SECTION` (the section's size in bytes; without it
+  nothing is closed) and `VICTORY_MEMMODEL_OUT` (the log file).
+- In every stage 3 run the summary line must show `forced_failed=0` and
+  `cannot_sync=0`; anything else ends the run's validity (a sync that had
+  nothing to copy from, or a closed page met where no sync could run).
+- Before the first run: no `gpu_w_kept` record (withheld shader writes) on
+  the section in either stream; the section's exact size from both
+  streams; the count of single-holder pages (what stage 3 can close).
+- Known gap, compared run against run: a system call of the title's that
+  reads from a closed page fails instead of faulting.
 
 After the gate: cargo test --workspace green; PC 1 A-B-A(-B-A) against
 the `play` baseline (frame breakdown, RAM, VRAM, fps with spread from clean
