@@ -1291,6 +1291,10 @@ impl State {
             map.note_builder();
         }
         #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::reader::plan().is_some() {
+            self.note_reader(list, p, None);
+        }
+        #[cfg(feature = "diagnostics")]
         if crate::bvh_replay::capture::enabled() {
             let builder = crate::pipeline::is_builder(self.pipeline as This);
             crate::bvh_replay::capture::record(
@@ -1622,6 +1626,80 @@ impl State {
                 list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len)));
             }
         }
+    }
+
+    /// With `VICTORY_READER_CAPTURE` and the bound program the reader's
+    /// (`crate::bvh_replay::reader`): its table views u52, t373 and t379
+    /// (by kind and register), the indirect arguments at `arguments`
+    /// (`stride` bytes, none for a direct dispatch) and the root constants,
+    /// noted on the list for after its fence.
+    #[cfg(feature = "diagnostics")]
+    fn note_reader(&self, list: &HostList, p: &HostPipeline, arguments: Option<(u64, u32)>) {
+        use crate::bvh_replay::reader;
+        let Some(stage) = p.stages.first() else { return };
+        if !reader::wanted_now(&stage.shader.hash) {
+            return;
+        }
+        let Some(plan) = reader::plan() else { return };
+        let mut ranges = Vec::new();
+        let mut used = Vec::new();
+        for u in &stage.translated().used {
+            let uav = u.kind == ResourceType::Uav;
+            used.push(format!("{:?} r{} slot {} dw {}", u.kind, u.lower_bound, u.slot, u.table_offset_dwords));
+            if !plan.views.contains(&(uav, u.lower_bound)) || !(uav || u.kind == ResourceType::Srv) {
+                continue;
+            }
+            let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot))) else {
+                continue;
+            };
+            let name = format!("{}{}", if uav { 'u' } else { 't' }, u.lower_bound);
+            let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                continue;
+            };
+            let (format, stride) = crate::descriptor::host::buffer_format(&view);
+            let Some((copy, address, len)) = crate::descriptor::host::view_copy(&view) else {
+                // A range with no copy: noted, so that the self-check fails.
+                if let Some((address, len)) = crate::descriptor::host::buffer_range(&view) {
+                    ranges.push(reader::Range { name, address, len, format, stride, copy: None });
+                }
+                continue;
+            };
+            // The view's own copy (off its copy's elements) is not the one
+            // title memory goes back from: that one too, apart.
+            if let Some(main) = crate::shadow::find(address, len).filter(|m| !std::sync::Arc::ptr_eq(m, &copy)) {
+                let name = format!("{name}m");
+                ranges.push(reader::Range { name, address, len, format, stride, copy: Some(main) });
+            }
+            ranges.push(reader::Range { name, address, len, format, stride, copy: Some(copy) });
+        }
+        if let Some((address, stride)) = arguments {
+            let len = u64::from(stride.max(12));
+            ranges.push(reader::Range {
+                name: "args".into(),
+                address,
+                len,
+                format: 0,
+                stride: 4,
+                copy: crate::shadow::find(address, len),
+            });
+        }
+        let constants = self
+            .roots_ref(true)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Root::Constants(v) => Some((i as u32, v.clone())),
+                _ => None,
+            })
+            .collect();
+        list.push_reader(reader::Recorded {
+            shader: stage.shader.hash.clone(),
+            pipeline: p.name.clone(),
+            indirect: arguments.is_some(),
+            ranges,
+            constants,
+            used,
+        });
     }
 
     /// With `VICTORY_DUMP_AFTER` naming one of the bound pipeline's shader
@@ -2106,6 +2184,13 @@ impl State {
                 },
                 std::mem::take(&mut self.bvh_args),
             );
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH
+            && crate::bvh_replay::reader::plan().is_some()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            self.note_reader(list, p, Some((arguments, stride)));
         }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.

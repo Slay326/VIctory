@@ -1079,6 +1079,18 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
+/// A buffer view's format (host DXGI value) and element stride
+/// (`VICTORY_READER_CAPTURE`, `crate::bvh_replay::reader`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffer_format(view: &View) -> (u32, u32) {
+    let words: Option<&[u32; 10]> = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) => Some(desc),
+        View::Placed(_, resource, desc) if resource[0] == 1 => desc[..10].try_into().ok(),
+        _ => None,
+    };
+    (words.map_or(0, |w| crate::resource::pc_format(w[0])), view_stride(view))
+}
+
 /// The byte stride of a buffer view (its element size, at least 1), 0 for
 /// other views: what the view-stride table holds for it.
 fn view_stride(view: &View) -> u32 {
