@@ -706,6 +706,8 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
     };
     if !is_header(h[0], h[1]) {
         fail(&mut c, format!("dword 0/1 {:#x}/{}", h[0], h[1]));
+    } else if (h[0] >> 16) & PACKED != 0 {
+        return check_packed(read, base, &h);
     }
     let bytes = u64::from(h[1]) * 64 + extra;
     let root = h[12];
@@ -721,7 +723,9 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
         fail(&mut c, format!("bounds {bounds:?}"));
     }
     let parents = h[14] as i32 as i64;
-    let mut queue = vec![(root, bounds, true)];
+    // Node boxes of a structure with a scale word (rehydrated ones) are in
+    // stored units, the header's bounds in object units.
+    let mut queue = vec![(root, to_stored(h[15], &bounds), true)];
     let mut seen = std::collections::HashSet::new();
     while let Some((p, bounds, is_root)) = queue.pop() {
         let kind = p & 7;
@@ -782,6 +786,209 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
             fail(&mut c, format!("root node empty with {} elements", h[3]));
         }
     }
+    c.valid = c.why.is_none();
+    c
+}
+
+/// Header dword 0 mark (high half): the structure is still packed.
+const PACKED: u32 = 0x100;
+
+/// The header bounds in the units the nodes are stored in. Dword 15 with
+/// bit 31 set is a scale word (packed and rehydrated bottom levels, e.g.
+/// 0x808e8e8d): axis a is stored in units of 2^(e_a - 127), e_a = byte a
+/// (x = byte 0), and with bit 30 set relative to the center 0.5 (min + max)
+/// of the header bounds (190fbf0e, Fable H-06b 3). Without bit 31 (built
+/// ones, 0x007f7f7f) the units are the same. Read from capture data
+/// (senior 81), unverified.
+fn to_stored(d15: u32, b: &Aabb) -> Aabb {
+    if d15 & 0x8000_0000 == 0 {
+        return *b;
+    }
+    let mut out = *b;
+    for a in 0..3 {
+        let unit = 2f32.powi(127 - ((d15 >> (8 * a)) & 0xff) as i32);
+        let center = if d15 & 0x4000_0000 != 0 { 0.5 * (b.0[a] + b.1[a]) } else { 0.0 };
+        out.0[a] = (b.0[a] - center) / unit;
+        out.1[a] = (b.1[a] - center) / unit;
+    }
+    out
+}
+
+/// A packed node word: its children (bits 24..31, 1 to 4) and the mask of
+/// the box components stored as f32 after its group's pointers (bits 0..23,
+/// bit 6 x child + component; components min x, y, z, max x, y, z).
+fn node_word(w: u32) -> Option<(usize, u32)> {
+    let children = (w >> 24) as usize;
+    (1..=4).contains(&children).then_some((children, w & 0xff_ffff))
+}
+
+/// A group of packed box nodes: where it starts and each node's children.
+struct Group {
+    at: u64,
+    children: Vec<Vec<u32>>,
+}
+
+/// The box nodes of a packed structure ([`check_packed`]), group by group.
+fn packed_groups(read: &dyn Fn(u64) -> Option<u32>, base: u64, h: &[u32]) -> Result<Vec<Group>, String> {
+    let size = u64::from(h[1]) * 64;
+    let word = |o: u64| read(base + o).ok_or_else(|| format!("node word +{o:#x} not read"));
+    let mut groups = Vec::new();
+    let mut s = u64::from(h[10]);
+    while s < size {
+        let w0 = word(s)?;
+        if w0 == 0 {
+            // Padding (a box32 node's second half, a group's unused slots),
+            // or the trailer some large structures end with (e.g. 0x1080,
+            // or 0x4b00 0x5100 0x6600 in the last words): nothing past it is
+            // parsed, nodes there count as missing in the walk.
+            let mut empty = true;
+            for i in 0..16 {
+                empty &= word(s + 4 * i)? == 0;
+            }
+            if !empty {
+                break;
+            }
+            s += 64;
+            continue;
+        }
+        let mut words = Vec::new();
+        while let Some(w) = node_word(word(s + 4 * words.len() as u64)?) {
+            words.push(w);
+        }
+        if words.is_empty() {
+            return Err(format!("slot +{s:#x} word 0 {w0:#x} not a node word"));
+        }
+        let mut o = s + 4 * words.len() as u64;
+        let mut children = Vec::with_capacity(words.len());
+        for &(n, _) in &words {
+            let mut node = Vec::with_capacity(n);
+            for _ in 0..n {
+                node.push(word(o)?);
+                o += 4;
+            }
+            children.push(node);
+        }
+        o += 4 * words.iter().map(|&(_, mask)| u64::from(mask.count_ones())).sum::<u64>();
+        if o > size {
+            return Err(format!("group +{s:#x} past the size"));
+        }
+        let next = (o + 63) & !63;
+        while o < next {
+            if word(o)? != 0 {
+                return Err(format!("group +{s:#x} tail not zero at +{o:#x}"));
+            }
+            o += 4;
+        }
+        groups.push(Group { at: s, children });
+        s = next;
+    }
+    Ok(groups)
+}
+
+/// From the root down through packed groups: every box node reached once,
+/// leaves (types 0-3) in the leaf area and each reached once. A group's
+/// stride is 64 bytes for box16 nodes (pointer type 4) and 128 for box32
+/// (type 5), known only from the pointers. Box nodes and leaves reached.
+fn packed_walk(groups: &[Group], root: u32, h: &[u32]) -> Result<(u32, u32), String> {
+    let size = u64::from(h[1]) * 64;
+    let (boxes, leaves_at) = (u64::from(h[10]), u64::from(h[13]));
+    let at = |p: u32| u64::from(p & !7) << 3;
+    let mut stride = vec![0u64; groups.len()];
+    let mut seen = std::collections::HashSet::new();
+    let mut leaves = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+        let (a, step) = (at(p), if p & 7 == 4 { 64 } else { 128 });
+        let node = groups
+            .partition_point(|g| g.at <= a)
+            .checked_sub(1)
+            .map(|g| (g, a - groups[g].at))
+            .filter(|&(g, off)| off % step == 0 && ((off / step) as usize) < groups[g].children.len());
+        let Some((g, off)) = node else {
+            return Err(format!("box pointer {p:#x} to no node"));
+        };
+        if stride[g] != 0 && stride[g] != step {
+            return Err(format!("group +{:#x} reached as box16 and box32", groups[g].at));
+        }
+        stride[g] = step;
+        if !seen.insert(a) {
+            return Err(format!("node +{a:#x} reached twice"));
+        }
+        for &child in &groups[g].children[(off / step) as usize] {
+            match child & 7 {
+                4 | 5 if (boxes..size).contains(&at(child)) => stack.push(child),
+                0..=3 if (leaves_at..boxes).contains(&at(child)) => {
+                    if !leaves.insert(at(child)) {
+                        return Err(format!("leaf {child:#x} reached twice"));
+                    }
+                }
+                _ => return Err(format!("child {child:#x} of +{a:#x} outside its area")),
+            }
+        }
+    }
+    let nodes: usize = groups.iter().map(|g| g.children.len()).sum();
+    if seen.len() != nodes {
+        return Err(format!("{} of {nodes} box nodes reached", seen.len()));
+    }
+    for (g, group) in groups.iter().enumerate() {
+        let end = groups.get(g + 1).map_or(size, |next| next.at);
+        if group.at + group.children.len() as u64 * stride[g] > end {
+            return Err(format!("group +{:#x} of {} nodes overlaps the next", group.at, group.children.len()));
+        }
+    }
+    Ok((seen.len() as u32, leaves.len() as u32))
+}
+
+/// Checks a still packed bottom level (mark 0x100, e.g. 0x8102_0006; format
+/// read from capture data by senior 81, unverified, see
+/// bvh-harness-design-fable.md "Gepacktes BLAS-Format"). Its box nodes hold
+/// no boxes, only the tree: from dword 10 on, groups of n nodes stored as n
+/// node words ([`node_word`]), then all their child pointers in node order,
+/// then the f32 box components the masks name, zeros up to the next 64-byte
+/// slot. The leaves [dword 13, dword 10) are a compressed stream (vertices
+/// come from the geometry at rehydration) and are not decoded. Checked: the
+/// header bounds (finite, not the start values), the offsets, the scale
+/// word (dword 15), and the tree: every node reached once, every leaf once,
+/// as many leaves as dword 3 counts. Words not read make it not valid.
+pub(crate) fn check_packed(read: &dyn Fn(u64) -> Option<u32>, base: u64, h: &[u32]) -> Check {
+    let mut c = Check::default();
+    let why = (|| {
+        let size = u64::from(h[1]) * 64;
+        let (boxes, leaves, elements) = (u64::from(h[10]), u64::from(h[13]), u64::from(h[3]));
+        let f = |i: usize| f32::from_bits(h[i]);
+        let bounds: Aabb = ([f(4), f(5), f(6)], [f(7), f(8), f(9)]);
+        if h[0] >> 16 & 0x8000 == 0 {
+            return Err(format!("dword 0 {:#x}: packed but not bottom level", h[0]));
+        }
+        if (4..10).any(|i| f(i).abs() == f32::MAX) {
+            return Err("bounds +-FLT_MAX (start values)".into());
+        }
+        if (4..10).any(|i| !f(i).is_finite()) || empty(&bounds) {
+            return Err(format!("bounds {bounds:?}"));
+        }
+        if !(64 <= leaves && leaves < boxes && boxes < size && leaves % 64 == 0 && boxes % 64 == 0) {
+            return Err(format!("offsets leaves {leaves:#x} boxes {boxes:#x} (size {size:#x})"));
+        }
+        if leaves + 64 * elements > boxes {
+            return Err(format!("{elements} leaves past the box nodes"));
+        }
+        if h[15] & 0x8000_0000 == 0 || h[15] & 0x3f00_0000 != 0 {
+            return Err(format!("dword 15 {:#x} not a scale word", h[15]));
+        }
+        let root = h[12];
+        let at = u64::from(root & !7) << 3;
+        if !(root & 7 == 4 || root & 7 == 5) || !(boxes..size).contains(&at) {
+            return Err(format!("root +48 {root:#x} (size {size:#x})"));
+        }
+        let groups = packed_groups(read, base, h).inspect_err(|_| c.missing += 1)?;
+        let (nodes, reached) = packed_walk(&groups, root, h)?;
+        c.boxes = nodes;
+        if u64::from(reached) != elements {
+            return Err(format!("{reached} leaves reached, dword 3 counts {elements}"));
+        }
+        Ok(())
+    })();
+    c.why = why.err();
     c.valid = c.why.is_none();
     c
 }
@@ -861,6 +1068,110 @@ mod tests {
         let mut w = good;
         w[21] = 0x4400_0000;
         assert!(check(&read_of(&w, base), base).why.unwrap().contains("outside"));
+    }
+
+    /// A small packed bottom level of 144 dwords: header, parent area at
+    /// +64, three leaf slots at +128, a group of two box16 nodes at +320
+    /// (node 0: leaves +128 and +192; node 1: leaf +256 with its box stored
+    /// as six f32, mask 0x3f), a box32 root at +448 with the two nodes.
+    fn mini_packed() -> [u32; 144] {
+        let mut w = [0u32; 144];
+        let one = 1f32.to_bits();
+        w[0] = 0x8102 << 16 | 6;
+        w[1] = 9;
+        w[3] = 3;
+        w[4..10].copy_from_slice(&[0, 0, 0, one, one, one]);
+        w[10] = 320;
+        w[12] = (448 >> 3) | 5;
+        w[13] = 128;
+        w[14] = 64;
+        w[15] = 0x8090_8f8f;
+        w[80..85].copy_from_slice(&[0x0200_0000, 0x0100_003f, 128 >> 3, 192 >> 3, 256 >> 3]);
+        w[85..91].copy_from_slice(&[0, 0, 0, 0x4000_0000, 0x4000_0000, 0x4000_0000]);
+        w[112..115].copy_from_slice(&[0x0200_0000, (320 >> 3) | 4, (384 >> 3) | 4]);
+        w
+    }
+
+    #[test]
+    fn a_packed_structure_passes_and_broken_ones_do_not() {
+        let base = 0x2000;
+        let good = mini_packed();
+        let c = check(&read_of(&good, base), base);
+        assert!(c.valid, "{c:?}");
+        assert_eq!(c.boxes, 3);
+        let why = |w: &[u32]| check(&read_of(w, base), base).why.unwrap_or_default();
+        // A leaf reached twice (node 1 names node 0's first leaf).
+        let mut w = good;
+        w[84] = 128 >> 3;
+        assert!(why(&w).contains("reached twice"), "{}", why(&w));
+        // A child pointer to no node.
+        let mut w = good;
+        w[114] = (512 >> 3) | 4;
+        assert!(!why(&w).is_empty());
+        // More elements than leaves in the tree.
+        let mut w = good;
+        w[3] = 4;
+        assert!(why(&w).contains("leaves"), "{}", why(&w));
+        // The builder's start values in the bounds.
+        let mut w = good;
+        w[4] = f32::MAX.to_bits();
+        assert!(why(&w).contains("FLT_MAX"));
+        // A mask naming one stored f32 too few: the sixth is left over.
+        let mut w = good;
+        w[81] = 0x0100_001f;
+        assert!(!why(&w).is_empty());
+    }
+
+    #[test]
+    fn rehydrated_boxes_are_compared_in_stored_units() {
+        // Scale word 0x8080_8080: every axis stored in units of 2^(128 - 127),
+        // so the header's 0..1 is 0..2 in the nodes.
+        let base = 0x1000;
+        let mut w = mini_bvh();
+        w[0] = 0x8002 << 16 | 6;
+        w[15] = 0x8080_8080;
+        w[20..23].copy_from_slice(&[0x0000_0000, 0x4000_0000, 0x4000_4000]);
+        let c = check(&read_of(&w, base), base);
+        assert!(c.valid, "{c:?}");
+        // 0..4 stored is 0..2 in object units, outside the header's 0..1.
+        w[21] = 0x4400_0000;
+        assert!(check(&read_of(&w, base), base).why.unwrap().contains("outside"));
+        // With the center bit the stored box is around the center 0.5.
+        let mut w = mini_bvh();
+        w[15] = 0xc080_8080;
+        w[20..23].copy_from_slice(&[0xbc00_bc00, 0x3c00_bc00, 0x3c00_3c00]);
+        assert!(check(&read_of(&w, base), base).valid);
+    }
+
+    /// Real packed structures extracted from a capture (senior 81,
+    /// extract_samples.py: 8 bytes base address, then the structure), named
+    /// by `VICTORY_BVH_PACKED_SAMPLES` (files separated by ';'): each valid,
+    /// and not valid with one more element in dword 3 or its root's node word
+    /// cleared. Game data, so not in the repository: `cargo test -p
+    /// victory-gpu --lib packed_samples -- --ignored`.
+    #[test]
+    #[ignore = "needs VICTORY_BVH_PACKED_SAMPLES (structures from a capture)"]
+    fn packed_samples_from_a_capture() {
+        let files = std::env::var("VICTORY_BVH_PACKED_SAMPLES").expect("VICTORY_BVH_PACKED_SAMPLES");
+        let mut n = 0;
+        for file in files.split(';').filter(|f| !f.trim().is_empty()) {
+            let bytes = std::fs::read(file.trim()).unwrap();
+            let base = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let good: Vec<u32> = bytes[8..].chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            let c = check(&read_of(&good, base), base);
+            assert!(c.valid, "{file}: {c:?}");
+            let mut w = good.clone();
+            w[3] += 1;
+            assert!(!check(&read_of(&w, base), base).valid, "{file}: one more element");
+            let mut w = good.clone();
+            let root = ((w[12] & !7) << 1) as usize;
+            w[root] = 0;
+            let c = check(&read_of(&w, base), base);
+            assert!(!c.valid, "{file}: root node word cleared");
+            println!("{file}: valid ({} box nodes); broken copies not valid ({})", check(&read_of(&good, base), base).boxes, c.why.unwrap());
+            n += 1;
+        }
+        assert!(n > 0);
     }
 
     #[test]
