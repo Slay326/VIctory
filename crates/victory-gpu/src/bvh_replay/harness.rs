@@ -1416,6 +1416,20 @@ fn stages(
                 println!("  run {r} {t:#x}: {}", invariants(&read, t));
             }
         }
+        // The pages after this cut, every run (`--dump`): cut<k>-run<r>.
+        if let Some(dir) = &o.dump {
+            std::fs::create_dir_all(dir)?;
+            for (r, res) in results.iter().enumerate() {
+                let mut index = String::new();
+                let mut bytes = Vec::new();
+                for (at, b) in &res.pages {
+                    index.push_str(&format!("{at:#x} {} {}\n", bytes.len(), b.len()));
+                    bytes.extend_from_slice(b);
+                }
+                std::fs::write(dir.join(format!("cut{k}-run{r}.index")), index)?;
+                std::fs::write(dir.join(format!("cut{k}-run{r}.pages")), bytes)?;
+            }
+        }
         before = now;
     }
     Ok(0)
