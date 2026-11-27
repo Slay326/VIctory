@@ -1463,6 +1463,24 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        // With the memory model: what this submission may withhold is no
+        // GPU-only page when its lists run (`may_be_withheld`). Such a page
+        // gets the GPU's bytes in title memory here, the bytes to go back
+        // to; found out after the lists ran, there would be none.
+        if crate::watch::net::model_on() {
+            let mut declared: Vec<(usize, usize, usize, bool)> = Vec::new();
+            for list in runs {
+                declared.extend(list.deferred().copies.iter().filter_map(|step| match step {
+                    Step::GpuWrite(shadow, address, len, _, memory) => {
+                        Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *len, *memory))
+                    }
+                    _ => None,
+                }));
+            }
+            for (address, len) in may_be_withheld(declared) {
+                crate::watch::net::program_writes(address, len);
+            }
+        }
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -2668,6 +2686,31 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Of the ranges a submission's lists declare for their shaders' writes
+/// (copy, address, bytes, whether the writing program uses title memory):
+/// the ranges (address, bytes) `Host::execute` keeps out of title memory
+/// if a list of the submission misses memory, or one did lately
+/// (`crate::memory::withholding`). Those are every range of a program
+/// using title memory, and every other range overlapping one of them in
+/// the same copy, which is withheld with it.
+fn may_be_withheld(mut declared: Vec<(usize, usize, usize, bool)>) -> Vec<(usize, usize)> {
+    // The world's lists declare the same ranges dozens of times.
+    declared.sort_unstable();
+    declared.dedup();
+    let programs: Vec<(usize, usize, usize)> =
+        declared.iter().filter(|d| d.3).map(|&(copy, address, len, _)| (copy, address, len)).collect();
+    if programs.is_empty() {
+        return Vec::new();
+    }
+    declared
+        .iter()
+        .filter(|&&(copy, address, len, memory)| {
+            memory || programs.iter().any(|&(c, a, n)| c == copy && a < address + len && address < a + n)
+        })
+        .map(|&(_, address, len, _)| (address, len))
+        .collect()
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -4278,6 +4321,110 @@ mod batch {   // `mod tests` is already taken at the top of this file
 
 #[cfg(test)]
 mod withholding {
+    /// What a submission may keep out of title memory is known from what
+    /// its lists declare: the ranges of programs using title memory, and
+    /// the ranges of others that overlap one of those in the same copy.
+    #[test]
+    fn what_a_submission_may_withhold_is_known_before_it_runs() {
+        // (copy, address, bytes, the writer uses title memory)
+        let declared = vec![
+            (1, 0x1000, 0x100, false),
+            (1, 0x2000, 0x100, true),
+            (1, 0x20f0, 0x100, false),
+            (1, 0x2100, 0x10, false),
+            (1, 0x1ff0, 0x10, false),
+            (2, 0x2000, 0x100, false),
+            (1, 0x2000, 0x100, true),
+            (1, 0x20f0, 0x100, false),
+            (3, 0x5000, 0, true),
+        ];
+        assert_eq!(
+            super::may_be_withheld(declared.clone()),
+            [(0x2000, 0x100), (0x20f0, 0x100), (0x5000, 0)],
+            "each once; not what only touches, nor another copy's"
+        );
+        let none: Vec<_> = declared.into_iter().filter(|d| !d.3).collect();
+        assert!(super::may_be_withheld(none).is_empty(), "no program using title memory: nothing");
+    }
+
+    /// With the memory model, a submission whose list misses memory drops
+    /// what its programs using title memory wrote exactly as without the
+    /// model, also from pages that were GPU-only: the ranges such a list
+    /// declares (and the ranges withheld with them) leave the class before
+    /// the lists run, with the GPU's earlier bytes in title memory, so the
+    /// title never sees the withheld bytes and the copy takes the earlier
+    /// ones again. A page no list of it declares stays GPU-only.
+    #[test]
+    fn a_submission_that_misses_withholds_from_pages_that_were_gpu_only() {
+        use crate::pagenet::{DemoteReason, State};
+        use crate::watch::net::{self, TEST_MODEL, TEST_SECTION, Way};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile};
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // A section size no other test has: the submission takes the marks
+        // of every test running, with the model on for this thread.
+        const PAGES: usize = 7;
+        let len = PAGES * PAGE;
+        TEST_MODEL.set(true);
+        TEST_SECTION.set(Some(len));
+        let (section, p, second) = crate::watch::tests::reported_section(PAGES);
+        // SAFETY: the fresh view, not guarded yet.
+        unsafe { (p as *mut u8).write_bytes(0x11, len) };
+        // SAFETY: the section, mapped once more where nobody knows of it.
+        let peek = unsafe { MapViewOfFile(section as _, FILE_MAP_READ, 0, 0, len) }.Value as usize;
+        assert!(peek != 0);
+        // SAFETY: bytes of that view.
+        let physical = |at: usize| unsafe { ((peek + at) as *const u8).read_volatile() };
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        copy.update(p, len);
+        for k in 0..3 {
+            net::close(p / PAGE + k, Way::Marked, &copy);
+            assert_eq!(net::tests::state(p / PAGE + k), State::GpuOnlyArmed, "page {k}");
+            // An earlier submission's write, whose copy-back was skipped.
+            copy.write_host((p + k * PAGE + 16) as u64, &[0xb0 + k as u8]);
+        }
+        assert_eq!((physical(16), physical(PAGE + 16)), (0x11, 0x11), "only in the copy");
+        let list = host.new_list().unwrap();
+        // (start, bytes, the writer uses title memory, where it writes, the byte)
+        let writes = [(0, 32, true, 24, 0xee), (16, PAGE + 16, false, PAGE + 20, 0x44)];
+        for &(at, bytes, memory, to, value) in &writes {
+            let _writer = list.writer_uses_memory(memory);
+            let (copy, address) = (copy.clone(), (p + at) as u64);
+            copy.refresh(&list, address, bytes as u64);
+            copy.gpu_writes(&list, address, bytes as u64, false);
+            // The shader's write, after the step that keeps the range's bytes.
+            list.defer_host(move || copy.write_host((p + to) as u64, &[value]));
+        }
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        for k in 0..2 {
+            assert_eq!(net::tests::state(p / PAGE + k), State::Demoted, "page {k}");
+            assert_eq!(net::tests::demotion(p / PAGE + k), Some((DemoteReason::Program, 2)), "page {k}: before the lists ran");
+        }
+        assert_eq!((physical(16), physical(PAGE + 16)), (0xb0, 0xb1), "the earlier bytes are in title memory");
+        assert_eq!(physical(24), 0x11, "withheld: never in title memory");
+        assert_eq!(physical(PAGE + 20), 0x11, "nor what was withheld with it");
+        copy.update(p, len);
+        let host_copy = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        assert_eq!((host_copy(16), host_copy(24)), (0xb0, 0x11), "the copy took the bytes from before");
+        assert_eq!((host_copy(PAGE + 16), host_copy(PAGE + 20)), (0xb1, 0x11));
+        assert_eq!(net::tests::demotions_of(&[p / PAGE, p / PAGE + 1, second / PAGE, second / PAGE + 1]), 2);
+        // Page 2: declared by no list.
+        assert_eq!(net::tests::state(p / PAGE + 2), State::GpuOnlyArmed, "stays GPU-only");
+        assert_eq!(physical(2 * PAGE + 16), 0x11);
+        // SAFETY: a byte of the title's view; closed: the handler syncs it.
+        assert_eq!(unsafe { ((p + 2 * PAGE + 16) as *const u8).read_volatile() }, 0xb2, "until the title reads it");
+        crate::shadow::unregister(p, p as u64);
+        drop((list, copy));
+        crate::watch::title_memory_section_gone(section);
+        TEST_SECTION.set(None);
+        TEST_MODEL.set(false);
+    }
+
     /// A list in which a program using title memory missed memory: what
     /// that program wrote is withheld from title memory and leaves the
     /// copies at once; what an ordinary program wrote in the same list goes

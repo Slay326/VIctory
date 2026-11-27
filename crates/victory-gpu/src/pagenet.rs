@@ -122,6 +122,10 @@ pub enum DemoteReason {
     /// a page with no bytes in title memory cannot do: the GPU's bytes
     /// were kept instead.
     Withheld,
+    /// A program using title memory writes the page, or may: what such
+    /// programs write is dropped again when a list of theirs read memory
+    /// with no copy, and only title memory has the bytes from before.
+    Program,
 }
 
 /// What [`PageNet::arm_group`] did.

@@ -542,7 +542,8 @@ fn report(net: &PageNet<Win>, frame: u64) -> String {
 //   copy step, a kernel write the runtime announces;
 // - one of its addresses going away ([`remapped`]), or a new one that
 //   cannot be closed ([`aliased`]);
-// - shaders' writes to it being withheld ([`withheld`]).
+// - shaders' writes to it being withheld ([`withheld`]);
+// - a program using title memory writing it ([`program_writes`]).
 //
 // Which pages: only where exactly one tracker, the closing copy's, holds the
 // physical page over all its addresses ([`eligible`]). Another host copy of
@@ -551,6 +552,19 @@ fn report(net: &PageNet<Win>, frame: u64) -> String {
 // copy-back skipped it would go stale without any CPU access, which no
 // fault catches. A tracker that comes later starts with every page changed
 // and reads title memory before it uses a byte, which syncs.
+//
+// And never a page that programs using title memory write
+// ([`program_writes`]). What they wrote is dropped from the copies when a
+// list of theirs read memory with no copy (`crate::memory::withholding`),
+// known only once the list has run: the copies take title memory's bytes
+// again, which are the bytes from before only where every copy-back went
+// there. A closed page has none (its sync could only keep what should have
+// been dropped), so their pages stay on the way through title memory: told
+// before a submission runs where a list declares them, and after it, when
+// its writes go back, where shaders marked or computed them. What is left
+// to [`withheld`] is a page such a program writes for the first time in the
+// very submission that is withheld, through a view no list declared or at a
+// computed address (`demoted_withheld`: a run's sign that it happened).
 //
 // Locks, in order: the runtime's page lock (it calls `remapped` and
 // `aliased` holding it); the submission lock and `SYNC` ([`idle`]); `OWN`
@@ -599,9 +613,11 @@ pub(crate) enum Refusal {
     Changed,
     /// The net refused: demoted before, or an address could not be closed.
     Net,
+    /// A program using title memory writes it ([`program_writes`]).
+    Program,
 }
 
-const REFUSALS: usize = 5;
+const REFUSALS: usize = 6;
 
 /// Pages closed by [`Way`], copy-backs skipped by [`Way`], pages not closed
 /// by [`Refusal`].
@@ -640,7 +656,7 @@ fn section_asked(value: Option<&str>) -> usize {
     }
 }
 
-const REASONS: usize = 5;
+const REASONS: usize = 6;
 /// Pages demoted by [`DemoteReason`] (counted as they are logged).
 static DEMOTED: [AtomicU64; REASONS] = [const { AtomicU64::new(0) }; REASONS];
 
@@ -651,6 +667,7 @@ fn reason_name(reason: DemoteReason) -> (usize, &'static str) {
         DemoteReason::Host => (2, "host"),
         DemoteReason::Remap => (3, "remap"),
         DemoteReason::Withheld => (4, "withheld"),
+        DemoteReason::Program => (5, "program"),
     }
 }
 
@@ -715,7 +732,8 @@ fn model_frame(net: &PageNet<Win>, frame: u64) {
 /// reason; demotions (pages whose access did it), by reason; syncs; title
 /// faults on closed pages; and what must stay 0: syncs that did not land
 /// (`forced_failed`), closed pages met where no sync could run
-/// (`cannot_sync`).
+/// (`cannot_sync`). Last, added later: pages not closed because programs
+/// using title memory write them, and pages demoted when one did.
 fn model_summary(net: &PageNet<Win>, frame: u64) -> String {
     let stats = net.stats();
     let load = |n: &AtomicU64| n.load(Relaxed);
@@ -724,7 +742,8 @@ fn model_summary(net: &PageNet<Win>, frame: u64) -> String {
          skipped_computed={} skipped_declared={} skipped_marked={} \
          refused_section={} refused_holders={} refused_unguarded={} refused_changed={} refused_net={} refused_demoted={} \
          demoted_cpu_read={} demoted_cpu_write={} demoted_host={} demoted_remap={} demoted_withheld={} \
-         syncs={} read_faults={} write_faults={} forced_failed={} cannot_sync={} open_refused={}",
+         syncs={} read_faults={} write_faults={} forced_failed={} cannot_sync={} open_refused={} \
+         refused_program={} demoted_program={}",
         net.closed(),
         load(&CLOSED[Way::Computed as usize]),
         load(&CLOSED[Way::Declared as usize]),
@@ -749,6 +768,8 @@ fn model_summary(net: &PageNet<Win>, frame: u64) -> String {
         load(&FORCED_FAILED),
         load(&CANNOT_SYNC),
         load(&OPEN_REFUSED),
+        load(&REFUSED[Refusal::Program as usize]),
+        load(&DEMOTED[5]),
     )
 }
 
@@ -881,6 +902,10 @@ pub(crate) fn close(page: usize, way: Way, copy: &Shadow) {
         // Under the lock already: a copy-back does not run there.
         let g = g?;
         match eligible(g, page, t) {
+            Ok(group) if written_by_programs(&group) => {
+                REFUSED[Refusal::Program as usize].fetch_add(1, Relaxed);
+                None
+            }
             Ok(group) => Some(net.arm_group(&group)),
             Err(why) => {
                 REFUSED[why as usize].fetch_add(1, Relaxed);
@@ -929,8 +954,86 @@ pub(crate) fn kept(page: usize, copy: &Shadow) -> bool {
 /// back to, so they keep the GPU's and leave the class.
 pub(super) fn withheld(first: usize, last: usize) {
     let Some(net) = net() else { return };
-    if net.mode() == Mode::Net && net.any_armed() {
+    if net.mode() != Mode::Net {
+        return;
+    }
+    // Programs using title memory wrote there (or a range overlapping
+    // theirs was withheld with it): no GPU-only pages from now on.
+    ranges_add(&mut programs(), first, last);
+    if net.any_armed() {
         demote_closed(net, first, last, DemoteReason::Withheld);
+    }
+}
+
+/// Title memory that programs using title memory write (page numbers, as
+/// ranges that neither overlap nor touch: first page to the page after the
+/// last). Kept for good, also when the memory is unmapped: what is mapped
+/// there next is then not closed either, which costs speed only.
+static PROGRAMS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn programs() -> std::sync::MutexGuard<'static, BTreeMap<usize, usize>> {
+    PROGRAMS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether `ranges` hold a page of `[first, last)`.
+fn ranges_hold(ranges: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    // The last range starting before `last` ends latest of those that do.
+    ranges.range(..last).next_back().is_some_and(|(_, &end)| end > first)
+}
+
+/// `[first, last)` joins `ranges`, merged with the ranges it overlaps or
+/// touches. False if all of it was there.
+fn ranges_add(ranges: &mut BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    if first >= last || ranges.range(..=first).next_back().is_some_and(|(_, &end)| end >= last) {
+        return false;
+    }
+    // From the last range starting at or before `last` downwards: their
+    // ends go down with their starts.
+    let joined: Vec<usize> = ranges
+        .range(..=last)
+        .rev()
+        .take_while(|&(_, &end)| end >= first)
+        .map(|(&start, _)| start)
+        .collect();
+    let (mut first, mut last) = (first, last);
+    for start in joined {
+        if let Some(end) = ranges.remove(&start) {
+            (first, last) = (first.min(start), last.max(end));
+        }
+    }
+    ranges.insert(first, last);
+    true
+}
+
+/// Whether programs using title memory write one of `pages` (page numbers:
+/// a page and the pages showing its memory).
+fn written_by_programs(pages: &[usize]) -> bool {
+    let programs = programs();
+    pages.iter().any(|&page| ranges_hold(&programs, page, page + 1))
+}
+
+/// Shaders of a program using title memory write `[at, at + len)` of title
+/// memory in its host copies: a range a list of theirs declares (told
+/// before the submission runs: they may), or pages they marked or wrote at
+/// computed addresses in a submission whose writes go back (told before
+/// those pages' copy-backs). None of its pages is GPU-only from now on
+/// ([`close`] refuses them), and one that is leaves the class here: the
+/// GPU's bytes go into title memory, where they would be had its
+/// copy-backs not been skipped. Before the submission those are the bytes
+/// to go back to if its writes are withheld; after it they hold what the
+/// program wrote, which goes back anyway.
+///
+/// On the submitting thread, between a submission's steps.
+pub(crate) fn program_writes(at: usize, len: usize) {
+    let Some(net) = net() else { return };
+    if len == 0 || net.mode() != Mode::Net {
+        return;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len - 1) / PAGE + 1);
+    ranges_add(&mut programs(), first, last);
+    // Whether the range is new or not: a page closed all the same is found.
+    if net.any_armed() {
+        demote_closed(net, first, last, DemoteReason::Program);
     }
 }
 
@@ -1059,6 +1162,31 @@ pub(crate) mod tests {
     use super::super::{track, writing};
     use super::*;
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+
+    /// The pages programs using title memory write, as ranges: found page
+    /// by page, joined where they overlap or touch, and told when nothing
+    /// was new.
+    #[test]
+    fn page_ranges_join_and_are_found() {
+        let mut ranges = BTreeMap::new();
+        assert!(!ranges_hold(&ranges, 0, usize::MAX));
+        assert!(ranges_add(&mut ranges, 10, 12) && ranges_add(&mut ranges, 20, 21));
+        assert!(!ranges_add(&mut ranges, 5, 5), "empty");
+        for (page, held) in [(9, false), (10, true), (11, true), (12, false), (19, false), (20, true), (21, false)] {
+            assert_eq!(ranges_hold(&ranges, page, page + 1), held, "{page}");
+        }
+        assert!(ranges_hold(&ranges, 0, 11) && ranges_hold(&ranges, 11, 100) && !ranges_hold(&ranges, 12, 20));
+        assert!(!ranges_add(&mut ranges, 10, 12) && !ranges_add(&mut ranges, 11, 12), "all of it was there");
+        // Touching on the left, overlapping on the right, and over both.
+        assert!(ranges_add(&mut ranges, 8, 10));
+        assert_eq!(ranges, BTreeMap::from([(8, 12), (20, 21)]));
+        assert!(ranges_add(&mut ranges, 11, 14));
+        assert_eq!(ranges, BTreeMap::from([(8, 14), (20, 21)]));
+        assert!(ranges_add(&mut ranges, 30, 31) && ranges_add(&mut ranges, 13, 25));
+        assert_eq!(ranges, BTreeMap::from([(8, 25), (30, 31)]));
+        assert!(ranges_add(&mut ranges, 0, 40));
+        assert_eq!(ranges, BTreeMap::from([(0, 40)]));
+    }
 
     #[test]
     fn the_section_is_named_by_its_size() {

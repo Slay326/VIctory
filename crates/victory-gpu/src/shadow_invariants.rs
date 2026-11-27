@@ -848,7 +848,10 @@ fn a_page_another_copy_holds_is_never_gpu_only() {
 
 /// (d) A page is only closed while title memory and the copy are equal: one
 /// its tracker has as changed (the title wrote it since the copy took it,
-/// or the copy is to take it again) is refused, and closed once taken.
+/// or the copy is to take it again) is refused, and closed once taken. (A
+/// page the copy is to take again because shaders' writes were withheld is
+/// not closed at all:
+/// `a_page_programs_using_title_memory_write_is_never_gpu_only`.)
 #[test]
 fn a_page_changed_since_it_was_taken_is_not_closed() {
     use crate::watch::net::{Refusal, Way, close};
@@ -858,7 +861,7 @@ fn a_page_changed_since_it_was_taken_is_not_closed() {
     };
     let copy = f.copy();
     copy.update(f.p, f.len);
-    crate::watch::retake(f.p, PAGE);
+    crate::watch::tests::to_take_again(f.p / PAGE);
     let refused = net::refused(Refusal::Changed);
     close(f.p / PAGE, Way::Marked, copy);
     assert_eq!(net::state(f.p / PAGE), State::Shared);
@@ -1118,6 +1121,132 @@ fn withheld_writes_take_a_gpu_only_page_out_of_the_class() {
     crate::watch::retake(f.second(), PAGE);
     assert_eq!(net::demotion(f.second() / PAGE), Some((DemoteReason::Withheld, 2)));
     assert_eq!(read(peek + 16), 0xb0);
+    assert!(protection(f.p) != CLOSED);
+}
+
+/// (d) Pages that programs using title memory write are never GPU-only.
+/// What such a program wrote is dropped again when a list of its read
+/// memory with no copy, and the bytes from before are title memory's: a
+/// page whose copy-backs were skipped has none there. So a page told as
+/// theirs is not closed, at any of its addresses; a closed one gets the
+/// GPU's bytes in title memory when it is told and leaves the class; and
+/// their writes withheld after that are dropped as without the model: the
+/// title never sees them, and the copy takes the bytes from before again.
+#[test]
+fn a_page_programs_using_title_memory_write_is_never_gpu_only() {
+    use crate::watch::net::{Refusal, Way, close, program_writes};
+    let _on = ModelOn::new();
+    let Some(f) = Fixture::views(3, pattern) else {
+        return; // no host GPU here
+    };
+    let (peek, copy) = (f.peek(), f.copy());
+    copy.update(f.p, f.len);
+    // Page 1 is told through its other address, before anything is closed;
+    // page 2's writes are withheld (a list missed memory).
+    program_writes(f.second() + PAGE + 100, 8);
+    crate::watch::retake(f.p + 2 * PAGE, PAGE);
+    copy.update(f.p, f.len);
+    let refused = net::refused(Refusal::Program);
+    for k in 0..3 {
+        close(f.p / PAGE + k, Way::Marked, copy);
+    }
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed, "page 0: no such program writes it");
+    for k in 1..3 {
+        assert_eq!(net::state(f.p / PAGE + k), State::Shared, "page {k}");
+        assert!(protection(f.p + k * PAGE) != CLOSED && protection(f.second() + k * PAGE) != CLOSED);
+    }
+    assert!(net::refused(Refusal::Program) >= refused + 2, "counted");
+
+    // Page 0 is GPU-only and its copy ahead of title memory.
+    f.marked(&[(16, 0xb0)]);
+    assert_eq!(read(peek + 16), pattern(16), "only in the copy");
+    // A list of such a program declares a range in it: before it runs.
+    program_writes(f.p + 20, 12);
+    assert_eq!(read(peek + 16), 0xb0, "the bytes to go back to are in title memory");
+    assert_eq!(net::demotion(f.p / PAGE), Some((DemoteReason::Program, 2)));
+    assert!(protection(f.p) != CLOSED && protection(f.second()) != CLOSED);
+    // The program's write is withheld.
+    copy.write_host((f.p + 24) as u64, &[0xee]);
+    crate::watch::retake(f.p, PAGE);
+    copy.update(f.p, f.len);
+    assert_eq!(read(peek + 24), pattern(24), "never in title memory");
+    assert_eq!(f.copy_bytes(16, 28), [&[0xb0][..], &f.title_bytes(17, 28)].concat(), "and gone from the copy");
+    assert_eq!(f.copy_bytes(24, 28)[0], pattern(24));
+    assert_eq!(net::demotions_of(&[f.p / PAGE, f.second() / PAGE]), 1, "nothing was left to withhold from a closed page");
+    close(f.p / PAGE, Way::Marked, copy);
+    assert_eq!(net::state(f.p / PAGE), State::Demoted, "for good");
+}
+
+/// (d) A page shaders using title memory marked through a view no list
+/// declared is known as theirs only after the submission. If it goes back
+/// (nothing is withheld), a GPU-only page goes back whole and leaves the
+/// class, so the next submission has its bytes from before in title
+/// memory; a page another program marked stays GPU-only beside it.
+#[test]
+fn a_page_a_program_using_title_memory_marked_goes_back_and_leaves_the_class() {
+    use crate::watch::net::TEST_SECTION;
+    // A section size no other test has: the marks of every test running go
+    // back here, with the model on for this thread.
+    const PAGES: usize = 5;
+    TEST_SECTION.set(Some(PAGES * PAGE));
+    let Some((_on, f)) = Fixture::gpu_only(PAGES) else {
+        TEST_SECTION.set(None);
+        return; // no host GPU here
+    };
+    let (peek, copy) = (f.peek(), f.copy());
+    let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+    let mark = |memory: bool, page: usize| {
+        let b = bitmap(memory).expect("a host GPU");
+        // SAFETY: a dword of the mapped bitmap; no submission runs (the
+        // caller holds the submission lock).
+        unsafe { *(b.data as *mut u32).add((base + page) / 32) |= 1 << ((base + page) % 32) };
+    };
+    copy.write_host((f.p + 24) as u64, &[0xc0]);
+    copy.write_host((f.p + PAGE + 24) as u64, &[0xc1]);
+    crate::host::tests::submitting(|| {
+        mark(true, 0);
+        mark(false, 1);
+        copy_back_marks(&[], false);
+    })
+    .expect("a host GPU");
+    assert_eq!(read(peek + 24), 0xc0, "what the program wrote went back");
+    assert_eq!(net::demotion(f.p / PAGE), Some((DemoteReason::Program, 2)));
+    assert!(protection(f.p) != CLOSED && protection(f.second()) != CLOSED);
+    assert_eq!(net::state(f.p / PAGE + 1), State::GpuOnlyArmed, "another program's page stays GPU-only");
+    assert_eq!(read(peek + PAGE + 24), pattern(PAGE + 24), "its copy-back is skipped");
+    // The next submission's marks are withheld: nothing of it in title
+    // memory, and no closed page left to keep it.
+    copy.write_host((f.p + 28) as u64, &[0xee]);
+    crate::host::tests::submitting(|| {
+        mark(true, 0);
+        copy_back_marks(&[], true);
+    })
+    .expect("a host GPU");
+    assert_eq!(read(peek + 28), pattern(28));
+    assert_eq!(net::demotions_of(&[f.p / PAGE, f.second() / PAGE]), 1);
+    TEST_SECTION.set(None);
+}
+
+/// (d) The same for a page shaders wrote at addresses they computed
+/// (`crate::memory`): its copy-back is never skipped, a GPU-only page
+/// leaves the class with it, and the copy-backs after it are ordinary ones.
+#[test]
+fn a_page_written_at_computed_addresses_goes_back_and_leaves_the_class() {
+    let Some((_on, f)) = Fixture::gpu_only(2) else {
+        return; // no host GPU here
+    };
+    let (peek, copy) = (f.peek(), f.copy());
+    copy.write_host((f.p + 24) as u64, &[0xc0]);
+    crate::memory::page_back(copy, f.p);
+    assert_eq!(read(peek + 24), 0xc0, "what the program wrote went back");
+    assert_eq!(net::demotion(f.p / PAGE), Some((DemoteReason::Program, 2)));
+    assert!(protection(f.p) != CLOSED && protection(f.second()) != CLOSED);
+    assert_eq!(net::state(f.p / PAGE + 1), State::GpuOnlyArmed, "the page beside it stays GPU-only");
+    copy.update(f.p, f.len);
+    copy.write_host((f.p + 28) as u64, &[0xc4]);
+    crate::memory::page_back(copy, f.p);
+    assert_eq!(read(peek + 28), 0xc4, "and goes back from then on");
+    assert_eq!(net::state(f.p / PAGE), State::Demoted, "closed by none of them");
     assert!(protection(f.p) != CLOSED);
 }
 

@@ -1665,6 +1665,8 @@ pub(crate) fn forget_read(slot: u32) {
 // declared it.
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
+    // Of `marked`, what shaders using title memory marked.
+    let mut programs = Vec::new();
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
             continue;
@@ -1683,9 +1685,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             let mut x = std::mem::take(word);
             let into = if memory && memory_withheld { &mut held } else { &mut marked };
+            let first = into.len();
             while x != 0 {
                 into.push((w * 32) as u32 + x.trailing_zeros());
                 x &= x - 1;
+            }
+            if memory && !memory_withheld {
+                programs.extend_from_slice(&marked[first..]);
             }
         }
     }
@@ -1708,6 +1714,20 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
             crate::memclass::tag(crate::memclass::f::GPU_W_MARK, page, PAGE);
             crate::memory::drop_withheld(page, PAGE);
+        }
+    }
+    // With the memory model, pages that programs using title memory write
+    // are not GPU-only (`crate::watch::net::program_writes`): one that was
+    // gets the GPU's bytes in title memory here, with what the program
+    // just wrote, which goes back; told before the copy-backs below, none
+    // of which closes such a page.
+    if !programs.is_empty() && crate::watch::net::model_on() {
+        let pages: Vec<usize> = {
+            let m = marks();
+            programs.iter().filter_map(|&n| page_of(&m, n)).map(|(_, page)| page).collect()
+        };
+        for page in pages {
+            crate::watch::net::program_writes(page, PAGE);
         }
     }
     if marked.is_empty() {

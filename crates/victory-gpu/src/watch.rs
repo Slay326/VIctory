@@ -1340,6 +1340,14 @@ pub(crate) mod tests {
         p
     }
 
+    /// Page `page` (a page number) counts as changed in the buffer copies'
+    /// trackers holding it, its guard left as it is: what [`retake`] does
+    /// to a page, without telling the net that shaders' writes were
+    /// withheld there.
+    pub(crate) fn to_take_again(page: usize) {
+        mark(&guards(), page, page + 1);
+    }
+
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };

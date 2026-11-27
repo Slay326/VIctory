@@ -616,6 +616,17 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
     false
 }
 
+/// After a submission that withholds nothing: the 64 KiB page at `page`,
+/// which its shaders wrote at addresses they computed, goes back from
+/// `copy` into title memory ([`Shadow::copy_back_page`]). With the memory
+/// model such a page is no GPU-only page, and leaves the class first if it
+/// was one (`crate::watch::net::program_writes`): the copy-back is not
+/// skipped then, and closes nothing.
+pub(crate) fn page_back(copy: &Shadow, page: usize) -> usize {
+    crate::watch::net::program_writes(page, 1 << 16);
+    copy.copy_back_page(page)
+}
+
 /// `list` uses title memory with view heap `key` bound: the heap's page
 /// table (made on first use) and a page bitmap of the list's, the table
 /// brought up to date at each submission of the list, its written pages
@@ -696,7 +707,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let n = page_back(&copies[k], at as usize);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
