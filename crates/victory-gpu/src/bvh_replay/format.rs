@@ -701,6 +701,11 @@ impl Capture {
 /// triangles (shader hash prefix); its root constant dword 5 is the y scale.
 pub const REHYDRATE_HASH: &str = "5e687674";
 
+/// Where [`REHYDRATE_HASH`]'s y scale (`cb5`) lies in a captured
+/// [`RootArg::Constants`]: the dwords are indexed by user-data index, and its
+/// constants start at user data 16 (16 + 5).
+pub const REHYDRATE_Y_SCALE: usize = 21;
+
 pub fn incomplete(left_out: Option<u64>, marked_not_taken: usize, outside: usize) -> Vec<String> {
     let mut why = Vec::new();
     match left_out {
@@ -776,7 +781,7 @@ impl Capture {
             seen += 1;
             let nonzero = d.args.iter().any(|a| {
                 matches!(a, RootArg::Constants { dwords, .. }
-                    if dwords.get(5).is_some_and(|x| x.value != 0))
+                    if dwords.get(REHYDRATE_Y_SCALE).is_some_and(|x| x.value != 0))
             });
             if nonzero {
                 return None;
@@ -1045,10 +1050,12 @@ mod tests {
         });
         let cb = |y: u32| RootArg::Constants {
             param: 0,
-            dwords: (0..19)
+            dwords: (0..35)
                 .map(|i| Dword {
-                    kind: if i == 5 { DwordKind::GroupXOffset } else { DwordKind::Plain },
-                    value: match i { 4 | 6 => 0x4900_0000, 5 => y, _ => 0 },
+                    // As the old build recorded it: dword 5 (y scale) as the group offset.
+                    kind: if i == REHYDRATE_Y_SCALE { DwordKind::GroupXOffset } else { DwordKind::Plain },
+                    // Index 5 nonzero too: only the y scale counts.
+                    value: match i { 5 | 20 | 22 => 0x4900_0000, REHYDRATE_Y_SCALE => y, _ => 0 },
                     address: 0,
                 })
                 .collect(),
