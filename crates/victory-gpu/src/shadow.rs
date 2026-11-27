@@ -583,6 +583,41 @@ impl Shadow {
         to - from
     }
 
+    /// The whole 64 KiB page at `page` goes from the copy into title memory
+    /// as it is, through our own view of the page's section and never the
+    /// title's: for a page kept closed to the title since the copy took it
+    /// (`crate::pagenet`), where the copy alone holds the GPU's bytes. No
+    /// "written since taken" check and no compare with title memory, which
+    /// is older throughout: a closed page has no title write to keep, and
+    /// dropping the GPU's bytes here would hand the title stale ones. The
+    /// title's view keeps its protection; the page's other trackers are
+    /// marked as for any copy-back beside the guard. True if every byte
+    /// landed; false, with nothing written, for a page the copy does not
+    /// hold whole or memory we have no view of our own of.
+    #[cfg_attr(not(test), allow(dead_code))] // called by the net's sync, which comes next
+    pub(crate) fn copy_back_forced(&self, page: usize) -> bool {
+        let Some(t) = &self.tracked else {
+            return false;
+        };
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if !page.is_multiple_of(PAGE) || page < start || page + PAGE > end {
+            return false;
+        }
+        // A copy in the GPU's memory: the page comes down first.
+        if self.card.is_some() {
+            crate::host::card_fetch(&[(self, page - start, page + PAGE - start)]);
+        }
+        // SAFETY: inside the mapping; the GPU is done with it (the caller
+        // holds the submission lock).
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(page - start), PAGE) };
+        let mut landed = false;
+        let put = |delta: usize| {
+            landed = crate::host::write_mapped(page.wrapping_add(delta) as *mut u8, host.as_ptr(), PAGE);
+            landed
+        };
+        t.write_beside(page, PAGE, put).is_some() && landed
+    }
+
     /// After a copy-back: the page at `page` is taken, then the copy's bytes
     /// `[from, to)` (title addresses) are read from title memory again. The
     /// title writes the page while it goes back, so bytes read before the

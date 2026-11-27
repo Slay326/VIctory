@@ -21,8 +21,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::pagenet::{
-    BLOCK, DemoteReason, Demotion, Fault, Mode, Oddities, PAGE, PageNet, Prot, Protect, Reason,
-    State, Stats,
+    Armed, BLOCK, DemoteReason, Demotion, Fault, Mode, Oddities, PAGE, PageNet, Prot, Protect,
+    Reason, State, Stats,
 };
 
 // -------------------------------------------------------- test model ---
@@ -42,6 +42,8 @@ struct MockState {
     title: BTreeMap<usize, Vec<u8>>,
     /// The host copy: what the GPU reads and writes.
     copy: BTreeMap<usize, Vec<u8>>,
+    /// Pages that show another page's memory (page to that page).
+    phys: BTreeMap<usize, usize>,
     /// The existing tracker: pages written since taken.
     changed: BTreeSet<usize>,
     /// GPU writes of the submission in flight: land at `complete`.
@@ -71,6 +73,7 @@ impl Mock {
             prot: BTreeMap::new(),
             title: BTreeMap::new(),
             copy: BTreeMap::new(),
+            phys: BTreeMap::new(),
             changed: BTreeSet::new(),
             pending: Vec::new(),
             submitted: 0,
@@ -93,6 +96,19 @@ impl Mock {
 
     fn st(&self) -> std::sync::MutexGuard<'_, MockState> {
         self.s.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Page `page` shows the memory of page `of` from now on (a second
+    /// mapping), under the baseline guard as `of` is.
+    fn alias(&self, page: usize, of: usize) {
+        let mut s = self.st();
+        s.phys.insert(page, of);
+        s.prot.insert(page, Prot::ReadOnly);
+    }
+
+    /// The page whose memory `page` shows.
+    fn mem(&self, page: usize) -> usize {
+        self.st().phys.get(&page).copied().unwrap_or(page)
     }
 
     /// A GPU write of `value` at `addr` in a new submission, still running.
@@ -159,7 +175,8 @@ impl Mock {
     }
 
     fn title(&self, addr: usize) -> u8 {
-        self.st().title[&(addr / PAGE)][addr % PAGE]
+        let mem = self.mem(addr / PAGE);
+        self.st().title[&mem][addr % PAGE]
     }
 
     fn copy(&self, addr: usize) -> u8 {
@@ -269,16 +286,17 @@ fn access(net: &Net, mock: &Arc<Mock>, addr: usize, write: Option<u8>, tid: u32)
             );
             continue;
         }
+        let mem = mock.mem(page);
         let mut s = mock.st();
         return match write {
-            None => s.title[&page][addr % PAGE],
+            None => s.title[&mem][addr % PAGE],
             Some(v) => {
                 if prot == Prot::ReadOnly {
                     // The existing guard: marks changed, opens.
                     s.changed.insert(page);
                     s.prot.insert(page, Prot::ReadWrite);
                 }
-                s.title.get_mut(&page).expect("mapped")[addr % PAGE] = v;
+                s.title.get_mut(&mem).expect("mapped")[addr % PAGE] = v;
                 v
             }
         };
@@ -363,7 +381,8 @@ fn t1_net_fault_syncs_before_resume() {
         vec![Demotion {
             page: P,
             reason: DemoteReason::CpuRead,
-            frame: 1
+            frame: 1,
+            pages: 1,
         }]
     );
     assert!(net.drain_demotions().is_empty(), "one log entry");
@@ -484,7 +503,8 @@ fn t3_write_fault_keeps_both() {
         vec![Demotion {
             page: P,
             reason: DemoteReason::CpuWrite,
-            frame: 1
+            frame: 1,
+            pages: 1,
         }]
     );
 }
@@ -561,7 +581,8 @@ fn t4_concurrent_faults_single_sync() {
         vec![Demotion {
             page: P,
             reason: DemoteReason::CpuRead,
-            frame: 1
+            frame: 1,
+            pages: 1,
         }]
     );
 
@@ -914,5 +935,180 @@ fn t10_lost_arming_is_renewed() {
         }
     );
     assert_eq!(net.armed_counts(), BTreeMap::from([(P, 2)]));
+    assert!(!net.any_armed());
+}
+
+/// t11 (I9): the addresses of one physical page leave the class together.
+///
+/// Input: Net; X = 0x80 (the copy's page), Y = 0x81 showing X's memory;
+/// `arm_group([X, Y])`; the GPU writes 0x42 at block 1 of X.
+/// Run: the title reads that byte through Y; then writes 0x99 at block 2
+/// through X (the baseline guard); then reads it through Y; then the engine
+/// asks for Y to be demoted once more.
+/// Expected: both pages closed after arming; the first read returns 0x42
+/// after exactly one copy (of X, the group's page); both pages are open
+/// and demoted, one demotion record naming Y with 2 pages; the CPU's 0x99
+/// is still there at the end and no second copy ran (a sync per address
+/// would have put the GPU's older bytes over it).
+#[test]
+fn t11_addresses_of_one_page_leave_together() {
+    const X: usize = 0x80;
+    const Y: usize = 0x81;
+    let mock = Mock::new(&[X]);
+    mock.alias(Y, X);
+    let net = PageNet::new(Mode::Net, mock.clone());
+    assert_eq!(net.arm_group(&[X, Y]), Armed::Now);
+    assert_eq!((mock.prot(X), mock.prot(Y)), (Prot::NoAccess, Prot::NoAccess));
+    assert!(net.is_gpu_only(X) && net.is_gpu_only(Y));
+    assert_eq!(net.closed_in(X, Y + 1), vec![X, Y]);
+    assert_eq!(net.group_of(Y), Some(X));
+    assert_eq!(net.arm_group(&[X, Y]), Armed::Already);
+    mock.gpu_write(at(X, 1, 0), 0x42);
+
+    assert_eq!(access(&net, &mock, at(Y, 1, 0), None, TITLE_TID), 0x42);
+    assert_eq!(mock.count(&Ev::CopyStart(X)), 1, "one copy, of the group's page");
+    assert_eq!(mock.count(&Ev::CopyStart(Y)), 0);
+    assert_eq!((mock.prot(X), mock.prot(Y)), (Prot::ReadOnly, Prot::ReadOnly), "open together");
+    assert_eq!((net.state(X), net.state(Y)), (State::Demoted, State::Demoted));
+    assert!(!net.any_armed());
+    assert_eq!(
+        net.drain_demotions(),
+        vec![Demotion {
+            page: Y,
+            reason: DemoteReason::CpuRead,
+            frame: 1,
+            pages: 2,
+        }]
+    );
+
+    access(&net, &mock, at(X, 2, 0), Some(0x99), TITLE_TID);
+    assert_eq!(access(&net, &mock, at(Y, 2, 0), None, TITLE_TID), 0x99);
+    assert!(!net.demote(Y, DemoteReason::Host), "demoted already");
+    assert_eq!(net.on_fault(at(Y, 2, 0), false, TITLE_TID_2), Fault::Handled, "a late fault");
+    assert_eq!(mock.title(at(X, 2, 0)), 0x99, "the CPU's byte stays");
+    assert_eq!(mock.count(&Ev::CopyStart(X)) + mock.count(&Ev::CopyStart(Y)), 1);
+    assert_eq!(net.stats().syncs, 1);
+    assert_eq!(net.arm_group(&[X, Y]), Armed::Refused, "I3, for every address");
+    assert_eq!(net.arm_group(&[Y]), Armed::Refused);
+}
+
+/// t12 (I9): a group is closed whole or not at all.
+///
+/// Input: Net; X = 0x90 and Y = 0x91 (Y showing X), Y closed by someone
+/// else (no access) before arming; then Y under the guard again.
+/// Expected: the first `arm_group([X, Y])` is refused and X has its
+/// read-only back (never GPU-only with an address left open or foreign);
+/// one refusal noted; no fault of X is ours. With Y guarded the group arms;
+/// arming X alone or Y alone afterwards changes nothing.
+#[test]
+fn t12_a_group_is_closed_whole_or_not_at_all() {
+    const X: usize = 0x90;
+    const Y: usize = 0x91;
+    let mock = Mock::new(&[X]);
+    mock.alias(Y, X);
+    mock.st().prot.insert(Y, Prot::NoAccess);
+    let net = PageNet::new(Mode::Net, mock.clone());
+    assert_eq!(net.arm_group(&[X, Y]), Armed::Refused);
+    assert_eq!(mock.prot(X), Prot::ReadOnly, "given back");
+    assert_eq!((net.state(X), net.state(Y)), (State::Shared, State::Shared));
+    assert!(!net.any_armed());
+    assert_eq!(net.oddities().arm_lost, 1);
+    assert_eq!(net.on_fault(at(X, 0, 0), true, TITLE_TID), Fault::NotOurs);
+    assert_eq!(net.arm_group(&[]), Armed::Refused);
+    assert_eq!(PageNet::new(Mode::Measure, mock.clone()).arm_group(&[X]), Armed::Refused);
+
+    mock.st().prot.insert(Y, Prot::ReadOnly);
+    assert_eq!(net.arm_group(&[X, Y]), Armed::Now);
+    assert_eq!(net.arm_group(&[X]), Armed::Already);
+    net.arm(Y, Reason::GpuOnly);
+    assert_eq!(net.armed_counts(), BTreeMap::from([(X, 1), (Y, 1)]));
+    assert_eq!((mock.prot(X), mock.prot(Y)), (Prot::NoAccess, Prot::NoAccess));
+}
+
+/// t13 (I2, I3): the engine takes a page out of the class without a fault.
+///
+/// Input: Net; P = 0xa0 armed; the GPU writes 0x42 in a submission still
+/// running.
+/// Run: `demote(P, Host)` on its own thread; the submission completes
+/// 100 ms later. Then `demote(P, Remap)` and a title read.
+/// Expected: the first call returns true only after the fence, with the
+/// GPU's byte in title memory, the page open and demoted; the record's
+/// reason is Host; no title access was counted; the second call does
+/// nothing (false) and the read faults nowhere.
+#[test]
+fn t13_the_engine_demotes_without_a_fault() {
+    const P: usize = 0xa0;
+    let mock = Mock::new(&[P]);
+    let net = Arc::new(PageNet::new(Mode::Net, mock.clone()));
+    net.arm(P, Reason::GpuOnly);
+    mock.gpu_write_pending(at(P, 3, 1), 0x42);
+    let (tx, rx) = mpsc::channel();
+    let worker = {
+        let net = net.clone();
+        std::thread::spawn(move || tx.send(net.demote(P, DemoteReason::Host)).unwrap())
+    };
+    assert!(mock.wait_for(&Ev::FenceWait));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "waits for the submission"
+    );
+    assert_eq!(mock.count(&Ev::CopyStart(P)), 0);
+    assert_eq!(net.closed_in(P, P + 1), vec![P], "closed while it syncs");
+    mock.complete();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+    worker.join().unwrap();
+    assert_eq!(mock.title(at(P, 3, 1)), 0x42);
+    assert_eq!((mock.prot(P), net.state(P)), (Prot::ReadOnly, State::Demoted));
+    assert_eq!(
+        net.drain_demotions(),
+        vec![Demotion {
+            page: P,
+            reason: DemoteReason::Host,
+            frame: 1,
+            pages: 1,
+        }]
+    );
+    let stats = net.stats();
+    assert!(stats.reads.is_empty() && stats.writes.is_empty(), "{stats:?}");
+    assert!(!net.demote(P, DemoteReason::Remap));
+    assert_eq!(access(&net, &mock, at(P, 3, 1), None, TITLE_TID), 0x42);
+    assert_eq!(net.stats().syncs, 1);
+    assert!(!net.demote(0xa1, DemoteReason::Host), "never armed");
+}
+
+/// t14 (I9): a new mapping of a GPU-only page is closed with it.
+///
+/// Input: Net; X = 0xb0 armed alone; then Y = 0xb1 is mapped showing X
+/// (guarded, as the baseline does for a page guarded elsewhere).
+/// Run: `join(X, Y)`; the GPU writes 0x42 at X; the title reads it through
+/// Y. Also: `join` of a page to one that is not GPU-only, and of a page
+/// that cannot be closed.
+/// Expected: Y is closed by the join; the read through Y syncs once and
+/// opens both; joining to a page that is not GPU-only changes nothing and
+/// is fine; a page that cannot be closed makes the join fail (the caller
+/// then demotes the group).
+#[test]
+fn t14_a_new_mapping_joins_the_closed_page() {
+    const X: usize = 0xb0;
+    const Y: usize = 0xb1;
+    const Z: usize = 0xb2;
+    let mock = Mock::new(&[X, 0xb8]);
+    let net = PageNet::new(Mode::Net, mock.clone());
+    net.arm(X, Reason::GpuOnly);
+    mock.alias(Y, X);
+    assert!(net.join(X, Y));
+    assert_eq!(mock.prot(Y), Prot::NoAccess);
+    assert_eq!(net.group_of(Y), Some(X));
+    mock.alias(Z, X);
+    mock.st().prot.insert(Z, Prot::NoAccess);
+    assert!(!net.join(X, Z), "not closable: the group must go");
+    assert!(net.join(0xb8, 0xb9), "nothing GPU-only there: nothing to do");
+    assert_eq!(net.state(0xb9), State::Shared);
+
+    mock.gpu_write(at(X, 0, 5), 0x42);
+    assert_eq!(access(&net, &mock, at(Y, 0, 5), None, TITLE_TID), 0x42);
+    assert_eq!(mock.count(&Ev::CopyStart(X)), 1);
+    assert_eq!((mock.prot(X), mock.prot(Y)), (Prot::ReadOnly, Prot::ReadOnly));
+    assert_eq!(net.drain_demotions()[0].pages, 2);
     assert!(!net.any_armed());
 }

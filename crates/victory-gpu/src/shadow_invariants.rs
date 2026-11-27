@@ -540,6 +540,101 @@ fn a_constant_written_between_two_lists_reaches_the_second() {
     }
 }
 
+// ------------------------------------------------- forced copy-back ---
+
+/// The protection of the page at `at`.
+fn protection(at: usize) -> u32 {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    info.Protect
+}
+
+const CLOSED: u32 = windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+const GUARDED: u32 = windows_sys::Win32::System::Memory::PAGE_READONLY;
+
+impl Fixture {
+    /// The title's second view of the fixture's pages.
+    fn second(&self) -> usize {
+        self.section.expect("over views").1
+    }
+
+    /// A view of the section nobody knows of: what the physical pages hold,
+    /// read without touching the title's views.
+    fn peek(&self) -> usize {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile};
+        let section = self.section.expect("over views").0;
+        // SAFETY: a section the fixture keeps; the view is never unmapped
+        // (a test's worth of address space).
+        let view = unsafe { MapViewOfFile(section as _, FILE_MAP_READ, 0, 0, self.len) }.Value as usize;
+        assert!(view != 0);
+        view
+    }
+}
+
+fn read(at: usize) -> u8 {
+    // SAFETY: a byte of a fixture's view; a closed page faults into the
+    // handler, which opens it.
+    unsafe { (at as *const u8).read_volatile() }
+}
+
+/// What a forced copy-back must do, whatever the net does around it: the
+/// copy's whole page lands in title memory through our own view while the
+/// title's views stay closed, the page's other trackers hear of it, and
+/// nothing is ever dropped, also where the ordinary copy-back drops the
+/// GPU's bytes (a page its tracker has as changed). Memory with no view of
+/// our own, and a page held in part, are refused with nothing written.
+#[test]
+fn a_forced_copy_back_lands_beside_closed_views_and_drops_nothing() {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    let Some(f) = Fixture::views(2, pattern) else {
+        return; // no host GPU here
+    };
+    let copy = f.copy();
+    copy.update(f.p, f.len);
+    let other = crate::watch::track(f.second(), PAGE, true).expect("views are tracked");
+    other.take(f.second(), f.second() + PAGE);
+    copy.write_host((f.p + 8) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
+    copy.write_host((f.p + PAGE - 4) as u64, &[0x11, 0x22, 0x33, 0x44]);
+    // The copy's tracker has the page as changed though title memory did
+    // not change: the ordinary copy-back keeps title memory's bytes then.
+    crate::watch::retake(f.p, PAGE);
+    assert_eq!(copy.copy_back_page(f.p), 0, "the ordinary way drops them here");
+    let peek = f.peek();
+    assert_eq!(read(peek + 8), pattern(8));
+    let mut old = 0;
+    for view in [f.p, f.second()] {
+        // SAFETY: the fixture's views; only their protection changes.
+        assert!(unsafe { VirtualProtect(view as *const _, PAGE, CLOSED, &mut old) } != 0);
+    }
+    assert!(!other.changed(f.second() / PAGE));
+
+    assert!(copy.copy_back_forced(f.p), "landed");
+    assert_eq!((protection(f.p), protection(f.second())), (CLOSED, CLOSED), "the title's views stay closed");
+    assert_eq!([read(peek + 8), read(peek + 9), read(peek + 10), read(peek + 11)], [0xaa, 0xbb, 0xcc, 0xdd]);
+    assert_eq!(read(peek + PAGE - 1), 0x44, "the whole page");
+    assert_eq!(read(peek + 100), pattern(100));
+    assert_eq!(read(peek + PAGE + 8), pattern(PAGE + 8), "and no other");
+    assert!(other.changed(f.second() / PAGE), "the page's other tracker takes it again");
+
+    assert!(!copy.copy_back_forced(f.p + 4096), "not a page");
+    assert!(!copy.copy_back_forced(f.p + 2 * PAGE), "not the copy's");
+    for view in [f.p, f.second()] {
+        // SAFETY: as above.
+        unsafe { VirtualProtect(view as *const _, PAGE, GUARDED, &mut old) };
+    }
+    drop(other);
+    let Some(pool) = Fixture::new(1, pattern) else {
+        return;
+    };
+    pool.copy().update(pool.p, pool.len);
+    pool.copy().write_host((pool.p + 8) as u64, &[0xee]);
+    assert!(!pool.copy().copy_back_forced(pool.p), "no view of our own: refused");
+    assert_eq!(pool.title(8), pattern(8), "nothing written");
+}
+
 // ---------------------------------------------------------------- (d) ---
 //
 // Demotion (night 2, stage 3: VICTORY_MEMMODEL=1, the safety net Fable

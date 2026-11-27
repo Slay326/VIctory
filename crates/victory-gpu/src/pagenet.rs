@@ -28,6 +28,17 @@
 //! - I6: a fault on a page that is not armed changes nothing.
 //! - I7: measuring changes no byte and no sync decision.
 //! - I8: an access by a host thread is never counted as the title's.
+//! - I9: the addresses showing one physical page are GPU-only together or
+//!   not at all, and leave the class together, by one sync: a second sync
+//!   for another address would put the GPU's bytes over what the CPU wrote
+//!   through the first.
+//!
+//! Locks: `arm`, `arm_group`, `join`, `host_access`, `disarm_for_free` and
+//! the measuring branch of a fault change protections and are called with
+//! the backend's exclusion held by the caller (on real memory the write
+//! guard's lock). A sync is not: it waits for the GPU and copies, and takes
+//! the exclusion itself for its last step ([`Protect::guarded`]), always
+//! before the net's own lock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,6 +111,28 @@ pub enum DemoteReason {
     CpuRead,
     /// A write.
     CpuWrite,
+    /// The engine itself needed the page's bytes in title memory, or was
+    /// about to write it there: another copy or a texture reading it, a
+    /// copy step or a kernel write into it.
+    Host,
+    /// One of the page's addresses was unmapped, or mapped anew in a way
+    /// that could not be closed.
+    Remap,
+    /// What shaders wrote there was to be dropped (withheld writes), which
+    /// a page with no bytes in title memory cannot do: the GPU's bytes
+    /// were kept instead.
+    Withheld,
+}
+
+/// What [`PageNet::arm_group`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Armed {
+    /// The pages are GPU-only from now on.
+    Now,
+    /// They were already.
+    Already,
+    /// Not armed: a page of them is demoted, or cannot be closed.
+    Refused,
 }
 
 /// One page leaving the GPU-only class.
@@ -111,6 +144,8 @@ pub struct Demotion {
     pub reason: DemoteReason,
     /// The frame it happened in.
     pub frame: u64,
+    /// How many addresses showed the page's memory and left with it.
+    pub pages: usize,
 }
 
 /// What the faults showed.
@@ -157,9 +192,21 @@ pub trait Protect: Send + Sync + 'static {
     /// since taken" check of the ordinary copy-back: an armed page cannot
     /// have been written by the title. Must not touch the title's own view
     /// of the page, which stays closed until the copy is done.
+    ///
+    /// Called once for a group of addresses showing the same memory, with
+    /// the page the group was armed by.
     fn copy_back_forced(&self, page: usize);
     /// The current frame, for demotion records.
     fn frame(&self) -> u64;
+    /// Runs `f`, which changes protections ([`Protect::swap`]), as one step
+    /// against everyone else who protects title pages. Called by a sync
+    /// with no lock of the net held; `f` takes the net's.
+    fn guarded<R>(&self, f: impl FnOnce() -> R) -> R
+    where
+        Self: Sized,
+    {
+        f()
+    }
 }
 
 /// One page the module has armed at some point.
@@ -168,6 +215,9 @@ struct Entry {
     state: State,
     /// The protection the page was armed from, given back on opening.
     from: Prot,
+    /// The page its group was armed by (itself, alone): the addresses
+    /// showing the same memory are GPU-only together (I9).
+    group: usize,
 }
 
 #[derive(Default)]
@@ -179,6 +229,9 @@ struct Inner {
     host: BTreeSet<u32>,
     /// How often each page was armed.
     arms: BTreeMap<usize, u64>,
+    /// The GPU-only groups of more than one page, by the page they were
+    /// armed by: every page of the group, that one first.
+    groups: BTreeMap<usize, Vec<usize>>,
 }
 
 /// The fault bookkeeping of title pages (see the module).
@@ -231,7 +284,10 @@ impl<B: Protect> PageNet<B> {
     pub fn arm(&self, page: usize, reason: Reason) {
         let state = match (self.mode, reason) {
             (Mode::Measure, Reason::AfterCopyBack) => State::ArmedMeasure,
-            (Mode::Net, Reason::GpuOnly) => State::GpuOnlyArmed,
+            (Mode::Net, Reason::GpuOnly) => {
+                self.arm_group(&[page]);
+                return;
+            }
             _ => return,
         };
         let mut inner = self.lock();
@@ -258,9 +314,199 @@ impl<B: Protect> PageNet<B> {
             inner.oddities.arm_lost += 1;
             return;
         }
-        inner.pages.insert(page, Entry { state, from });
+        inner.pages.insert(
+            page,
+            Entry {
+                state,
+                from,
+                group: page,
+            },
+        );
         *inner.arms.entry(page).or_default() += 1;
         self.armed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Makes `pages` GPU-only together (the net's mode only): the addresses
+    /// showing one physical page, the one whose copy holds the GPU's bytes
+    /// first. All of them are closed, or none (I9): a page that is demoted
+    /// (counted, I3), not mapped, closed by someone else or whose
+    /// protection changes under us refuses the whole group, and the pages
+    /// closed so far get their protection back.
+    pub fn arm_group(&self, pages: &[usize]) -> Armed {
+        if self.mode != Mode::Net || pages.is_empty() {
+            return Armed::Refused;
+        }
+        let mut inner = self.lock();
+        let states: Vec<Option<State>> = pages
+            .iter()
+            .map(|p| inner.pages.get(p).map(|e| e.state))
+            .collect();
+        if states.contains(&Some(State::Demoted)) {
+            inner.stats.arm_noops += 1;
+            return Armed::Refused;
+        }
+        let closed = |s: &Option<State>| matches!(s, Some(State::GpuOnlyArmed | State::Syncing));
+        if states.iter().all(closed) {
+            return Armed::Already;
+        }
+        if states.iter().any(closed) {
+            // Part of another group, or of this one with pages missing:
+            // not widened here (`join` does that, one page at a time).
+            return Armed::Refused;
+        }
+        let mut done: Vec<(usize, Prot)> = Vec::with_capacity(pages.len());
+        for &page in pages {
+            let from = self.backend.get(page);
+            if from == Prot::NoAccess
+                || done.iter().any(|&(p, _)| p == page)
+                || !self.backend.swap(page, from, Prot::NoAccess)
+            {
+                for &(page, from) in &done {
+                    if !self.backend.swap(page, Prot::NoAccess, from) {
+                        inner.oddities.overridden += 1;
+                    }
+                }
+                inner.oddities.arm_lost += 1;
+                return Armed::Refused;
+            }
+            done.push((page, from));
+        }
+        for &(page, from) in &done {
+            inner.pages.insert(
+                page,
+                Entry {
+                    state: State::GpuOnlyArmed,
+                    from,
+                    group: pages[0],
+                },
+            );
+            *inner.arms.entry(page).or_default() += 1;
+        }
+        if pages.len() > 1 {
+            inner.groups.insert(pages[0], pages.to_vec());
+        }
+        self.armed.fetch_add(pages.len(), Ordering::Relaxed);
+        Armed::Now
+    }
+
+    /// `page` shows the memory of `of` from now on (a new mapping): if `of`
+    /// is GPU-only, `page` is closed with it and leaves with it. False if
+    /// `of` is GPU-only and `page` could not be closed: the caller must
+    /// take the group out of the class ([`Self::demote`]) before the new
+    /// address is used.
+    pub fn join(&self, of: usize, page: usize) -> bool {
+        if self.mode != Mode::Net {
+            return true;
+        }
+        let mut inner = self.lock();
+        let Some(entry) = inner.pages.get(&of).copied() else {
+            return true;
+        };
+        if !matches!(entry.state, State::GpuOnlyArmed | State::Syncing) {
+            return true;
+        }
+        match inner.pages.get(&page).map(|e| e.state) {
+            Some(State::GpuOnlyArmed | State::Syncing) => return true,
+            Some(State::Demoted) => return false,
+            _ => {}
+        }
+        let from = self.backend.get(page);
+        if from == Prot::NoAccess || !self.backend.swap(page, from, Prot::NoAccess) {
+            inner.oddities.arm_lost += 1;
+            return false;
+        }
+        inner.pages.insert(
+            page,
+            Entry {
+                state: entry.state,
+                from,
+                group: entry.group,
+            },
+        );
+        *inner.arms.entry(page).or_default() += 1;
+        let group = entry.group;
+        inner
+            .groups
+            .entry(group)
+            .or_insert_with(|| vec![group])
+            .push(page);
+        self.armed.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Takes `page` and the pages closed with it out of the GPU-only class
+    /// for good, for a reason that is not an access fault: the GPU's bytes
+    /// go into title memory first, as for a fault (I2). True if the page
+    /// was GPU-only (another thread's sync of it is waited for).
+    pub fn demote(&self, page: usize, reason: DemoteReason) -> bool {
+        if self.mode != Mode::Net {
+            return false;
+        }
+        let mut inner = self.lock();
+        loop {
+            match inner.pages.get(&page).map(|e| e.state) {
+                Some(State::GpuOnlyArmed) => {
+                    self.sync(inner, page, reason);
+                    return true;
+                }
+                Some(State::Syncing) => {
+                    inner = self.synced.wait(inner).unwrap_or_else(|e| e.into_inner());
+                    if inner.pages.get(&page).map(|e| e.state) != Some(State::Syncing) {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// The sync of a GPU-only page and the pages closed with it: fence,
+    /// one copy of the GPU's bytes into title memory, then all of them
+    /// demoted and opened together (I2, I9).
+    fn sync(&self, mut inner: MutexGuard<'_, Inner>, page: usize, reason: DemoteReason) {
+        let group = inner.pages.get(&page).map_or(page, |e| e.group);
+        let members = inner
+            .groups
+            .get(&group)
+            .cloned()
+            .unwrap_or_else(|| vec![page]);
+        for member in &members {
+            if let Some(entry) = inner.pages.get_mut(member) {
+                entry.state = State::Syncing;
+            }
+        }
+        // The sync runs without the lock: it waits for the GPU, and other
+        // threads must be able to find the pages syncing meanwhile.
+        drop(inner);
+        self.backend.fence_wait();
+        self.backend.copy_back_forced(group);
+        let frame = self.backend.frame();
+        self.backend.guarded(|| {
+            let mut inner = self.lock();
+            // Read again: an address may have joined meanwhile.
+            let members = inner.groups.remove(&group).unwrap_or(members);
+            for &member in &members {
+                let Some(entry) = inner.pages.get_mut(&member) else {
+                    continue;
+                };
+                entry.state = State::Demoted;
+                let from = entry.from;
+                if !self.backend.swap(member, Prot::NoAccess, from) {
+                    inner.oddities.overridden += 1;
+                }
+            }
+            // Counted as closed until here: a host access meanwhile must
+            // find them and wait.
+            self.armed.fetch_sub(members.len(), Ordering::Relaxed);
+            inner.stats.syncs += 1;
+            inner.demotions.push(Demotion {
+                page,
+                reason,
+                frame,
+                pages: members.len(),
+            });
+        });
+        self.synced.notify_all();
     }
 
     /// A thread `tid` faulted reading (or writing, `is_write`) `addr`: the
@@ -314,14 +560,6 @@ impl<B: Protect> PageNet<B> {
                 Fault::Handled
             }
             State::GpuOnlyArmed => {
-                self.armed.fetch_sub(1, Ordering::Relaxed);
-                inner.pages.insert(
-                    page,
-                    Entry {
-                        state: State::Syncing,
-                        ..entry
-                    },
-                );
                 if host {
                     inner.oddities.host_faults += 1;
                 } else {
@@ -332,37 +570,12 @@ impl<B: Protect> PageNet<B> {
                     };
                     *counts.entry((page, block)).or_default() += 1;
                 }
-                // The sync runs without the lock: it waits for the GPU,
-                // and other threads must be able to find the page
-                // syncing meanwhile.
-                drop(inner);
-                self.backend.fence_wait();
-                self.backend.copy_back_forced(page);
-                let frame = self.backend.frame();
-                let mut inner = self.lock();
-                inner.pages.insert(
-                    page,
-                    Entry {
-                        state: State::Demoted,
-                        ..entry
-                    },
-                );
-                inner.stats.syncs += 1;
-                let reason = if is_write {
-                    DemoteReason::CpuWrite
-                } else {
-                    DemoteReason::CpuRead
+                let reason = match (host, is_write) {
+                    (true, _) => DemoteReason::Host,
+                    (false, true) => DemoteReason::CpuWrite,
+                    (false, false) => DemoteReason::CpuRead,
                 };
-                inner.demotions.push(Demotion {
-                    page,
-                    reason,
-                    frame,
-                });
-                if !self.backend.swap(page, Prot::NoAccess, entry.from) {
-                    inner.oddities.overridden += 1;
-                }
-                drop(inner);
-                self.synced.notify_all();
+                self.sync(inner, page, reason);
                 Fault::Handled
             }
             State::Syncing => {
@@ -442,6 +655,30 @@ impl<B: Protect> PageNet<B> {
         self.state(page) == State::GpuOnlyArmed
     }
 
+    /// The pages of `[first, last)` that are closed as GPU-only now (or
+    /// being synced): title memory there is not what the GPU holds.
+    pub fn closed_in(&self, first: usize, last: usize) -> Vec<usize> {
+        if !self.any_armed() {
+            return Vec::new();
+        }
+        self.lock()
+            .pages
+            .range(first..last)
+            .filter(|(_, e)| matches!(e.state, State::GpuOnlyArmed | State::Syncing))
+            .map(|(&p, _)| p)
+            .collect()
+    }
+
+    /// The page `page`'s group was armed by, while it is closed as
+    /// GPU-only (or being synced).
+    pub fn group_of(&self, page: usize) -> Option<usize> {
+        self.lock()
+            .pages
+            .get(&page)
+            .filter(|e| matches!(e.state, State::GpuOnlyArmed | State::Syncing))
+            .map(|e| e.group)
+    }
+
     /// Where `page` stands.
     pub fn state(&self, page: usize) -> State {
         self.lock()
@@ -488,6 +725,11 @@ impl<B: Protect> PageNet<B> {
     /// What did not go as the plain path expects.
     pub fn oddities(&self) -> Oddities {
         self.lock().oddities
+    }
+
+    /// The demotions not taken yet ([`Self::drain_demotions`]), in order.
+    pub fn demotions(&self) -> Vec<Demotion> {
+        self.lock().demotions.clone()
     }
 
     /// The demotions since the last call, in order.
