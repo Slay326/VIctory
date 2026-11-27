@@ -445,6 +445,16 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+/// Before writes into physical pages through our own views: the title
+/// views showing them now are told, so that pages the GPU side keeps to
+/// itself (its memory model) are brought up to date first and the write
+/// lands on top. A view mapped after this and before the write is told by
+/// its mapping.
+#[must_use = "the write must happen while this lives"]
+fn will_write(shown: &[usize]) -> Vec<victory_gpu::KernelWrite> {
+    shown.iter().filter_map(|&page| victory_gpu::title_memory_will_change(page, PAGE)).collect()
+}
+
 /// Reports writes into physical pages through our own views at every title
 /// view showing them (DirectStorage's page destinations).
 fn report_written(shown: &[usize]) {
@@ -641,6 +651,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let _told = will_write(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -669,6 +680,10 @@ pub(crate) struct PageWindow {
     /// the page there before the bytes landed would never hear of them. An
     /// address that stops showing a page meanwhile was told by the unmap.
     pages: Vec<usize>,
+    /// What the GPU side was told before the window opened (`will_write`),
+    /// kept until its writes are reported.
+    #[allow(dead_code)]
+    told: Vec<victory_gpu::KernelWrite>,
 }
 
 impl Drop for PageWindow {
@@ -694,7 +709,9 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let told = will_write(&shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])));
     Some(PageWindow {
+        told,
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,

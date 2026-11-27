@@ -875,6 +875,18 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// The runtime is about to write title memory `[at, at + len)` by a way
+/// that neither faults nor is announced before it happens (through a view
+/// of its own of the physical pages, reported once written): pages kept in
+/// the GPU's copy alone (`VICTORY_MEMMODEL`) get the GPU's bytes first, so
+/// the write lands on top of them, and are shared from then on. The pages
+/// count as being written until the result is dropped (after the write is
+/// reported), so that none of them is taken, and so closed, while the
+/// write is under way. Nothing, and `None`, without the memory model.
+pub fn title_memory_will_change(at: usize, len: usize) -> Option<Writing> {
+    net::model_on().then(|| writing(at, len))
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
@@ -1021,7 +1033,9 @@ pub(crate) fn own_view_on() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            let on = crate::switch::on("VICTORY_BACK_OWN_VIEW");
+            // The memory model needs it: a GPU-only page is synced through
+            // our own view while the title's stays closed.
+            let on = crate::switch::on("VICTORY_BACK_OWN_VIEW") || net::model_on();
             if on {
                 tracing::info!("copy-backs write view memory through a view of our own (VICTORY_BACK_OWN_VIEW)");
             }

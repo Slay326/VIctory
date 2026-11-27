@@ -231,7 +231,11 @@ impl Host {
 }
 
 pub(crate) fn host() -> Option<&'static Host> {
-    HOST_ASKED.store(true, Ordering::Release);
+    // Read first: a store on every call would bounce the flag's cache line
+    // between all the threads that ask.
+    if !HOST_ASKED.load(Ordering::Relaxed) {
+        HOST_ASKED.store(true, Ordering::Release);
+    }
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),

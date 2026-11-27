@@ -896,6 +896,86 @@ fn the_engines_own_accesses_sync_a_gpu_only_page() {
     assert_eq!(net::demotion(f.second() / PAGE + 1), Some((DemoteReason::Host, 2)));
 }
 
+/// (d) The model closes pages of one section only, named by its size
+/// (`VICTORY_MEMMODEL_SECTION`): a section of another size, no section
+/// named, and memory that is no section's view are left as they are.
+#[test]
+fn only_pages_of_the_named_section_are_closed() {
+    use crate::watch::net::{Refusal, TEST_SECTION, Way, close};
+    let _on = ModelOn::new();
+    let Some(f) = Fixture::views(1, pattern) else {
+        return; // no host GPU here
+    };
+    f.copy().update(f.p, f.len);
+    let refused = net::refused(Refusal::Section);
+    for other in [Some(2 * PAGE), Some(0)] {
+        TEST_SECTION.set(other);
+        close(f.p / PAGE, Way::Marked, f.copy());
+        assert_eq!(net::state(f.p / PAGE), State::Shared, "{other:?}");
+        assert!(protection(f.p) != CLOSED);
+    }
+    assert_eq!(net::refused(Refusal::Section), refused + 1, "another size is counted, none named is not");
+    TEST_SECTION.set(Some(f.len));
+    close(f.p / PAGE, Way::Marked, f.copy());
+    assert_eq!(net::state(f.p / PAGE), State::GpuOnlyArmed, "the section named");
+    TEST_SECTION.set(None);
+    let Some(pool) = Fixture::new(1, pattern) else {
+        return;
+    };
+    pool.copy().update(pool.p, pool.len);
+    close(pool.p / PAGE, Way::Marked, pool.copy());
+    assert_eq!(net::state(pool.p / PAGE), State::Shared, "no section's view");
+}
+
+/// (d) A write the runtime makes through a view of its own of the physical
+/// pages (DirectStorage's page destinations) neither faults nor is seen by
+/// the guards, and is reported only once written. With the memory model it
+/// is told before: a GPU-only page gets the GPU's bytes first, so the write
+/// lands on top of them and the report after it loses nothing; and while
+/// the write is under way no page of it is closed. Without the model the
+/// call does nothing.
+#[test]
+fn a_write_through_the_runtimes_own_view_is_told_before_it_lands() {
+    use crate::watch::net::{Way, close};
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    assert!(crate::watch::title_memory_will_change(PAGE, 16).is_none(), "nothing without the model");
+    let Some((_on, f)) = Fixture::gpu_only(1) else {
+        return; // no host GPU here
+    };
+    let section = f.section.expect("over views").0;
+    // SAFETY: the fixture's section; the runtime's own view of its pages.
+    let own = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, f.len) }.Value as usize;
+    assert!(own != 0);
+    f.marked(&[(16, 0xb0)]);
+    {
+        let _told = crate::watch::title_memory_will_change(f.second(), PAGE).expect("told, with the model");
+        assert_eq!(net::demotion(f.second() / PAGE), Some((DemoteReason::Host, 2)), "synced before the write");
+        assert_eq!(read(own + 16), 0xb0, "the GPU's bytes are in the page");
+        // SAFETY: a byte of the runtime's own view.
+        unsafe { ((own + 20) as *mut u8).write_volatile(0x42) };
+        drop(crate::watch::writing(f.second(), PAGE)); // the report, once written
+    }
+    assert_eq!((f.title(16), f.title(20), f.title(8)), (0xb0, 0x42, 0xa0), "both writers' bytes");
+    f.copy().update(f.p, f.len);
+    assert_eq!(f.first_difference(0, f.len), None, "and the copy takes the write");
+
+    // A page that is not closed when the write is told stays open while it
+    // is under way.
+    let Some(g) = Fixture::views(1, pattern) else {
+        return;
+    };
+    g.copy().update(g.p, g.len);
+    let told = crate::watch::title_memory_will_change(g.second(), PAGE).expect("told");
+    g.copy().update(g.p, g.len);
+    close(g.p / PAGE, Way::Marked, g.copy());
+    assert_eq!(net::state(g.p / PAGE), State::Shared, "not closed under a write");
+    assert!(protection(g.p) != CLOSED && protection(g.second()) != CLOSED);
+    drop(told);
+    g.copy().update(g.p, g.len);
+    close(g.p / PAGE, Way::Marked, g.copy());
+    assert_eq!(net::state(g.p / PAGE), State::GpuOnlyArmed, "closed once it is done");
+}
+
 /// (d) A copy in the GPU's memory has two sides, and only the GPU's holds
 /// what shaders wrote to a GPU-only page: a sync brings the page down
 /// before it goes into title memory, whatever the CPU's side has.

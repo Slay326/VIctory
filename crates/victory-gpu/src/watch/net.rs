@@ -180,6 +180,9 @@ thread_local! {
     /// Tests switch the memory model on for their own thread (it wins over
     /// measuring, as in `mode`).
     pub(crate) static TEST_MODEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests name the model's section for their own thread (its size in
+    /// bytes); otherwise any section's pages may be closed in tests.
+    pub(crate) static TEST_SECTION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 static NET: OnceLock<Option<PageNet<Win>>> = OnceLock::new();
@@ -218,11 +221,12 @@ fn net() -> Option<&'static PageNet<Win>> {
     #[cfg(not(test))]
     NET.get_or_init(|| {
         let asked = std::env::var("VICTORY_PAGENET").ok();
-        let mode = mode(asked.as_deref(), false);
+        let mode = mode(asked.as_deref(), crate::switch::on("VICTORY_MEMMODEL"));
         match (&asked, mode) {
             (_, Some(Mode::Net)) => {
                 ours();
-                let section = section_wanted();
+                let section = section_asked(std::env::var("VICTORY_MEMMODEL_SECTION").ok().as_deref());
+                SECTION.store(section, Relaxed);
                 tracing::info!(
                     section,
                     "memory model on (VICTORY_MEMMODEL): pages only the GPU uses stay in its copy, closed to the title"
@@ -251,6 +255,12 @@ fn net() -> Option<&'static PageNet<Win>> {
         mode.map(|mode| PageNet::new(mode, Win))
     })
     .as_ref()
+}
+
+/// Whether the memory model is on (`VICTORY_MEMMODEL=1`; off unless asked
+/// for).
+pub(crate) fn model_on() -> bool {
+    net().is_some_and(|net| net.mode() == Mode::Net)
 }
 
 /// Our module's address range (found when the net is made: never in the
@@ -429,11 +439,12 @@ const REPORT_FRAMES: u64 = 600;
 /// names, whole each time).
 pub(crate) fn frame() {
     let frame = FRAME.fetch_add(1, Relaxed) + 1;
-    if !frame.is_multiple_of(REPORT_FRAMES) {
-        return;
-    }
     let Some(net) = net() else { return };
     if net.mode() == Mode::Net {
+        model_frame(net, frame);
+        return;
+    }
+    if !frame.is_multiple_of(REPORT_FRAMES) {
         return;
     }
     let report = report(net, frame);
@@ -608,7 +619,137 @@ static OPEN_REFUSED: AtomicU64 = AtomicU64::new(0);
 static SECTION: AtomicUsize = AtomicUsize::new(if cfg!(test) { usize::MAX } else { 0 });
 
 fn section_wanted() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_SECTION.get() {
+        return bytes;
+    }
     SECTION.load(Relaxed)
+}
+
+/// What `VICTORY_MEMMODEL_SECTION` names: the size in bytes of the section
+/// whose pages may be GPU-only, decimal or `0x` hexadecimal (sections have
+/// no name that lasts from run to run; their sizes do). 0, nothing closed,
+/// for anything else.
+fn section_asked(value: Option<&str>) -> usize {
+    let Some(value) = value.map(str::trim) else {
+        return 0;
+    };
+    match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        Some(hex) => usize::from_str_radix(hex, 16).unwrap_or(0),
+        None => value.parse().unwrap_or(0),
+    }
+}
+
+const REASONS: usize = 5;
+/// Pages demoted by [`DemoteReason`] (counted as they are logged).
+static DEMOTED: [AtomicU64; REASONS] = [const { AtomicU64::new(0) }; REASONS];
+
+fn reason_name(reason: DemoteReason) -> (usize, &'static str) {
+    match reason {
+        DemoteReason::CpuRead => (0, "cpu_read"),
+        DemoteReason::CpuWrite => (1, "cpu_write"),
+        DemoteReason::Host => (2, "host"),
+        DemoteReason::Remap => (3, "remap"),
+        DemoteReason::Withheld => (4, "withheld"),
+    }
+}
+
+/// The most demotions logged line by line per frame (all of them go to the
+/// file and into the counts).
+const DEMOTION_LINES: usize = 16;
+
+/// A frame was presented with the model on: the demotions since the last
+/// one are logged (target `victory_gpu::memmodel`: page, reason, frame, how
+/// many addresses left together) and appended to the file
+/// `VICTORY_MEMMODEL_OUT` names (`D` lines, tab-separated), and every
+/// [`REPORT_FRAMES`] frames the counts so far ([`model_summary`]; an `S`
+/// line in the file).
+fn model_frame(net: &PageNet<Win>, frame: u64) {
+    use std::fmt::Write;
+    // Copies that kept pages demoted since: let go here, not in a handler.
+    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(retired);
+    let demotions = net.drain_demotions();
+    let mut out = String::new();
+    for (i, d) in demotions.iter().enumerate() {
+        let (index, reason) = reason_name(d.reason);
+        DEMOTED[index].fetch_add(1, Relaxed);
+        if i < DEMOTION_LINES {
+            tracing::info!(
+                target: "victory_gpu::memmodel",
+                page = format_args!("{:#x}", d.page * PAGE),
+                reason,
+                frame = d.frame,
+                addresses = d.pages,
+                "a GPU-only page was touched: synced and shared from now on"
+            );
+        }
+        let _ = writeln!(out, "D\t{}\t{:#x}\t{reason}\t{}", d.frame, d.page * PAGE, d.pages);
+    }
+    if demotions.len() > DEMOTION_LINES {
+        tracing::info!(target: "victory_gpu::memmodel", more = demotions.len() - DEMOTION_LINES, frame, "more pages demoted in this frame");
+    }
+    if frame.is_multiple_of(REPORT_FRAMES) {
+        let summary = model_summary(net, frame);
+        tracing::info!(target: "victory_gpu::memmodel", "{summary}");
+        let _ = writeln!(out, "S\t{summary}");
+    }
+    if out.is_empty() {
+        return;
+    }
+    if let Some(path) = std::env::var_os("VICTORY_MEMMODEL_OUT") {
+        use std::io::Write;
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(out.as_bytes()));
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "VICTORY_MEMMODEL_OUT: not written");
+        }
+    }
+}
+
+/// The model's counts so far, as one line: pages GPU-only now (addresses);
+/// pages closed and copy-backs skipped, by way back; pages not closed, by
+/// reason; demotions (pages whose access did it), by reason; syncs; title
+/// faults on closed pages; and what must stay 0: syncs that did not land
+/// (`forced_failed`), closed pages met where no sync could run
+/// (`cannot_sync`).
+fn model_summary(net: &PageNet<Win>, frame: u64) -> String {
+    let stats = net.stats();
+    let load = |n: &AtomicU64| n.load(Relaxed);
+    format!(
+        "memmodel frame={frame} gpu_only_addresses={} closed_computed={} closed_declared={} closed_marked={} \
+         skipped_computed={} skipped_declared={} skipped_marked={} \
+         refused_section={} refused_holders={} refused_unguarded={} refused_changed={} refused_net={} refused_demoted={} \
+         demoted_cpu_read={} demoted_cpu_write={} demoted_host={} demoted_remap={} demoted_withheld={} \
+         syncs={} read_faults={} write_faults={} forced_failed={} cannot_sync={} open_refused={}",
+        net.closed(),
+        load(&CLOSED[Way::Computed as usize]),
+        load(&CLOSED[Way::Declared as usize]),
+        load(&CLOSED[Way::Marked as usize]),
+        load(&SKIPPED[Way::Computed as usize]),
+        load(&SKIPPED[Way::Declared as usize]),
+        load(&SKIPPED[Way::Marked as usize]),
+        load(&REFUSED[Refusal::Section as usize]),
+        load(&REFUSED[Refusal::Holders as usize]),
+        load(&REFUSED[Refusal::Unguarded as usize]),
+        load(&REFUSED[Refusal::Changed as usize]),
+        load(&REFUSED[Refusal::Net as usize]),
+        stats.arm_noops,
+        load(&DEMOTED[0]),
+        load(&DEMOTED[1]),
+        load(&DEMOTED[2]),
+        load(&DEMOTED[3]),
+        load(&DEMOTED[4]),
+        stats.syncs,
+        stats.reads.values().sum::<u64>(),
+        stats.writes.values().sum::<u64>(),
+        load(&FORCED_FAILED),
+        load(&CANNOT_SYNC),
+        load(&OPEN_REFUSED),
+    )
 }
 
 /// The copies holding the GPU's bytes of closed pages, by the page each
@@ -918,6 +1059,39 @@ pub(crate) mod tests {
     use super::super::{track, writing};
     use super::*;
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+
+    #[test]
+    fn the_section_is_named_by_its_size() {
+        assert_eq!(section_asked(Some("780140544")), 780_140_544);
+        assert_eq!(section_asked(Some(" 0x2e800000 ")), 0x2e80_0000);
+        for none in [None, Some(""), Some("744MB"), Some("-1"), Some("0x")] {
+            assert_eq!(section_asked(none), 0, "{none:?}");
+        }
+    }
+
+    /// The model's log: every demotion once, with its reason, and the
+    /// counts in one line.
+    #[test]
+    fn demotions_are_counted_by_reason_in_the_summary() {
+        let (p, t) = taken(1, 0x33);
+        TEST_MODEL.set(true);
+        let net = PageNet::new(Mode::Net, Win);
+        assert_eq!(locked(|_| net.arm_group(&[p / PAGE])), Armed::Now);
+        assert!(model_summary(&net, 7).contains("frame=7 gpu_only_addresses=1 "));
+        let before = DEMOTED[reason_name(DemoteReason::Withheld).0].load(Relaxed);
+        assert!(net.demote(p / PAGE, DemoteReason::Withheld));
+        model_frame(&net, 8);
+        assert_eq!(DEMOTED[reason_name(DemoteReason::Withheld).0].load(Relaxed), before + 1);
+        assert!(net.demotions().is_empty(), "taken by the log");
+        let summary = model_summary(&net, 9);
+        assert!(summary.contains(" gpu_only_addresses=0 ") && summary.contains(" syncs=1 "), "{summary}");
+        for field in ["refused_holders=", "demoted_cpu_read=", "demoted_withheld=", "forced_failed=", "cannot_sync="] {
+            assert!(summary.contains(field), "{field}: {summary}");
+        }
+        TEST_MODEL.set(false);
+        drop(t);
+        free(p);
+    }
 
     #[test]
     fn only_measure_switches_it_on() {

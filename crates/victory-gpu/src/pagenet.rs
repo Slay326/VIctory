@@ -640,6 +640,12 @@ impl<B: Protect> PageNet<B> {
         true
     }
 
+    /// How many pages are armed now, GPU-only ones being synced included
+    /// (no lock taken).
+    pub fn closed(&self) -> usize {
+        self.armed.load(Ordering::Relaxed)
+    }
+
     /// Whether any page is armed now (no lock taken).
     pub fn any_armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed) != 0
