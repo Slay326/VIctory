@@ -113,6 +113,10 @@ read as varints.
 - `seq` in ACCESS: the submission the access happened during or after;
   a title-thread ACCESS with `seq = s` that comes after `POINT end s` is
   between submissions s and s+1.
+  The number is read under the stream's lock, and a submission is counted
+  and its SUBMIT written under the same lock, so no record of submission
+  `s` comes before `SUBMIT s` (streams before this rule could have one
+  such record from another thread, by a race between count and SUBMIT).
 - Records come per hook call, not per unit: one ACCESS may cover many
   units (`len`), and the same range may repeat (every list asks for its
   refreshes). A replayer expands ranges to units itself (header shift).

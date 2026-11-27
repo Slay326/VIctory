@@ -221,7 +221,7 @@ pub(crate) fn record(flag: u16, at: usize, len: usize) {
     if let Some(c) = global()
         && let Some(s) = &c.stream
     {
-        s.access(flag, c.submissions.load(Relaxed), at, len);
+        s.access(flag, &c.submissions, at, len);
     }
 }
 
@@ -584,7 +584,14 @@ pub(crate) struct Classifier {
     syncs: Mutex<Vec<(Sync, usize, usize, u64)>>,
     state: Mutex<State>,
     stream: Option<Stream>,
+    /// The last submission's number. With a stream, read and counted only
+    /// under the stream's lock, so that no record of a submission can come
+    /// before its SUBMIT (another thread's record between the count and
+    /// the SUBMIT would carry the new number).
     submissions: AtomicU64,
+    /// Tests: runs between a submission's number and its SUBMIT record.
+    #[cfg(test)]
+    pub(crate) between_number_and_submit: OnceLock<Box<dyn Fn() + Send + std::marker::Sync>>,
     /// Bytes refreshes copied ([`refresh_copied`]), over the run.
     copied: AtomicU64,
     /// Keys asked about in this frame ([`first_in_frame`]).
@@ -616,6 +623,8 @@ impl Classifier {
             state: Mutex::new(State::default()),
             stream,
             submissions: AtomicU64::new(0),
+            #[cfg(test)]
+            between_number_and_submit: OnceLock::new(),
             copied: AtomicU64::new(0),
             seen: Mutex::new(std::collections::HashSet::new()),
             cfg,
@@ -670,7 +679,7 @@ impl Classifier {
             return;
         }
         if let Some(s) = &self.stream {
-            s.access(flag, self.submissions.load(Relaxed), at, len);
+            s.access(flag, &self.submissions, at, len);
         }
         self.units(flag, at, len);
     }
@@ -732,16 +741,24 @@ impl Classifier {
     }
 
     pub(crate) fn submit(&self, lists: usize) -> Submission<'_> {
-        let seq = self.submissions.fetch_add(1, Relaxed) + 1;
-        if let Some(s) = &self.stream {
-            s.submit(seq, lists);
+        let between = || {
+            #[cfg(test)]
+            if let Some(f) = self.between_number_and_submit.get() {
+                f();
+            }
+        };
+        match &self.stream {
+            Some(s) => s.submit(&self.submissions, lists, between),
+            None => {
+                self.submissions.fetch_add(1, Relaxed);
+            }
         }
         Submission(self)
     }
 
     pub(crate) fn point(&self, p: Point) {
         if let Some(s) = &self.stream {
-            s.point(p, self.submissions.load(Relaxed));
+            s.point(p, &self.submissions);
         }
     }
 
@@ -1089,13 +1106,15 @@ impl Stream {
         record(buf, last);
     }
 
-    fn access(&self, flag: u16, seq: u64, at: usize, len: usize) {
+    /// The record carries the submission number read under the lock (see
+    /// [`Classifier::submissions`]).
+    fn access(&self, flag: u16, seq: &AtomicU64, at: usize, len: usize) {
         let tid = thread();
         self.with(|b, last| {
             b.push(rec::ACCESS);
             varint(b, u64::from(flag));
             varint(b, tid);
-            varint(b, seq);
+            varint(b, seq.load(Relaxed));
             varint(b, zigzag(at as i64 - *last as i64));
             varint(b, len as u64);
             *last = at;
@@ -1112,19 +1131,26 @@ impl Stream {
         });
     }
 
-    fn submit(&self, seq: u64, lists: usize) {
-        self.with(|b, _| {
+    /// Counts the next submission and writes its SUBMIT under one lock
+    /// (`between` runs between the two, for tests). The count goes on after
+    /// the stream ended.
+    fn submit(&self, seq: &AtomicU64, lists: usize, between: impl FnOnce()) {
+        let mut b = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        let n = seq.fetch_add(1, Relaxed) + 1;
+        between();
+        if self.on.load(Relaxed) {
+            let (b, _, _) = &mut *b;
             b.push(rec::SUBMIT);
-            varint(b, seq);
+            varint(b, n);
             varint(b, lists as u64);
-        });
+        }
     }
 
-    fn point(&self, p: Point, seq: u64) {
+    fn point(&self, p: Point, seq: &AtomicU64) {
         self.with(|b, _| {
             b.push(rec::POINT);
             b.push(p as u8);
-            varint(b, seq);
+            varint(b, seq.load(Relaxed));
         });
     }
 
