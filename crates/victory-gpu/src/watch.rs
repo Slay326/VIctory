@@ -38,6 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod net;
+
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
@@ -215,9 +217,47 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
+/// The thread holding the guard lock (0: none). The page net's fault path
+/// (`net`) must not wait for a lock its own thread holds.
+static GUARD_OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn this_thread() -> u32 {
+    // SAFETY: no arguments, no failure.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
 #[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> Held {
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    GUARD_OWNER.store(this_thread(), Ordering::Relaxed);
+    Held(guard)
+}
+
+/// The guard lock, held; [`GUARD_OWNER`] names the thread meanwhile.
+#[cfg(not(feature = "diagnostics"))]
+struct Held(std::sync::MutexGuard<'static, Guards>);
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Before the lock is released (the field drops after this).
+        GUARD_OWNER.store(0, Ordering::Relaxed);
+    }
 }
 
 /// The guard lock, timed while held by the line that took it
@@ -227,6 +267,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    GUARD_OWNER.store(this_thread(), Ordering::Relaxed);
     Held(Some(guard), std::time::Instant::now(), line)
 }
 
@@ -259,6 +300,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let us = self.1.elapsed().as_micros() as u64;
+        GUARD_OWNER.store(0, Ordering::Relaxed);
         drop(self.0.take());
         let line = u64::from(self.2);
         if let Some(slot) = HELD
@@ -449,6 +491,11 @@ impl Drop for Tracked {
 /// Gives write access back to page `page` if we guarded it.
 fn open(g: &mut Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    // A page closed as GPU-only (`net`) holds old bytes: it stays closed and
+    // guarded, whoever asks; its next access syncs it.
+    if g.protected.contains(&page) && net::keeps_closed(page) {
+        return false;
+    }
     if !g.protected.remove(&page) {
         return false;
     }
@@ -809,7 +856,20 @@ impl Drop for Writing {
 pub fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Pages closed as GPU-only get the GPU's bytes first and are closed no
+    // more: before the guard lock (`net`'s lock order), and once more if
+    // one was closed between that and the lock. With the range busy under
+    // the lock, none is closed from here on.
+    net::host_touch(at, len);
     let mut g = guards();
+    for _ in 0..8 {
+        if !net::closed(first, last) {
+            break;
+        }
+        drop(g);
+        net::host_touch(at, len);
+        g = guards();
+    }
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
     Writing { first, last }
@@ -823,11 +883,26 @@ pub fn kernel_will_write(at: usize, len: usize) -> Writing {
     writing(at, len)
 }
 
+/// The runtime is about to write title memory `[at, at + len)` by a way
+/// that neither faults nor is announced before it happens (through a view
+/// of its own of the physical pages, reported once written): pages kept in
+/// the GPU's copy alone (`VICTORY_MEMMODEL`) get the GPU's bytes first, so
+/// the write lands on top of them, and are shared from then on. The pages
+/// count as being written until the result is dropped (after the write is
+/// reported), so that none of them is taken, and so closed, while the
+/// write is under way. Nothing, and `None`, without the memory model.
+pub fn title_memory_will_change(at: usize, len: usize) -> Option<Writing> {
+    net::model_on().then(|| writing(at, len))
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::memclass::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Pages closed as GPU-only are synced while our own view still knows
+    // the address, then forgotten.
+    net::remapped(first, last);
     // Our own address of what it showed is no longer its address (taken
     // before the guards, never under them: see `Own`).
     forget_views(at, at.saturating_add(len));
@@ -858,6 +933,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // A page closed as GPU-only cannot drop them (see there).
+    net::withheld(first, last);
     let g = guards();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     mark(&g, first, last);
@@ -900,6 +977,14 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
         && protect(&mut g, &[page]).is_empty()
     {
         changed(&mut g, page, page + 1, false);
+    }
+    // Where they are closed as GPU-only, it is closed with them; if it
+    // cannot be, they are synced and closed no more.
+    let others: Vec<usize> = others.iter().map(|o| o / PAGE).collect();
+    let joined = net::aliased(page, &others);
+    drop(g);
+    if !joined {
+        net::unjoined(&others);
     }
 }
 
@@ -957,7 +1042,9 @@ pub(crate) fn own_view_on() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            let on = crate::switch::on("VICTORY_BACK_OWN_VIEW");
+            // The memory model needs it: a GPU-only page is synced through
+            // our own view while the title's stays closed.
+            let on = crate::switch::on("VICTORY_BACK_OWN_VIEW") || net::model_on();
             if on {
                 tracing::info!("copy-backs write view memory through a view of our own (VICTORY_BACK_OWN_VIEW)");
             }
@@ -1039,6 +1126,27 @@ fn forget_views(at: usize, end: usize) {
 }
 
 impl Own {
+    /// Pages `[first, last)` widened to the whole of every title view we
+    /// know that they touch (what `forget_views` forgets for them).
+    fn reach(&self, first: usize, last: usize) -> (usize, usize) {
+        let (at, end) = (first * PAGE, last.saturating_mul(PAGE));
+        let before = self.views.range(..=at).next_back().filter(|(base, v)| *base + v.0 > at);
+        let (mut lo, mut hi) = (at, end);
+        for (&base, v) in before.into_iter().chain(self.views.range(at.saturating_add(1)..end)) {
+            lo = lo.min(base);
+            hi = hi.max(base + v.0);
+        }
+        (lo / PAGE, hi.div_ceil(PAGE))
+    }
+
+    /// The size in bytes of the section title memory `[at, at + len)` is a
+    /// view of, if we have a view of our own of it ([`Own::beside`]).
+    fn section_of(&self, at: usize, len: usize) -> Option<usize> {
+        self.beside(at, len)?;
+        let (_, &(_, section, _)) = self.views.range(..=at).next_back()?;
+        self.sections.get(&section).map(|&(_, bytes)| bytes)
+    }
+
     /// Our own address of title memory `[at, at + len)`, if it lies in one
     /// title view of a section we have a view of.
     fn beside(&self, at: usize, len: usize) -> Option<usize> {
@@ -1142,14 +1250,21 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let at = r.ExceptionInformation[1];
+        let (kind, at) = (r.ExceptionInformation[0], r.ExceptionInformation[1]);
+        // A page closed to measure its accesses (`net`) is asked for first:
+        // looked at here first, the guard would open such a page for a
+        // write and the access would go uncounted.
+        if (kind == READ || kind == WRITE) && net::fault(at, kind == WRITE, r.ExceptionAddress as usize) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if kind != WRITE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
         // Held across both checks: another thread may have opened the block
@@ -1223,6 +1338,14 @@ pub(crate) mod tests {
         } as usize;
         assert!(p != 0 && p.is_multiple_of(PAGE));
         p
+    }
+
+    /// Page `page` (a page number) counts as changed in the buffer copies'
+    /// trackers holding it, its guard left as it is: what [`retake`] does
+    /// to a page, without telling the net that shaders' writes were
+    /// withheld there.
+    pub(crate) fn to_take_again(page: usize) {
+        mark(&guards(), page, page + 1);
     }
 
     pub(crate) fn free(p: usize) {

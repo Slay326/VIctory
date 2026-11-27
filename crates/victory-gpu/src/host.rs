@@ -132,7 +132,120 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+/// The submission lock, held: [`SUBMITTER`] names the thread meanwhile.
+pub(crate) struct Submission<'a>(std::sync::MutexGuard<'a, u64>);
+
+impl std::ops::Deref for Submission<'_> {
+    type Target = u64;
+    fn deref(&self) -> &u64 {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Submission<'_> {
+    fn deref_mut(&mut self) -> &mut u64 {
+        &mut self.0
+    }
+}
+
+impl Drop for Submission<'_> {
+    fn drop(&mut self) {
+        // Before the lock is released (the field drops after this).
+        SUBMITTER.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The thread holding the submission lock (0: none). Code that must run
+/// with no submission under way ([`submission_idle`]) may be reached from
+/// inside one, by a fault of the submitting thread itself: it must not wait
+/// for a lock its own thread holds.
+static SUBMITTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether a host device was asked for yet ([`host`]): a fault handler asks
+/// for the lock of one that exists and never makes one.
+static HOST_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// This thread works for the submitting thread, which holds the
+    /// submission lock for it ([`for_submitter`]).
+    static FOR_SUBMITTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn this_thread() -> u32 {
+    // SAFETY: no arguments, no failure.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// Runs `f` as part of the submission the calling thread's spawner holds
+/// the submission lock for (the copy-back's worker threads).
+pub(crate) fn for_submitter<R>(f: impl FnOnce() -> R) -> R {
+    FOR_SUBMITTER.set(true);
+    let done = f();
+    FOR_SUBMITTER.set(false);
+    done
+}
+
+/// Whether the calling thread holds the submission lock or works for the
+/// thread that does ([`for_submitter`]). Threads it hands work to and waits
+/// for are part of its submission as it is itself, and must be told so
+/// (`crate::texture::in_parallel`): what they do may need the lock
+/// ([`submission_idle`]: a page kept in the GPU's copy alone that they
+/// read), which their spawner holds until they are done.
+pub(crate) fn in_submission() -> bool {
+    SUBMITTER.load(Ordering::Relaxed) == this_thread() || FOR_SUBMITTER.get()
+}
+
+/// Runs `f` with no submission under way and the last one's copy-backs
+/// done: holding the submission lock, unless this thread holds it already
+/// or works for the thread that does (then `f` runs between that
+/// submission's own steps, where the GPU is idle for it as well: a
+/// submission is waited for before its copy-backs and writes start).
+pub(crate) fn submission_idle<R>(f: impl FnOnce() -> R) -> R {
+    if in_submission() {
+        return f();
+    }
+    let host = if HOST_ASKED.load(Ordering::Acquire) { host() } else { None };
+    let _one = host.map(Host::submission);
+    f()
+}
+
+/// What changed on the CPU's side of copies in the GPU's memory goes to
+/// their GPU side now, as before a submission's lists run, and is waited
+/// for (tests: a whole submission would also take every test's marks).
+#[cfg(test)]
+pub(crate) fn card_up() {
+    let Some(host) = host() else { return };
+    let mut submitted = host.submission();
+    let kept = host.card_before(&[]);
+    *submitted += 1;
+    // SAFETY: our queue, fence and event, waited for under the submission
+    // lock as `execute` does.
+    unsafe {
+        let waited = host
+            .queue
+            .Signal(&host.fence, *submitted)
+            .and_then(|()| host.fence.SetEventOnCompletion(*submitted, host.event));
+        if waited.is_ok() {
+            WaitForSingleObject(host.event, INFINITE);
+        }
+    }
+    drop(kept);
+}
+
+impl Host {
+    /// Takes the submission lock.
+    fn submission(&self) -> Submission<'_> {
+        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        SUBMITTER.store(this_thread(), Ordering::Relaxed);
+        Submission(held)
+    }
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
+    // Read first: a store on every call would bounce the flag's cache line
+    // between all the threads that ask.
+    if !HOST_ASKED.load(Ordering::Relaxed) {
+        HOST_ASKED.store(true, Ordering::Release);
+    }
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
@@ -473,6 +586,14 @@ pub(crate) mod tests {
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// Runs `f` holding the submission lock, as a submission's steps run
+    /// (`None` without a host GPU).
+    pub(crate) fn submitting<R>(f: impl FnOnce() -> R) -> Option<R> {
+        let host = super::host()?;
+        let _one = host.submission();
+        Some(f())
+    }
+
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
@@ -523,7 +644,7 @@ pub(crate) mod tests {
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.submission();
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
@@ -563,7 +684,7 @@ pub(crate) mod tests {
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
         // No submission takes the marks meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.submission();
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
             let slots = crate::shadow::reads_since();
@@ -610,7 +731,7 @@ pub(crate) mod tests {
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
             // No submission takes the marks meanwhile.
-            let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let _one = host.submission();
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
                 crate::shadow::tests::mark_read(false, 5);
@@ -655,7 +776,7 @@ pub(crate) mod tests {
         let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
         viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.submission();
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
         copy.unstamp();
@@ -684,7 +805,7 @@ pub(crate) mod tests {
         let old = crate::resource::host_copy(object).expect("a host texture");
         assert!(crate::resource::placed_in_heap(&old).is_some(), "in a heap of textures");
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.submission();
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
         assert!(crate::texture::staging(object, &old.texture).is_some(), "uploaded before");
@@ -726,7 +847,7 @@ pub(crate) mod tests {
             })
             .collect();
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.submission();
         let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "each brought up once");
@@ -1281,7 +1402,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = self.submission();
         // Stage 1 classification: the submission's points in its stream.
         let _memclass = crate::memclass::submission(runs.len());
         let started = std::time::Instant::now();
@@ -1342,6 +1463,24 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        // With the memory model: what this submission may withhold is no
+        // GPU-only page when its lists run (`may_be_withheld`). Such a page
+        // gets the GPU's bytes in title memory here, the bytes to go back
+        // to; found out after the lists ran, there would be none.
+        if crate::watch::net::model_on() {
+            let mut declared: Vec<(usize, usize, usize, bool)> = Vec::new();
+            for list in runs {
+                declared.extend(list.deferred().copies.iter().filter_map(|step| match step {
+                    Step::GpuWrite(shadow, address, len, _, memory) => {
+                        Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *len, *memory))
+                    }
+                    _ => None,
+                }));
+            }
+            for (address, len) in may_be_withheld(declared) {
+                crate::watch::net::program_writes(address, len);
+            }
+        }
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -2549,6 +2688,31 @@ impl HostList {
     }
 }
 
+/// Of the ranges a submission's lists declare for their shaders' writes
+/// (copy, address, bytes, whether the writing program uses title memory):
+/// the ranges (address, bytes) `Host::execute` keeps out of title memory
+/// if a list of the submission misses memory, or one did lately
+/// (`crate::memory::withholding`). Those are every range of a program
+/// using title memory, and every other range overlapping one of them in
+/// the same copy, which is withheld with it.
+fn may_be_withheld(mut declared: Vec<(usize, usize, usize, bool)>) -> Vec<(usize, usize)> {
+    // The world's lists declare the same ranges dozens of times.
+    declared.sort_unstable();
+    declared.dedup();
+    let programs: Vec<(usize, usize, usize)> =
+        declared.iter().filter(|d| d.3).map(|&(copy, address, len, _)| (copy, address, len)).collect();
+    if programs.is_empty() {
+        return Vec::new();
+    }
+    declared
+        .iter()
+        .filter(|&&(copy, address, len, memory)| {
+            memory || programs.iter().any(|&(c, a, n)| c == copy && a < address + len && address < a + n)
+        })
+        .map(|&(_, address, len, _)| (address, len))
+        .collect()
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -2710,11 +2874,20 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut done = 0;
-    // SAFETY: the destination is `len` bytes the caller may write, host
-    // memory or title memory; the kernel checks both ranges, and a page it
-    // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    // Pages closed to measure the title's accesses are opened first: the
+    // kernel would fail on them (no cost unless that is switched on).
+    crate::watch::net::host_touch(src as usize, len);
+    crate::watch::net::host_touch(dst as usize, len);
+    let copy = || {
+        let mut done = 0;
+        // SAFETY: the destination is `len` bytes the caller may write, host
+        // memory or title memory; the kernel checks both ranges, and a page
+        // it cannot read or write fails the call instead of faulting.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    };
+    // Once more if a page was closed between the look above and the copy
+    // (the memory model's; asked only when the copy failed).
+    copy() || (crate::watch::net::touched_again(src as usize, dst as usize, len) && copy())
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -3214,6 +3387,7 @@ impl Meter {
         self.frames += 1;
         crate::memory::log_frame();
         crate::descriptor::sweep();
+        crate::watch::net::frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         crate::memclass::frame_done();
@@ -4147,6 +4321,110 @@ mod batch {   // `mod tests` is already taken at the top of this file
 
 #[cfg(test)]
 mod withholding {
+    /// What a submission may keep out of title memory is known from what
+    /// its lists declare: the ranges of programs using title memory, and
+    /// the ranges of others that overlap one of those in the same copy.
+    #[test]
+    fn what_a_submission_may_withhold_is_known_before_it_runs() {
+        // (copy, address, bytes, the writer uses title memory)
+        let declared = vec![
+            (1, 0x1000, 0x100, false),
+            (1, 0x2000, 0x100, true),
+            (1, 0x20f0, 0x100, false),
+            (1, 0x2100, 0x10, false),
+            (1, 0x1ff0, 0x10, false),
+            (2, 0x2000, 0x100, false),
+            (1, 0x2000, 0x100, true),
+            (1, 0x20f0, 0x100, false),
+            (3, 0x5000, 0, true),
+        ];
+        assert_eq!(
+            super::may_be_withheld(declared.clone()),
+            [(0x2000, 0x100), (0x20f0, 0x100), (0x5000, 0)],
+            "each once; not what only touches, nor another copy's"
+        );
+        let none: Vec<_> = declared.into_iter().filter(|d| !d.3).collect();
+        assert!(super::may_be_withheld(none).is_empty(), "no program using title memory: nothing");
+    }
+
+    /// With the memory model, a submission whose list misses memory drops
+    /// what its programs using title memory wrote exactly as without the
+    /// model, also from pages that were GPU-only: the ranges such a list
+    /// declares (and the ranges withheld with them) leave the class before
+    /// the lists run, with the GPU's earlier bytes in title memory, so the
+    /// title never sees the withheld bytes and the copy takes the earlier
+    /// ones again. A page no list of it declares stays GPU-only.
+    #[test]
+    fn a_submission_that_misses_withholds_from_pages_that_were_gpu_only() {
+        use crate::pagenet::{DemoteReason, State};
+        use crate::watch::net::{self, TEST_MODEL, TEST_SECTION, Way};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile};
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // A section size no other test has: the submission takes the marks
+        // of every test running, with the model on for this thread.
+        const PAGES: usize = 7;
+        let len = PAGES * PAGE;
+        TEST_MODEL.set(true);
+        TEST_SECTION.set(Some(len));
+        let (section, p, second) = crate::watch::tests::reported_section(PAGES);
+        // SAFETY: the fresh view, not guarded yet.
+        unsafe { (p as *mut u8).write_bytes(0x11, len) };
+        // SAFETY: the section, mapped once more where nobody knows of it.
+        let peek = unsafe { MapViewOfFile(section as _, FILE_MAP_READ, 0, 0, len) }.Value as usize;
+        assert!(peek != 0);
+        // SAFETY: bytes of that view.
+        let physical = |at: usize| unsafe { ((peek + at) as *const u8).read_volatile() };
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        copy.update(p, len);
+        for k in 0..3 {
+            net::close(p / PAGE + k, Way::Marked, &copy);
+            assert_eq!(net::tests::state(p / PAGE + k), State::GpuOnlyArmed, "page {k}");
+            // An earlier submission's write, whose copy-back was skipped.
+            copy.write_host((p + k * PAGE + 16) as u64, &[0xb0 + k as u8]);
+        }
+        assert_eq!((physical(16), physical(PAGE + 16)), (0x11, 0x11), "only in the copy");
+        let list = host.new_list().unwrap();
+        // (start, bytes, the writer uses title memory, where it writes, the byte)
+        let writes = [(0, 32, true, 24, 0xee), (16, PAGE + 16, false, PAGE + 20, 0x44)];
+        for &(at, bytes, memory, to, value) in &writes {
+            let _writer = list.writer_uses_memory(memory);
+            let (copy, address) = (copy.clone(), (p + at) as u64);
+            copy.refresh(&list, address, bytes as u64);
+            copy.gpu_writes(&list, address, bytes as u64, false);
+            // The shader's write, after the step that keeps the range's bytes.
+            list.defer_host(move || copy.write_host((p + to) as u64, &[value]));
+        }
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        for k in 0..2 {
+            assert_eq!(net::tests::state(p / PAGE + k), State::Demoted, "page {k}");
+            assert_eq!(net::tests::demotion(p / PAGE + k), Some((DemoteReason::Program, 2)), "page {k}: before the lists ran");
+        }
+        assert_eq!((physical(16), physical(PAGE + 16)), (0xb0, 0xb1), "the earlier bytes are in title memory");
+        assert_eq!(physical(24), 0x11, "withheld: never in title memory");
+        assert_eq!(physical(PAGE + 20), 0x11, "nor what was withheld with it");
+        copy.update(p, len);
+        let host_copy = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        assert_eq!((host_copy(16), host_copy(24)), (0xb0, 0x11), "the copy took the bytes from before");
+        assert_eq!((host_copy(PAGE + 16), host_copy(PAGE + 20)), (0xb1, 0x11));
+        assert_eq!(net::tests::demotions_of(&[p / PAGE, p / PAGE + 1, second / PAGE, second / PAGE + 1]), 2);
+        // Page 2: declared by no list.
+        assert_eq!(net::tests::state(p / PAGE + 2), State::GpuOnlyArmed, "stays GPU-only");
+        assert_eq!(physical(2 * PAGE + 16), 0x11);
+        // SAFETY: a byte of the title's view; closed: the handler syncs it.
+        assert_eq!(unsafe { ((p + 2 * PAGE + 16) as *const u8).read_volatile() }, 0xb2, "until the title reads it");
+        crate::shadow::unregister(p, p as u64);
+        drop((list, copy));
+        crate::watch::title_memory_section_gone(section);
+        TEST_SECTION.set(None);
+        TEST_MODEL.set(false);
+    }
+
     /// A list in which a program using title memory missed memory: what
     /// that program wrote is withheld from title memory and leaves the
     /// copies at once; what an ordinary program wrote in the same list goes

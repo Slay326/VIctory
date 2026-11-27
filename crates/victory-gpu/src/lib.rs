@@ -43,6 +43,9 @@ mod memclass;
 #[cfg(windows)]
 mod memory;
 pub mod object;
+pub mod pagenet;
+#[cfg(test)]
+mod pagenet_tests;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
@@ -78,5 +81,5 @@ pub use memclass::{allocated as memclass_allocated, finish as memclass_finish, i
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped, title_memory_section,
-    title_memory_section_gone, title_memory_view, kernel_will_write,
+    title_memory_section_gone, title_memory_view, kernel_will_write, title_memory_will_change,
 };
