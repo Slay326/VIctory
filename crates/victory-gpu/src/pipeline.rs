@@ -88,6 +88,62 @@ pub(crate) fn builder_loop_limit() -> Option<u32> {
     })
 }
 
+/// The stage of `VICTORY_BVH_COHERENT` (default off, local test branch):
+/// `1` the BVH builder's refit 5552dac6 only, `2` every stage of the
+/// builder. Those translate with coherent title memory where the console
+/// bypasses its caches (H-05 variant b, Fable's decision): `glc`/`dlc`
+/// accesses read and write through the page's UAV marked globally coherent
+/// instead of its SRV, no fence (`victory_shader::emit::set_coherent_parts`
+/// with [`COHERENT_PARTS`]). Without it the refit's bottom levels came out
+/// invalid in the harness on both cards; with it valid in 70 of 70. Every
+/// other program translates as without the switch.
+#[cfg(windows)]
+pub(crate) fn builder_coherent() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let level = coherent_switch(std::env::var("VICTORY_BVH_COHERENT").ok().as_deref());
+        if level != 0 {
+            tracing::warn!(
+                level,
+                "VICTORY_BVH_COHERENT: {} translate with globally coherent title memory where the \
+                 console bypasses its caches (cached apart)",
+                if level == 1 { "the BVH builder's refit 5552dac6" } else { "all the BVH builder's stages" }
+            );
+        }
+        level
+    })
+}
+
+/// The parts of the coherent translation (H-05 variant b): the UAV,
+/// globally coherent; no fence at `s_waitcnt_vscnt`.
+const COHERENT_PARTS: u8 = victory_shader::emit::COHERENT_UAV | victory_shader::emit::COHERENT_GLOBAL;
+
+/// The builder's refit, the one stage the harness showed the switch to make
+/// valid (shader hash prefix, as logged).
+const COHERENT_REFIT: &str = "5552dac6";
+
+/// `VICTORY_BVH_COHERENT` as set: `1` or `2`, anything else off (0).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn coherent_switch(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// The coherence parts a stage translates with (0: none): only the
+/// builder's, at level 1 only its refit, at level 2 all of them
+/// ([`builder_coherent`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn coherent_translation(builder: bool, hash: &str, level: u8) -> u8 {
+    match level {
+        1 if builder && hash.starts_with(COHERENT_REFIT) => COHERENT_PARTS,
+        2 if builder => COHERENT_PARTS,
+        _ => 0,
+    }
+}
+
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)
@@ -146,8 +202,11 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let limit = if self.builder.load(std::sync::atomic::Ordering::Relaxed) { builder_loop_limit() } else { None };
-                let (done, cached) = translate(&self.container, limit);
+                let builder = self.builder.load(std::sync::atomic::Ordering::Relaxed);
+                let limit = if builder { builder_loop_limit() } else { None };
+                let level = builder_coherent();
+                let coherent = coherent_translation(builder, &self.hash, level);
+                let (done, cached) = translate(&self.container, limit, (coherent, level));
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -155,6 +214,7 @@ impl Shader {
                         stage = self.stage,
                         hash = %self.hash,
                         loop_limit = ?limit,
+                        coherent,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         cached,
@@ -204,11 +264,11 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
-fn translate(container: &[u8], loop_limit: Option<u32>) -> (Result<Translated, String>, bool) {
+fn translate(container: &[u8], loop_limit: Option<u32>, coherent: (u8, u8)) -> (Result<Translated, String>, bool) {
     // The device first: it tells the translator (and the shader cache's
     // key) its widest wave.
     crate::host::host();
-    let (host, cached) = crate::shader_cache::host_shader_with(container, loop_limit);
+    let (host, cached) = crate::shader_cache::host_shader_with(container, loop_limit, coherent);
     // The same choice as the translation's options.
     let group_x_offset = crate::shader_cache::wide_groups(container);
     let made = host.and_then(|host| with_resources(container, host));
@@ -807,6 +867,53 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// `VICTORY_BVH_COHERENT` reaches the builder's stages only (`1` its
+    /// refit 5552dac6, `2` all), with variant b (UAV, globally coherent, no
+    /// fence): every other stage translates exactly as with the switch off
+    /// (the same translation request, so byte for byte the same DXIL and
+    /// cache entry, `crate::shader_cache` tests); off, no stage changes.
+    #[test]
+    fn the_coherent_switch_reaches_only_the_builders_stages() {
+        use victory_shader::emit::{COHERENT_FENCE, COHERENT_GLOBAL, COHERENT_UAV};
+        assert_eq!(super::coherent_switch(Some("1")), 1);
+        assert_eq!(super::coherent_switch(Some(" 2 ")), 2);
+        for off in [None, Some(""), Some("0"), Some("3"), Some("yes"), Some("true")] {
+            assert_eq!(super::coherent_switch(off), 0, "{off:?}");
+        }
+        let b = COHERENT_UAV | COHERENT_GLOBAL;
+        assert_eq!(super::COHERENT_PARTS, b, "variant b");
+        assert_eq!(super::COHERENT_PARTS & COHERENT_FENCE, 0, "no fence");
+        let (refit, other_stage) = ("5552dac6a2b7a1fd", "93be497edd442293");
+        assert_eq!(super::coherent_translation(true, refit, 1), b, "1: the refit");
+        assert_eq!(super::coherent_translation(true, other_stage, 1), 0, "1: no other builder stage");
+        assert_eq!(super::coherent_translation(true, refit, 2), b, "2: the refit");
+        assert_eq!(super::coherent_translation(true, other_stage, 2), b, "2: every builder stage");
+        for level in [0, 1, 2] {
+            // A title program that happened to share the refit's prefix is
+            // still not the builder's.
+            assert_eq!(super::coherent_translation(false, refit, level), 0, "not the builder's, {level}");
+            assert_eq!(super::coherent_translation(false, other_stage, level), 0, "not the builder's, {level}");
+        }
+        assert_eq!(super::coherent_translation(true, refit, 0), 0, "off");
+        // A stage outside the builder with the switch on, through the
+        // translation the host makes: the DXIL of today.
+        let container = crate::shader_cache::tests::coherent_container();
+        let options = victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None };
+        let today = victory_shader::emit::translate_with(&container, options).expect("translates");
+        for level in [1, 2] {
+            let other = crate::shader_cache::translate_container(
+                &container,
+                options,
+                super::coherent_translation(false, refit, level),
+            )
+            .expect("translates");
+            assert_eq!(other.dxil, today.dxil, "not the builder's: byte for byte as today with {level}");
+        }
+        let builder = crate::shader_cache::translate_container(&container, options, super::coherent_translation(true, refit, 1))
+            .expect("translates");
+        assert_ne!(builder.dxil, today.dxil, "the builder's refit: coherent");
+    }
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

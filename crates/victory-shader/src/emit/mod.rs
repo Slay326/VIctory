@@ -457,7 +457,9 @@ pub const COHERENT_FENCE: u8 = 4;
 /// the page's globally coherent UAV, not its SRV) and fence UAVs device-wide
 /// at `s_waitcnt_vscnt` (a `DeviceMemoryBarrier`). Off by default; off, the
 /// translation is byte for byte as without the switch. Per thread, so a
-/// shader cache filled on other threads is never touched.
+/// shader cache filled on other threads is never touched. The host turns it
+/// on only around translations of the BVH builder's stages with
+/// `VICTORY_BVH_COHERENT=1` ([`with_coherent`]; local test branch).
 pub fn set_coherent(on: bool) {
     set_coherent_parts(if on { COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE } else { 0 });
 }
@@ -476,6 +478,20 @@ pub fn coherent_parts() -> u8 {
 /// Whether any part of [`set_coherent`] is on for this thread.
 pub fn coherent() -> bool {
     coherent_parts() != 0
+}
+
+/// `f` run with [`set_coherent_parts`]`(parts)` on this thread, and the
+/// thread's parts from before restored after it (also when `f` panics).
+pub fn with_coherent<R>(parts: u8, f: impl FnOnce() -> R) -> R {
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_coherent_parts(self.0);
+        }
+    }
+    let _restore = Restore(coherent_parts());
+    set_coherent_parts(parts);
+    f()
 }
 
 /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc is
