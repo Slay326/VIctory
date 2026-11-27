@@ -77,6 +77,12 @@ pub(crate) use card::{card_fetch, run_now};
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
+/// The submissions made so far, as `submitted` counts them (the `sN` of the
+/// diagnostics lines): for title CPU code that has no lock to take
+/// (`victory_loader::probe`, diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -1455,6 +1461,8 @@ impl Host {
         let mut marks_sent = false;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            SUBMITTED.store(*submitted, std::sync::atomic::Ordering::Relaxed);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
@@ -1557,7 +1565,7 @@ impl Host {
         if gt_target.is_some() {
             let mut builds: Vec<(u64, u8)> = runs.iter().flat_map(|l| l.take_gt_builds()).collect();
             crate::bvh_gt::log_rehydration(*submitted, &builds);
-            builds.retain(|b| b.1 != crate::bvh_gt::START_STAGE);
+            builds.retain(|b| !crate::bvh_gt::is_unpacking_mark(b.1));
             crate::bvh_gt::note_builds(*submitted, &builds);
         }
         let mut gt = gt_target.and_then(|hash| {

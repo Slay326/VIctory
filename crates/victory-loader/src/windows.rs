@@ -242,6 +242,10 @@ impl LoadedImage {
                             Provenance::Host => report.host += 1,
                             Provenance::Title => report.title += 1,
                         }
+                        // `VICTORY_TITLE_PROBE` (diagnostics): the builder
+                        // DLL's unpacking and build behind logging wrappers.
+                        #[cfg(feature = "diagnostics")]
+                        let address = crate::probe::wrap_import(&module.dll, &entry.symbol, address);
                         slots.push((entry.iat_slot_rva, address));
                     }
                     Resolution::Missing => {

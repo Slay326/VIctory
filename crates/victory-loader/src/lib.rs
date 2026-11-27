@@ -24,6 +24,8 @@
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe;
 pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -43,6 +45,8 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use probe::arm_title_probe;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

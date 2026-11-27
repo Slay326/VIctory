@@ -884,6 +884,11 @@ impl State {
                             if let Some(at) = crate::bvh_gt::start_target(&p.name, &values) {
                                 list.note_gt_build(at, crate::bvh_gt::START_STAGE);
                             }
+                            // Fable Aufruf 14 P8: the unpacking's destination as
+                            // well (user data 37/38, the builder's slot 2).
+                            if let Some((at, mark)) = crate::bvh_gt::unpack_destination(&p.name, &values) {
+                                list.note_gt_build(at, mark);
+                            }
                         }
                         #[cfg(feature = "diagnostics")]
                         if capturing {

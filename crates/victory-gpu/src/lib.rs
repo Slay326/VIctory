@@ -76,6 +76,13 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// The submissions made so far (diagnostics): the `sN` of the diagnostics
+/// lines, one atomic read, safe from an exception handler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn submitted() -> u64 {
+    host::SUBMITTED.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped, title_memory_section,

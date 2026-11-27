@@ -136,23 +136,59 @@ pub(crate) fn start_target(name: &str, values: &[u32]) -> Option<u64> {
     (at != 0 && at & 0xff == 0).then_some(at)
 }
 
+/// Marks of the unpacking's destination, user data 37/38 (the builder binds
+/// the source at its root slot 1, user data 35/36, and the destination at
+/// slot 2, 37/38: rt-rea-bvh-calls.md section 1), of 4ddd6f97 and of
+/// 5e687674. Logged only, not part of the build map.
+pub(crate) const START_DEST_STAGE: u8 = 8;
+pub(crate) const REHYDRATE_DEST_STAGE: u8 = 9;
+
+/// Whether a build mark is one of the unpacking's, logged by
+/// [`log_rehydration`] and kept out of the build map.
+pub(crate) fn is_unpacking_mark(stage: u8) -> bool {
+    matches!(stage, START_STAGE | START_DEST_STAGE | REHYDRATE_DEST_STAGE)
+}
+
+/// The destination a 4ddd6f97 or 5e687674 bind names (user data 37 and 38)
+/// and its mark; none for other programs and for addresses no header can
+/// lie at.
+pub(crate) fn unpack_destination(name: &str, values: &[u32]) -> Option<(u64, u8)> {
+    let mark = if name.contains(START) {
+        START_DEST_STAGE
+    } else if name.contains(REHYDRATE) {
+        REHYDRATE_DEST_STAGE
+    } else {
+        return None;
+    };
+    let at = u64::from(*values.get(37)?) | u64::from(*values.get(38)?) << 32;
+    (at != 0 && at & 0xff == 0).then_some((at, mark))
+}
+
 /// Every unpacking of the run by submission (Fable Aufruf 13): the bottom
 /// levels the 4ddd6f97 binds and the 5e687674 binds of submission
 /// `submission` named, all of them, one line per submission that has any.
+/// Logged from the run's start, whatever `VICTORY_BVH_GT_FROM` says (only
+/// `VICTORY_BVH_GT` is needed). Fable Aufruf 14 P8: then the destinations
+/// the same binds name at user data 37/38, in the same order.
 pub(crate) fn log_rehydration(submission: u64, targets: &[(u64, u8)]) {
     let of = |stage: u8| -> Vec<String> {
         targets.iter().filter(|t| t.1 == stage).map(|t| format!("{:#x}", t.0)).collect()
     };
     let (starts, rehydrated) = (of(START_STAGE), of(2));
-    if starts.is_empty() && rehydrated.is_empty() {
+    let (start_dest, rehydrated_dest) = (of(START_DEST_STAGE), of(REHYDRATE_DEST_STAGE));
+    if starts.is_empty() && rehydrated.is_empty() && start_dest.is_empty() && rehydrated_dest.is_empty() {
         return;
     }
     tracing::info!(
-        "BVH GT s{submission} rehydration: {} binds of 4ddd6f97 [{}]; {} binds of 5e687674 [{}]",
+        "BVH GT s{submission} rehydration: {} binds of 4ddd6f97 [{}]; {} binds of 5e687674 [{}];          dest(37/38) {} of 4ddd6f97 [{}]; {} of 5e687674 [{}]",
         starts.len(),
         starts.join(" "),
         rehydrated.len(),
         rehydrated.join(" "),
+        start_dest.len(),
+        start_dest.join(" "),
+        rehydrated_dest.len(),
+        rehydrated_dest.join(" "),
     );
 }
 
@@ -3951,6 +3987,13 @@ mod tests {
         assert_eq!(start_target("cs 4ddd6f9702fab2a7", &values), Some(0x7_0305_d100));
         assert_eq!((start_target("5e687674", &values), start_target("4ddd6f97", &values[..36])), (None, None));
         assert_eq!(build_target("4ddd6f97", &values), None, "a start is no build of the map");
+        // Fable Aufruf 14 P8: the destination at user data 37/38.
+        (values[37], values[38]) = (0x0405_e200, 0x7);
+        assert_eq!(unpack_destination("cs 4ddd6f9702fab2a7", &values), Some((0x7_0405_e200, START_DEST_STAGE)));
+        assert_eq!(unpack_destination("5e687674", &values), Some((0x7_0405_e200, REHYDRATE_DEST_STAGE)));
+        assert_eq!((unpack_destination("5552dac6", &values), unpack_destination("4ddd6f97", &values[..38])), (None, None));
+        assert!(is_unpacking_mark(START_STAGE) && is_unpacking_mark(START_DEST_STAGE) && is_unpacking_mark(REHYDRATE_DEST_STAGE));
+        assert!(!is_unpacking_mark(2) && !is_unpacking_mark(TOP_STAGE) && !is_unpacking_mark(0));
         assert_eq!(build_target("5e687674", &values), Some((0x7_0305_d100, 2)));
         assert_eq!(build_target("f607780a", &values), None);
         assert_eq!(build_target("5552dac6", &values[..17]), None);
