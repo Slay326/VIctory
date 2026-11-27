@@ -768,7 +768,7 @@ pub(crate) fn check(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> Check {
 /// [`check`] with `extra` bytes added to the size dword 1 gives: 64 reads
 /// the size as the nodes past the header (an open question of the format).
 pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64) -> Check {
-    check_core(read, base, extra, None)
+    check_core(read, base, extra, None, false)
 }
 
 /// The second validator (senior 96, `BVH GT s.. v2` lines; [`check`] stays
@@ -778,11 +778,13 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
 /// word (rehydrated ones) are compared in their stored units, around
 /// `centre` ([`Centre`]).
 pub(crate) fn check_v2(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> Check {
-    check_core(read, base, 64, Some(centre))
+    check_core(read, base, 64, Some(centre), false)
 }
 
-/// [`check_with`] (`v2` none: as before) or [`check_v2`].
-fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Option<Centre>) -> Check {
+/// [`check_with`] (`v2` none: as before) or [`check_v2`]; with `node_end`
+/// (v3b, senior 105) a box node must also end inside the size, not only
+/// start there (box16 64 bytes, box32 112).
+fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Option<Centre>, node_end: bool) -> Check {
     let mut c = Check::default();
     let fail = |c: &mut Check, why: String| {
         if c.why.is_none() {
@@ -826,6 +828,11 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
             continue;
         }
         let n = if kind == 4 { 16 } else { 28 };
+        if node_end && at(p) + 4 * n > bytes {
+            c.outside += 1;
+            fail(&mut c, format!("box node {p:#x} ends past the size {bytes:#x}"));
+            continue;
+        }
         let Some(w) = (0..n).map(|i| read(base + at(p) + 4 * i)).collect::<Option<Vec<u32>>>() else {
             c.missing += 1;
             continue;
@@ -1180,6 +1187,20 @@ pub(crate) struct TopCheck {
     /// and the first thing not read (box node, instance, bottom level).
     pub(crate) first_defect: Option<String>,
     pub(crate) first_unread: Option<String>,
+    /// v3b (senior 105): whether a word that decides [`TopCheck::first_defect`]
+    /// came from title memory (the defect word itself, the pointers and
+    /// header words that led to it, the bottom-level header for "no header"
+    /// or an open box); whether any word of the tree (header, box nodes,
+    /// instance entries' dword 15) did; reached instances whose
+    /// bottom-level header (read for its kind only) did; whether any word
+    /// read did ([`top_v3_over`] sets it); and, of a verdict that
+    /// [`top_v3_over`] turned into "not judged", its index before
+    /// ([`Verdict::index`]).
+    pub(crate) defect_from_title: bool,
+    pub(crate) tree_from_title: bool,
+    pub(crate) kind_from_title: u32,
+    pub(crate) any_title: bool,
+    pub(crate) title_before: Option<usize>,
 }
 
 /// Index of `b` in [`TopCheck::on`] and [`TopCheck::finite`].
@@ -1205,7 +1226,7 @@ fn bottom_index(b: Bottom) -> usize {
 /// Child boxes are not compared with their parent's (that is [`check`]'s,
 /// which counts the packed instances' +-FLT_MAX as outside).
 pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopCheck {
-    check_top_core(read, base, 64)
+    check_top_core(read, base, 64, None)
 }
 
 /// [`check_top`] with the instance list ending by D1 * 64 + `list_extra`
@@ -1215,10 +1236,18 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
 /// (box32) or at D1 * 64 (box16), so a top level's D1 does not count its
 /// header, unlike a bottom level's (spec point 1). Measured, unverified, for
 /// Fable.
-fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64) -> TopCheck {
+///
+/// With `title` (v3b, senior 105: which words came from title memory) a box
+/// node must also end by D1 * 64 + 64 (box16 64 bytes, box32 112), and the
+/// first defect, the tree and the bottom levels' kinds note whether title
+/// words decided them ([`TopCheck::defect_from_title`]). v2 passes none
+/// and is unchanged.
+fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64, title: Option<&dyn Fn(u64) -> bool>) -> TopCheck {
     let mut t = TopCheck::default();
     let mut why: Option<String> = None;
     let (mut defect, mut unread): (Option<String>, Option<String>) = (None, None);
+    let mut defect_title = false;
+    let tw = |a: u64| title.is_some_and(|f| f(a));
     let fail = |why: &mut Option<String>, w: String| {
         if why.is_none() {
             *why = Some(w);
@@ -1227,6 +1256,13 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
     let note = |first: &mut Option<String>, w: &str| {
         if first.is_none() {
             *first = Some(w.to_string());
+        }
+    };
+    // The first defect and whether title words decided it.
+    let note_defect = |first: &mut Option<String>, from_title: &mut bool, w: &str, by_title: bool| {
+        if first.is_none() {
+            *first = Some(w.to_string());
+            *from_title = by_title;
         }
     };
     let Some(h) = (0..16).map(|i| read(base + 4 * i)).collect::<Option<Vec<u32>>>() else {
@@ -1241,26 +1277,35 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
     let at = |p: u32| u64::from(p & !7) << 3;
     let list = u64::from(h[13]);
     let root = h[12];
+    // Header words that decide the size, root, list and count.
+    let header_title = [0u64, 1, 3, 12, 13].iter().any(|&i| tw(base + 4 * i));
+    let mut tree_title = header_title;
+    let size_of = |p: u32| if p & 7 == 4 { 64 } else { 112 };
+    let node_end = title.is_some();
     if !is_header(h[0], h[1]) || bottom_kind(h[0]).is_some() {
         fail(&mut why, format!("dword 0/1 {:#x}/{}: not a top level", h[0], h[1]));
     }
-    if !(root & 7 == 4 || root & 7 == 5) || at(root) == 0 || at(root) >= bytes {
+    if !(root & 7 == 4 || root & 7 == 5) || at(root) == 0 || at(root) >= bytes || (node_end && at(root) + size_of(root) > bytes) {
         fail(&mut why, format!("root +48 {root:#x} (size {bytes:#x})"));
     }
     if list == 0 || list % 64 != 0 || list + 128 * u64::from(h[3]) > list_end {
         fail(&mut why, format!("instance list +{list:#x} of {} (size {list_end:#x})", h[3]));
     }
     if let Some(w) = &why {
-        note(&mut defect, w);
+        note_defect(&mut defect, &mut defect_title, w, header_title);
     }
     let mut count = std::collections::HashMap::<u64, u32>::new();
+    // Of each reached instance, whether a title word led to it first.
+    let mut reach_title = std::collections::HashMap::<u64, bool>::new();
+    let mut twice_title = false;
     let mut seen = std::collections::HashSet::new();
-    let mut stack = if why.is_none() { vec![root] } else { Vec::new() };
-    while let Some(p) = stack.pop() {
+    // Box nodes to visit and whether a title word led there.
+    let mut stack = if why.is_none() { vec![(root, header_title)] } else { Vec::new() };
+    while let Some((p, path_title)) = stack.pop() {
         if !seen.insert(at(p)) {
             t.nodes_twice += 1;
             let w = format!("box node {p:#x} reached twice");
-            note(&mut defect, &w);
+            note_defect(&mut defect, &mut defect_title, &w, path_title);
             fail(&mut why, w);
             continue;
         }
@@ -1277,11 +1322,15 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
             fail(&mut why, w);
             continue;
         };
+        let node_title = (0..n).any(|i| tw(base + at(p) + 4 * i));
+        tree_title |= path_title || node_title;
         for i in 0..4 {
             let child = w[i];
             if child == u32::MAX {
                 continue;
             }
+            // The slot's pointer and what led to its node.
+            let child_title = path_title || tw(base + at(p) + 4 * i as u64);
             let b: Aabb = if p & 7 == 4 {
                 let (a, b, d) = (w[4 + 3 * i], w[5 + 3 * i], w[6 + 3 * i]);
                 ([half(a), half(a >> 16), half(b)], [half(b >> 16), half(d), half(d >> 16)])
@@ -1290,15 +1339,21 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
                 ([g(0), g(1), g(2)], [g(3), g(4), g(5)])
             };
             match child & 7 {
-                4 | 5 if at(child) != 0 && at(child) < bytes => stack.push(child),
+                4 | 5 if at(child) != 0 && at(child) < bytes && (!node_end || at(child) + size_of(child) <= bytes) => {
+                    stack.push((child, child_title))
+                }
                 6 if at(child) >= list && (at(child) - list) % 128 == 0 && (at(child) - list) / 128 < u64::from(h[3]) => {
                     let index = (at(child) - list) / 128;
                     let k = count.entry(index).or_default();
                     *k += 1;
                     if *k > 1 {
+                        twice_title |= child_title || reach_title.get(&index).copied().unwrap_or(false);
                         continue;
                     }
+                    reach_title.insert(index, child_title);
                     let entry = base + at(child);
+                    let entry_title = child_title || tw(entry + 60);
+                    tree_title |= entry_title;
                     let Some(e15) = read(entry + 60) else {
                         t.missing += 1;
                         let w = format!("instance {index} not read");
@@ -1312,17 +1367,24 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
                         (Some(d0), Some(d1)) if is_header(d0, d1) => bottom_kind(d0),
                         _ => None,
                     };
+                    let blas_title = tw(blas) || tw(blas + 4);
                     let Some(kind) = kind else {
                         t.blas_unread += 1;
                         if let (Some(_), Some(_)) = header {
                             t.blas_no_header += 1;
-                            note(&mut defect, &format!("instance {index}: no bottom-level header at {blas:#x}"));
+                            note_defect(
+                                &mut defect,
+                                &mut defect_title,
+                                &format!("instance {index}: no bottom-level header at {blas:#x}"),
+                                entry_title || blas_title,
+                            );
                         } else {
                             note(&mut unread, &format!("instance {index}: bottom level {blas:#x} not read"));
                         }
                         fail(&mut why, format!("instance {index}: bottom level {blas:#x} not read or no header"));
                         continue;
                     };
+                    t.kind_from_title += u32::from(blas_title);
                     let k = bottom_index(kind);
                     t.on[k] += 1;
                     let finite = (0..3).all(|a| {
@@ -1331,14 +1393,14 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
                     t.finite[k] += u32::from(finite);
                     if kind == Bottom::Rehydrated && !finite {
                         let w = format!("instance {index} on rehydrated {blas:#x}: box {b:?}");
-                        note(&mut defect, &w);
+                        note_defect(&mut defect, &mut defect_title, &w, child_title || node_title || blas_title);
                         fail(&mut why, w);
                     }
                 }
                 _ => {
                     t.bad_slots += 1;
                     let w = format!("slot {i} of {p:#x}: pointer {child:#x}");
-                    note(&mut defect, &w);
+                    note_defect(&mut defect, &mut defect_title, &w, child_title);
                     fail(&mut why, w);
                 }
             }
@@ -1354,8 +1416,10 @@ fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64)
         why = Some(format!("{} of {} instances never reached", t.never, t.instances));
     }
     if t.twice > 0 {
-        note(&mut defect, &format!("{} instances reached more than once", t.twice));
+        note_defect(&mut defect, &mut defect_title, &format!("{} instances reached more than once", t.twice), twice_title);
     }
+    t.defect_from_title = defect_title;
+    t.tree_from_title = tree_title;
     t.valid = why.is_none();
     t.why = why;
     t.first_defect = defect;
@@ -1595,8 +1659,19 @@ impl Verdict {
 /// at D1 * 64 (senior 98 point 5a: v2's D1 * 64 + 64 lets a child up to 64
 /// bytes past the end pass), and a structure with words or box nodes not
 /// read is not judged instead of valid or invalid.
+///
+/// v3b (senior 105): box nodes must end inside the size, and the exact
+/// D1 * 64 holds for the 0x8002 / 0x8004 (and packed) bottom levels only.
+/// Other bottom levels (mark 0x8000 alone) put their root at exactly
+/// D1 * 64 (runs s103: root 0x10c at size 0x840, 0x55fc at 0x2afc0, like
+/// runs 164431/171123 in [`check`]): their nodes may end at D1 * 64 + 64,
+/// as a top level's ([`check_top_core`]). Measured, unverified, for Fable.
 pub(crate) fn check_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> Verdict {
-    verdict_of(&check_core(read, base, 0, Some(centre)))
+    let extra = match read(base).and_then(bottom_kind) {
+        Some(Bottom::Other) => 64,
+        _ => 0,
+    };
+    verdict_of(&check_core(read, base, extra, Some(centre), true))
 }
 
 /// [`Verdict`] of a bottom-level [`Check`]: a reason that names something
@@ -1677,14 +1752,21 @@ pub(crate) fn no_top_level(h: &[u32]) -> Option<String> {
 /// a rehydrated instance's open box) makes it invalid; else anything not
 /// read (box node, instance entry, bottom-level header) makes it not judged,
 /// and "never reached" counts only when all was read.
+#[cfg(test)]
 pub(crate) fn check_top_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> (TopCheck, Verdict) {
+    check_top_v3_with(read, base, &|_| false)
+}
+
+/// [`check_top_v3`] with `title` naming the words read from title memory
+/// (v3b, senior 105; see [`check_top_core`]).
+pub(crate) fn check_top_v3_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, title: &dyn Fn(u64) -> bool) -> (TopCheck, Verdict) {
     let Some(h) = (0..16).map(|i| read(base + 4 * i)).collect::<Option<Vec<u32>>>() else {
         return (TopCheck::default(), Verdict::NotJudged("header not read".into()));
     };
     if let Some(w) = no_top_level(&h) {
         return (TopCheck { instances: h[3], ..Default::default() }, Verdict::NotJudged(w));
     }
-    let t = check_top_core(read, base, 0);
+    let t = check_top_core(read, base, 0, Some(title));
     let v = if let Some(d) = &t.first_defect {
         Verdict::Invalid(d.clone())
     } else if let Some(u) = &t.first_unread {
@@ -1699,10 +1781,19 @@ pub(crate) fn check_top_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> (Top
 
 /// [`check_top_v3`] over the compared pages (`first`, G) and the pages read
 /// besides (`besides`), `title` naming the words of those that came from
-/// title memory: a top level judged with any such word is not judged
-/// (senior 99: the 4 bad slots per top level were a root of zeros on a
-/// title-memory page read before the GPU built it, valid one submission
-/// later). Pages from the arena hold the GPU's bytes and count.
+/// title memory (senior 99: the 4 bad slots per top level were a root of
+/// zeros on a title-memory page read before the GPU built it, valid one
+/// submission later). Pages from the arena or a copy hold the GPU's bytes
+/// and count.
+///
+/// v3b (senior 105, review senior 104 point 5): a verdict turns into "not
+/// judged, read from title memory" only when title words decide it: an
+/// invalid one when a word that decides its first defect came from there
+/// ([`TopCheck::defect_from_title`]; "never reached": any word of the
+/// tree), a valid one when any word of the tree did. Bottom-level headers
+/// read from there only for their kind leave the verdict as it is and are
+/// counted ([`TopCheck::kind_from_title`]). The verdict before is kept in
+/// [`TopCheck::title_before`].
 pub(crate) fn top_v3_over(
     first: &dyn Fn(u64) -> Option<u32>,
     besides: &dyn Fn(u64) -> Option<u32>,
@@ -1719,14 +1810,23 @@ pub(crate) fn top_v3_over(
             w
         })
     };
-    let (t, v) = check_top_v3(&read, at);
-    let v = match v {
-        Verdict::NotJudged(w) if w.starts_with("no top level") => Verdict::NotJudged(w),
-        v if used.get() => Verdict::NotJudged(format!("read from title memory besides (may predate the GPU's build): {}", match &v {
+    let from_title = |a: u64| first(a).is_none() && title(a) && besides(a).is_some();
+    let (mut t, v) = check_top_v3_with(&read, at, &from_title);
+    t.any_title = used.get();
+    let decided = match &v {
+        Verdict::Invalid(w) if w.ends_with("instances never reached") => t.tree_from_title,
+        Verdict::Invalid(_) => t.defect_from_title,
+        Verdict::Valid => t.tree_from_title,
+        Verdict::NotJudged(_) => false,
+    };
+    let v = if decided {
+        t.title_before = Some(v.index());
+        Verdict::NotJudged(format!("read from title memory besides (may predate the GPU's build): {}", match &v {
             Verdict::Valid => "valid",
             Verdict::Invalid(w) | Verdict::NotJudged(w) => w,
-        })),
-        v => v,
+        }))
+    } else {
+        v
     };
     (t, v)
 }
@@ -1749,6 +1849,15 @@ pub(crate) struct V3 {
     /// judged by a page read besides from title memory ([`top_v3_over`]).
     pub(crate) no_top: u32,
     pub(crate) top_unread: [u32; 3],
+    /// v3b (senior 105): of those read from title memory besides, the
+    /// verdict before ([valid, invalid, -]: "downgraded, of them invalid");
+    /// judged top levels with title words that decided nothing (invalid
+    /// ones apart); reached instances whose bottom-level kind came from
+    /// title memory; pages read besides from a copy's GPU bytes.
+    pub(crate) title_down: [u32; 3],
+    pub(crate) judged_with_title: [u32; 2],
+    pub(crate) kind_from_title: u64,
+    pub(crate) besides_from_copies: u64,
     /// Summed over the judged top levels only (valid or invalid), so that
     /// "never" holds no instance merely not read.
     pub(crate) instances: u64,
@@ -1776,11 +1885,15 @@ impl V3 {
             .chain(self.tops.iter_mut().flatten().zip(o.tops.iter().flatten()))
             .chain(self.rule.iter_mut().zip(&o.rule))
             .chain(self.fallback.iter_mut().zip(&o.fallback))
-            .chain(self.top_unread.iter_mut().zip(&o.top_unread));
+            .chain(self.top_unread.iter_mut().zip(&o.top_unread))
+            .chain(self.title_down.iter_mut().zip(&o.title_down))
+            .chain(self.judged_with_title.iter_mut().zip(&o.judged_with_title));
         for (a, b) in pairs {
             *a += b;
         }
         self.no_top += o.no_top;
+        self.kind_from_title += o.kind_from_title;
+        self.besides_from_copies += o.besides_from_copies;
         self.instances += o.instances;
         self.reached += o.reached;
         self.never += o.never;
@@ -1815,6 +1928,9 @@ impl V3 {
             Verdict::NotJudged(w) => {
                 self.tops[start][2] += 1;
                 let k = if w.starts_with("read from title memory") {
+                    if let Some(b) = t.title_before {
+                        self.title_down[b] += 1;
+                    }
                     2
                 } else {
                     usize::from(t.first_unread.as_deref().is_some_and(|u| u.contains("bottom level")))
@@ -1823,6 +1939,10 @@ impl V3 {
             }
             _ => {
                 self.tops[start][v.index()] += 1;
+                if t.any_title {
+                    self.judged_with_title[usize::from(matches!(v, Verdict::Invalid(_)))] += 1;
+                }
+                self.kind_from_title += u64::from(t.kind_from_title);
                 self.instances += u64::from(t.instances);
                 self.reached += u64::from(t.reached);
                 self.never += u64::from(t.never);
@@ -1856,7 +1976,7 @@ impl V3 {
     pub(crate) fn text(&self) -> String {
         let c = |k: &[u32; 3]| format!("{}/{}/{}", k[0], k[1], k[2]);
         format!(
-            "valid/invalid/not judged: bottom fresh {}, rehydrated without the bit-30 rule {}, with the rule (centre from cb) {}, header one-sided fallback apart {}, other bottom {}, packed {}; top {}, top with +-FLT_MAX header bounds {}; not judged: no top level {}, top with a box node or instance not read {}, with a bottom level not read {}, read from title memory besides {}; judged top levels: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}, bottom level no header {}; on packed {}, on 0x8002 {} (finite {}), on 0x8004 {} (finite {}), on other bottom {}",
+            "valid/invalid/not judged: bottom fresh {}, rehydrated without the bit-30 rule {}, with the rule (centre from cb) {}, header one-sided fallback apart {}, other bottom {}, packed {}; top {}, top with +-FLT_MAX header bounds {}; not judged: no top level {}, top with a box node or instance not read {}, with a bottom level not read {}, read from title memory besides {}; judged top levels: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}, bottom level no header {}; on packed {}, on 0x8002 {} (finite {}), on 0x8004 {} (finite {}), on other bottom {}; v3b: read from title memory besides, verdict before valid/invalid {}/{}; judged with title words that decided nothing valid/invalid {}/{}; bottom-level kind from title memory {}; pages read besides from copies {}",
             c(&self.bottom[2]),
             c(&self.bottom[1]),
             c(&self.rule),
@@ -1882,6 +2002,12 @@ impl V3 {
             self.on[2],
             self.finite[2],
             self.on[3],
+            self.title_down[0],
+            self.title_down[1],
+            self.judged_with_title[0],
+            self.judged_with_title[1],
+            self.kind_from_title,
+            self.besides_from_copies,
         )
     }
 }
@@ -1902,20 +2028,41 @@ fn most_top_pages() -> usize {
 
 /// Pages for the top levels' check that the compared ones lack (title
 /// addresses of 64 KiB pages): the arena's bytes where it holds them, else
-/// title memory. Counts into `extra` ([`V2::extra`]).
+/// (v3b, senior 105) a copy's GPU bytes where one copy holds the whole page
+/// (the GPU's state after the fence, as for the compared pages; title
+/// memory gets it only after this check), else title memory. Counts into
+/// `extra` ([`V2::extra`]: arena and copies under 0) and `copies`.
 fn more_pages(
     want: &std::collections::BTreeSet<u64>,
     budget: &mut usize,
     extra: &mut [u64; 3],
     title: &mut std::collections::HashSet<u64>,
+    copies: &mut u64,
 ) -> Vec<(usize, Vec<u8>)> {
     let wanted: Vec<u64> = want.iter().copied().take(*budget).collect();
     extra[2] += (want.len() - wanted.len()) as u64;
     *budget -= wanted.len();
     let mut got: Vec<(usize, Vec<u8>)> = crate::arena::fetch(&wanted).into_iter().map(|(at, b)| (at as usize, b)).collect();
     extra[0] += got.len() as u64;
+    // `VICTORY_BVH_GT_COPIES=0`: title memory as in v3 90102a3.
+    static COPIES: OnceLock<bool> = OnceLock::new();
+    let from_copies = *COPIES.get_or_init(|| number("VICTORY_BVH_GT_COPIES", 1) != 0);
+    let all = if from_copies && wanted.len() > got.len() { crate::shadow::all() } else { Vec::new() };
     for &page in &wanted {
         if got.iter().any(|(at, _)| *at as u64 == page) {
+            continue;
+        }
+        let whole = all.iter().find(|c| {
+            let (start, len) = c.range();
+            start <= page && page + (1 << 16) <= start + len && c.title_changed(page as usize) != Some(true)
+        });
+        if let Some((from, b)) = whole.and_then(|c| c.gpu_bytes(page as usize))
+            && from as u64 == page
+            && b.len() == 1 << 16
+        {
+            extra[0] += 1;
+            *copies += 1;
+            got.push((from, b));
             continue;
         }
         let mut b = vec![0u8; 1 << 16];
@@ -1995,7 +2142,7 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -
                     if missed.is_empty() || round == 2 || !fetch {
                         break;
                     }
-                    let got = more_pages(&missed, &mut budget, &mut v.extra, &mut title_pages);
+                    let got = more_pages(&missed, &mut budget, &mut v.extra, &mut title_pages, &mut v3.besides_from_copies);
                     if got.is_empty() {
                         break;
                     }
@@ -2302,6 +2449,9 @@ mod tests {
     fn v3_a_child_32_bytes_past_the_size_is_invalid() {
         let base = 0x5000;
         let mut w = mini_bvh();
+        // A fresh (0x8004) bottom level: the exact size holds for 0x8002 /
+        // 0x8004 (v3b; other bottom levels end at D1 * 64 + 64).
+        w[0] = 0x8004 << 16 | 6;
         // Child 0 of the root: a triangle at 256 + 32 (the size is 4 * 64).
         w[16] = (256 + 32) >> 3;
         let v = check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes);
@@ -2312,6 +2462,174 @@ mod tests {
         w[16] = 248 >> 3;
         assert_eq!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Valid);
         assert_eq!(check_v3(&read_of(&mini_bvh(), base), base, Centre::Bit30AllAxes), Verdict::Valid);
+    }
+
+    // v3b (senior 105, review senior 104 points 4 and 5, field data senior
+    // 103). Each test is red against v3 90102a3 (red proof in the JOURNAL
+    // entry "senior 105").
+
+    /// [`mini_top`] with its three bottom-level headers moved out of `first`
+    /// (G) to `besides`, as the game reads them when no arena page holds
+    /// them.
+    fn heads_besides(m: &std::collections::HashMap<u64, u32>) -> (std::collections::HashMap<u64, u32>, std::collections::HashMap<u64, u32>) {
+        let heads: Vec<u64> = [0x20000u64, 0x20100, 0x20200].iter().flat_map(|&b| [b, b + 4]).collect();
+        let first = m.iter().filter(|(a, _)| !heads.contains(a)).map(|(a, w)| (*a, *w)).collect();
+        let besides = m.iter().filter(|(a, _)| heads.contains(a)).map(|(a, w)| (*a, *w)).collect();
+        (first, besides)
+    }
+
+    /// senior 104's probe: a bad slot in the root read from G, only the
+    /// bottom-level headers from title memory: invalid (v3 made it "not
+    /// judged" as soon as any word came from title memory). The kinds read
+    /// from there are counted.
+    #[test]
+    fn v3b_a_bad_slot_in_g_with_bottom_heads_from_title_is_invalid() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.insert(base + 64 + 12, 0x5);
+        let (first, besides) = heads_besides(&m);
+        let (t, v) = top_v3_over(&read_map(&first), &read_map(&besides), &|_| true, base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("slot 3")), "{v:?}");
+        assert_eq!((t.kind_from_title, t.any_title, t.title_before), (3, true, None));
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!((c.tops[1], c.top_unread, c.title_down, c.judged_with_title, c.kind_from_title), ([0, 1, 0], [0; 3], [0; 3], [0, 1], 3));
+        // The same structure without the bad slot: valid, kinds counted.
+        let (first, besides) = heads_besides(&mini_top());
+        let (t, v) = top_v3_over(&read_map(&first), &read_map(&besides), &|_| true, base);
+        assert_eq!((v, t.kind_from_title), (Verdict::Valid, 3));
+    }
+
+    /// The defect word itself from title memory: not judged, counted as
+    /// "downgraded, of them invalid"; a valid tree with box-node words from
+    /// there: not judged, "downgraded, of them valid".
+    #[test]
+    fn v3b_a_defect_word_from_title_is_downgraded_and_counted() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.insert(base + 64 + 12, 0x5);
+        // Only slot 3's word of the root from title memory.
+        let bad = base + 64 + 12;
+        let first = |a: u64| if a == bad { None } else { m.get(&a).copied() };
+        let besides = |a: u64| (a == bad).then(|| m[&a]);
+        let (t, v) = top_v3_over(&first, &besides, &|_| true, base);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.starts_with("read from title memory") && why.contains("slot 3")), "{v:?}");
+        assert_eq!(t.title_before, Some(1));
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!((c.tops[1], c.top_unread, c.title_down, c.bad_slots), ([0, 0, 1], [0, 0, 1], [0, 1, 0], 0));
+        // A valid tree whose root node came from title memory.
+        let m = mini_top();
+        let root = base + 64..base + 64 + 112;
+        let first = |a: u64| if root.contains(&a) { None } else { m.get(&a).copied() };
+        let besides = |a: u64| root.contains(&a).then(|| m.get(&a).copied().unwrap_or(0));
+        let (t, v) = top_v3_over(&first, &besides, &|_| true, base);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("valid")), "{v:?}");
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!(c.title_down, [1, 0, 0]);
+        // A bad slot in G but reached through a pointer read from title
+        // memory: the pointer decides, not judged.
+        let mut m = mini_top();
+        m.insert(base + 64 + 12, (576 >> 3) | 4);
+        for i in 0..16u64 {
+            m.insert(base + 576 + 4 * i, if i == 0 { 0x5 } else if i < 4 { u32::MAX } else { 0 });
+        }
+        let ptr = base + 64 + 12;
+        let first = |a: u64| if a == ptr { None } else { m.get(&a).copied() };
+        let besides = |a: u64| (a == ptr).then(|| m[&a]);
+        let (t, v) = top_v3_over(&first, &besides, &|_| true, base);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("slot 0")), "{v:?}");
+        assert_eq!(t.title_before, Some(1));
+    }
+
+    /// A top level's box node must end by D1 * 64 + 64, not only start
+    /// before it: a box32 at D1 * 64 (112 bytes, ends 48 past) is a bad
+    /// slot, and so is a box32 root there; a box16 at D1 * 64 stays inside
+    /// ([`v3_a_top_level_box_node_may_start_at_d1_times_64`]).
+    #[test]
+    fn v3b_a_top_level_box_node_must_end_inside() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.insert(base + 64 + 12, (576 >> 3) | 5);
+        for i in 0..28u64 {
+            m.insert(base + 576 + 4 * i, if i < 4 { u32::MAX } else { 0 });
+        }
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("slot 3")), "{v:?}");
+        assert_eq!(t.bad_slots, 1);
+        // The same box32 at 512 ends at 624, inside 640.
+        let mut m = mini_top();
+        m.insert(base + 64 + 12, (512 >> 3) | 5);
+        for i in 0..28u64 {
+            m.insert(base + 512 + 4 * i, if i < 4 { u32::MAX } else { 0 });
+        }
+        assert_eq!(check_top_v3(&read_map(&m), base).1, Verdict::Valid);
+        // A box32 root at D1 * 64 holding the three instances: invalid root.
+        let mut m = mini_top();
+        for i in 0..28u64 {
+            let w = m.get(&(base + 64 + 4 * i)).copied().unwrap_or(0);
+            m.insert(base + 576 + 4 * i, w);
+        }
+        m.insert(base + 48, (576 >> 3) | 5);
+        let (_, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("root")), "{v:?}");
+    }
+
+    /// The mini structure's root as a box32 node (28 dwords): child 0 the
+    /// triangle with box (0,0,0)-(1,1,1), the rest empty.
+    fn box32_root() -> [u32; 28] {
+        let mut n = [0u32; 28];
+        n[..4].copy_from_slice(&[128 >> 3, u32::MAX, u32::MAX, u32::MAX]);
+        n[4..10].copy_from_slice(&[0f32, 0.0, 0.0, 1.0, 1.0, 1.0].map(f32::to_bits));
+        n
+    }
+
+    /// A bottom level's box node must end by D1 * 64 too (0x8004 here): a
+    /// box32 root at 192 of a 256-byte structure ends 48 bytes past; at 64
+    /// it is inside.
+    #[test]
+    fn v3b_a_bottom_level_box_node_must_end_inside() {
+        let base = 0x5000;
+        let mut w = mini_bvh().to_vec();
+        w.resize(96, 0);
+        w[0] = 0x8004 << 16 | 6;
+        w[48..76].copy_from_slice(&box32_root());
+        w[12] = (192 >> 3) | 5;
+        let v = check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("ends past the size")), "{v:?}");
+        let mut w = mini_bvh().to_vec();
+        w[0] = 0x8004 << 16 | 6;
+        w[16..44].copy_from_slice(&box32_root());
+        w[12] = (64 >> 3) | 5;
+        assert_eq!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Valid);
+    }
+
+    /// Other bottom levels (mark 0x8000 alone) put the root at exactly
+    /// D1 * 64 (s103: root 0x10c at size 0x840): valid in v3b, as in v2
+    /// (v3 90102a3: "root +48 .. (size ..)", 1.7 % valid); a fresh one
+    /// with its root there stays invalid (exact D1 * 64).
+    #[test]
+    fn v3b_other_bottom_levels_may_end_at_d1_times_64_plus_64() {
+        let base = 0x5000;
+        let mut w = mini_bvh().to_vec();
+        w.resize(80, 0);
+        let node: Vec<u32> = w[16..32].to_vec();
+        w[64..80].copy_from_slice(&node);
+        w[12] = (256 >> 3) | 4;
+        assert_eq!(bottom_kind(w[0]), Some(Bottom::Other));
+        assert_eq!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Valid);
+        assert!(check_v2(&read_of(&w, base), base, Centre::Bit30AllAxes).valid, "v2 agrees");
+        // Past D1 * 64 + 64 still invalid for them: a box32 root at
+        // D1 * 64 ends 48 bytes past it.
+        let mut x = w.clone();
+        x.resize(96, 0);
+        x[64..92].copy_from_slice(&box32_root());
+        x[12] = (256 >> 3) | 5;
+        assert!(matches!(check_v3(&read_of(&x, base), base, Centre::Bit30AllAxes), Verdict::Invalid(why) if why.contains("ends past")));
+        // A fresh one with its root at D1 * 64: invalid.
+        w[0] = 0x8004 << 16 | 6;
+        assert!(matches!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Invalid(_)));
     }
 
     /// A bottom level whose box nodes were not read is not judged, neither
