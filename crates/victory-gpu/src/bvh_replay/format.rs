@@ -697,6 +697,10 @@ impl Capture {
 /// capture with pages left out, marked pages with a source not taken
 /// before, or harness accesses outside the capture is refused: "valid in
 /// the harness" from such a capture would be a wrong conclusion.
+/// The BVH builder's stage that rehydrates packed bottom levels into
+/// triangles (shader hash prefix); its root constant dword 5 is the y scale.
+pub const REHYDRATE_HASH: &str = "5e687674";
+
 pub fn incomplete(left_out: Option<u64>, marked_not_taken: usize, outside: usize) -> Vec<String> {
     let mut why = Vec::new();
     match left_out {
@@ -752,7 +756,35 @@ pub fn outside_text(k: u64) -> String {
 impl Capture {
     /// [`incomplete`] for what the capture alone says (before a run).
     pub fn incomplete_before_run(&self) -> Vec<String> {
-        incomplete(self.left_out(), self.marked_not_taken(), 0)
+        let mut why = incomplete(self.left_out(), self.marked_not_taken(), 0);
+        why.extend(self.rehydrate_scale_zeroed());
+        why
+    }
+
+    /// Fix B acceptance (b): the rehydrating stage [`REHYDRATE_HASH`] reads
+    /// its y scale from root constant dword 5 (`cb5`). When the capture has
+    /// dispatches of it and none carries cb5 != 0, the host zeroed the
+    /// title's value (as before Fix B) and the capture cannot show the y
+    /// scale: a reason it is invalid. Without such dispatches: no reason.
+    pub fn rehydrate_scale_zeroed(&self) -> Option<String> {
+        let mut seen = 0usize;
+        for d in &self.dispatches {
+            let Some(p) = self.pipelines.get(d.pipeline as usize) else { continue };
+            if !p.hash.to_ascii_lowercase().starts_with(REHYDRATE_HASH) {
+                continue;
+            }
+            seen += 1;
+            let nonzero = d.args.iter().any(|a| {
+                matches!(a, RootArg::Constants { dwords, .. }
+                    if dwords.get(5).is_some_and(|x| x.value != 0))
+            });
+            if nonzero {
+                return None;
+            }
+        }
+        (seen > 0).then(|| {
+            format!("{seen} dispatches of {REHYDRATE_HASH}, none with root constant dword 5 (y scale) != 0")
+        })
     }
 
     /// A summary for `manifest.txt`.
@@ -992,6 +1024,50 @@ mod tests {
         assert_eq!(outside_text(0xdd0040000), "0xdd0040000");
         // Same bits as the game: nothing outside.
         assert!(outside(&c, &game, &game).is_empty());
+    }
+
+    /// Fix B acceptance (b): a capture whose 5e687674 dispatches all carry
+    /// cb5 = 0 (the host zeroed the title's y scale) is refused; one dispatch
+    /// with cb5 != 0 passes; a capture without the stage is not affected.
+    #[test]
+    fn a_capture_with_the_rehydrating_y_scale_zeroed_is_refused() {
+        let mut c = sample();
+        c.meta.push(("pages left out (budget)".into(), "0".into()));
+        let mut pre = c.pages[1].clone();
+        pre.stage = Stage::Pre;
+        c.pages.push(pre);
+        assert!(c.incomplete_before_run().is_empty(), "no 5e687674: no reason");
+        c.pipelines.push(Pipeline {
+            name: "cs 5e68767498c57eb6".into(),
+            hash: "5e68767498c57eb6".into(),
+            dxil: vec![4],
+            root: vec![9],
+        });
+        let cb = |y: u32| RootArg::Constants {
+            param: 0,
+            dwords: (0..19)
+                .map(|i| Dword {
+                    kind: if i == 5 { DwordKind::GroupXOffset } else { DwordKind::Plain },
+                    value: match i { 4 | 6 => 0x4900_0000, 5 => y, _ => 0 },
+                    address: 0,
+                })
+                .collect(),
+        };
+        let rehydrate = |y: u32| Dispatch {
+            list: 0,
+            pipeline: 1,
+            builder: true,
+            barrier: false,
+            groups: Groups::Direct([1, 1, 1]),
+            args: vec![cb(y)],
+        };
+        c.dispatches.push(rehydrate(0));
+        c.dispatches.push(rehydrate(0));
+        let why = c.incomplete_before_run();
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("2 dispatches of 5e687674"), "{why:?}");
+        c.dispatches.push(rehydrate(0x4880_0000));
+        assert!(c.incomplete_before_run().is_empty());
     }
 
     #[test]

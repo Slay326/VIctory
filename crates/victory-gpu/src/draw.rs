@@ -821,7 +821,7 @@ impl State {
                         };
                         kinds[u.index as usize] = if fresh.is_some() || u.root == RootType::Table {
                             (DwordKind::TableOffset, 0)
-                        } else if u.dword == victory_shader::emit::GROUP_X_OFFSET && u.root == RootType::Constants {
+                        } else if takes_group_offset(t.group_x_offset, u) {
                             (DwordKind::GroupXOffset, 0)
                         } else if is_root_view_offset(u) {
                             (DwordKind::RootViewOffset, address)
