@@ -119,7 +119,16 @@ fn run(prologue: bool, x: u32) -> Vec<(&'static str, Vec<u32>)> {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: pipeline: {e}"));
+        // WARP refuses fixed WaveSize pipelines (as in synthetic_tests); the
+        // hardware adapter must run it.
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            Err(e) if warp => {
+                eprintln!("warp: no pipeline ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: pipeline: {e}"),
+        };
         let mut ud = vec![0u32; shader.user_data_dwords().max(4) as usize];
         ud[1] = x;
         let r = host
