@@ -760,6 +760,10 @@ impl Gt {
             self.v4.first.join(", "),
             self.v4.first_not_judged.join(", "),
         );
+        // senior 127: the bottom levels of each top level built here.
+        for line in &self.v4.blas_lines {
+            tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} tlas blas {line}");
+        }
         let total4 = V4_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
         let (later, waiting, dropped, known, full, noted) = with_builds(|b| (b.later, b.pending.len(), b.dropped, b.map.len(), b.full, b.noted));
         tracing::info!(
@@ -1427,6 +1431,11 @@ pub(crate) struct TopCheck {
     /// v4: the first instance's bottom-level address with no header in the
     /// GPU's bytes (classes d, e, or no page of the table).
     pub(crate) first_no_header: Option<u64>,
+    /// senior 127: each reached instance (first reach) by its bottom
+    /// level's address (dword 15 << 8), its dword 12 (the readers enter it
+    /// only with bit 30) and the kind of the header at that address (none:
+    /// not read or no bottom-level header there).
+    pub(crate) blas: Vec<(u64, u32, Option<Bottom>)>,
 }
 
 /// Indices of [`TopCheck::classes`] (v4, Fable Aufruf 8 point 2): (a) a
@@ -1623,6 +1632,11 @@ fn check_top_core(
                     };
                     let blas = u64::from(e15) << 8;
                     let header = (read(blas), read(blas + 4));
+                    let d0_kind = match header {
+                        (Some(d0), Some(d1)) if is_header(d0, d1) => bottom_kind(d0),
+                        _ => None,
+                    };
+                    t.blas.push((blas, read(entry + 48).unwrap_or(0), d0_kind));
                     let mut kind = match header {
                         (Some(d0), Some(d1)) if is_header(d0, d1) => bottom_kind(d0),
                         _ => None,
@@ -2627,6 +2641,8 @@ pub(crate) struct V4 {
     pub(crate) never_built: Vec<u64>,
     pub(crate) first: Vec<String>,
     pub(crate) first_not_judged: Vec<String>,
+    /// senior 127: one [`blas_line`] per top level the submission built.
+    pub(crate) blas_lines: Vec<String>,
 }
 
 impl V4 {
@@ -2874,6 +2890,39 @@ pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64]) -> V2 {
     validate(pages, headers, &Ctx::none()).0
 }
 
+/// senior 127 (A against E): the bottom levels of a top level's reached
+/// instances by the state of the header at their address (dword 15 << 8):
+/// those the readers enter (instance dword 12 bit 30) with every address,
+/// sorted and without repeats, the others counted only. Kinds: packed
+/// (0x8102), unpacked (rehydrated 0x8002), fresh (0x8004), other bottom
+/// level, none (not read or no bottom-level header at the address).
+pub(crate) fn blas_line(top: u64, t: &TopCheck) -> String {
+    const KINDS: [&str; 5] = ["packed", "unpacked", "fresh", "other", "none"];
+    let slot = |k: Option<Bottom>| k.map_or(4, bottom_index);
+    let mut entered: [std::collections::BTreeSet<u64>; 5] = Default::default();
+    let mut skipped = [0u32; 5];
+    for &(blas, d12, kind) in &t.blas {
+        if d12 & 1 << 30 != 0 {
+            entered[slot(kind)].insert(blas);
+        } else {
+            skipped[slot(kind)] += 1;
+        }
+    }
+    let parts: Vec<String> = KINDS
+        .iter()
+        .zip(&entered)
+        .map(|(k, set)| format!("{k} {} [{}]", set.len(), set.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ")))
+        .collect();
+    let rest: Vec<String> = KINDS.iter().zip(skipped).map(|(k, n)| format!("{k} {n}")).collect();
+    format!(
+        "top {top:#x}: instances {} reached {}; entered (dword 12 bit 30) {}; not entered {}",
+        t.instances,
+        t.reached,
+        parts.join("; "),
+        rest.join(", "),
+    )
+}
+
 /// The v2, v3 and v4 counts ([`V2`], [`V3`], [`V4`]) of the structures with
 /// headers at `headers` in `pages` (start, bytes). With a table in `ctx`, a
 /// top level's box nodes, instances and their bottom levels' headers not in
@@ -2951,6 +3000,11 @@ pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], ctx: &Ctx) -> 
                 let more = indexed(&extra_pages);
                 let read_all = |a: u64| read(a).or_else(|| more(a));
                 let t = check_top(&read_all, at);
+                // Only the builder's check (gated): the readers' sees what
+                // its pages hold and nothing besides.
+                if ctx.gate && built {
+                    v4.blas_lines.push(blas_line(at, &t));
+                }
                 v.add_top(&t);
                 if !t.valid && v.first.len() < 3 {
                     v.first.push(format!("top {at:#x} {}", t.why.as_deref().unwrap_or("?")));
@@ -3771,6 +3825,36 @@ mod tests {
         assert!(!check(&read_map(&m), 0x10000).valid);
     }
 
+    /// senior 127: the bottom levels of a top level's instances by the
+    /// state of their header, only those with dword 12 bit 30 listed (the
+    /// readers enter no other), each address once.
+    #[test]
+    fn blas_line_lists_entered_instances_by_header_state() {
+        let base = 0x10000u64;
+        let entry = |i: u64| base + 192 + 128 * i;
+        let mut m = mini_top();
+        // Instances 0 (0x8002 at 0x20000) and 1 (packed at 0x20100) entered,
+        // 2 (fresh at 0x20200) not; other bits of dword 12 are no entry.
+        m.insert(entry(0) + 48, 1 << 30 | 0xff);
+        m.insert(entry(1) + 48, 0x40 << 24);
+        m.insert(entry(2) + 48, 0xbfff_ffff);
+        let line = blas_line(base, &check_top(&read_map(&m), base));
+        assert_eq!(
+            line,
+            "top 0x10000: instances 3 reached 3; entered (dword 12 bit 30) packed 1 [0x20100]; unpacked 1 [0x20000]; fresh 0 []; other 0 []; none 0 []; not entered packed 0, unpacked 0, fresh 1, other 0, none 0"
+        );
+        // Instance 2 on the packed bottom level too, entered: listed once.
+        m.insert(entry(2) + 48, 1 << 30);
+        m.insert(entry(2) + 60, 0x20100 >> 8);
+        let line = blas_line(base, &check_top(&read_map(&m), base));
+        assert!(line.contains("entered (dword 12 bit 30) packed 1 [0x20100]; unpacked 1 [0x20000]; fresh 0 []"), "{line}");
+        assert!(line.ends_with("not entered packed 0, unpacked 0, fresh 0, other 0, none 0"), "{line}");
+        // A bottom level whose header was not read: none, with its address.
+        m.remove(&0x20000);
+        let line = blas_line(base, &check_top(&read_map(&m), base));
+        assert!(line.contains("unpacked 0 []; fresh 0 []; other 0 []; none 1 [0x20000]"), "{line}");
+    }
+
     #[test]
     fn a_top_level_check_finds_twice_never_bad_slots_and_open_instances() {
         let base = 0x10000u64;
@@ -3909,6 +3993,23 @@ mod tests {
         // Without the gate (the readers' check) every top level is judged.
         let (_, _, v4) = validate(&slices(&pages), &[base], &Ctx { built: &|_| Some(3), ..Ctx::none() });
         assert_eq!((v4.tops, v4.stale), ([0, 1, 0], 0));
+    }
+
+    /// senior 127: one bottom-level line per top level the submission
+    /// built, none for one it did not build, none in the readers' check.
+    #[test]
+    fn v4_blas_lines_only_for_top_levels_built_here() {
+        let base = 0x10000u64;
+        let pages = pages_of(&mini_top());
+        let never = |_: u64| None;
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&|_| None, &never));
+        assert!(v4.blas_lines.is_empty(), "{:?}", v4.blas_lines);
+        let here = |at: u64| (at == base).then_some(1u8 << TOP_STAGE);
+        let (_, _, v4) = validate(&slices(&pages), &[base], &gated(&here, &never));
+        assert_eq!(v4.blas_lines.len(), 1);
+        assert!(v4.blas_lines[0].starts_with("top 0x10000: instances 3 reached 3;"), "{:?}", v4.blas_lines);
+        let (_, _, v4) = validate(&slices(&pages), &[base], &Ctx::none());
+        assert!(v4.blas_lines.is_empty(), "{:?}", v4.blas_lines);
     }
 
     /// Fable Aufruf 8 point 2: each reached instance in one class. (a) a
