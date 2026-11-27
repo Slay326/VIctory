@@ -1582,10 +1582,10 @@ fn retranslate(
         let limit = thread_limit_on() && THREAD_LIMITED.iter().any(|h| p.hash.starts_with(h));
         if limit {
             println!("retranslate {}: thread-limit prologue (x threads from user data {THREAD_LIMIT_INDEX})", p.hash);
-            // exe branch: the game build keeps rt/play's translator (its SOURCE_HASH); no diag code patch here.
-            let _ = thread_limit_patch;
+            victory_shader::emit::set_diag_code_patch(Some(thread_limit_patch));
         }
         let host = victory_shader::emit::translate_with(container, options);
+        victory_shader::emit::set_diag_code_patch(None);
         let host = host.map_err(|e| anyhow::anyhow!("translating {}: {e}", p.hash))?;
         println!(
             "retranslate {}: coherent {coherent}, wave lanes {lanes}, view heap {views}, {} bytes, captured {} bytes, byte-equal to the captured DXIL: {}",
