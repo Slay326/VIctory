@@ -1193,17 +1193,58 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// Writes slot `index`'s words into the view addresses at `data` (the
 /// caller keeps `index` below [`HostHeap::address_slots`]), 16 bytes a
 /// slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
-/// high), a texture view's size fields ([`texture_words`]), zeros for
-/// anything else.
+/// high), an acceleration structure view's location likewise
+/// ([`acceleration_address`]), a texture view's size fields
+/// ([`texture_words`]), zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = match view.and_then(texture_words) {
-        Some(words) => words,
-        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
-    };
+    let words = view.map_or([0; 4], |v| address_entry(v, acceleration_addresses()));
     // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
     // slot (below `address_slots`, and more, up to `HEAP_VIEWS`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// Whether acceleration structure views enter their location in the view
+/// addresses: yes, unless `VICTORY_AS_SRV_ADDRESS=0` (they read 0 again, as
+/// before 2026-11-27: to compare, or should a program's walk of a structure
+/// the emulation left unbuilt or wrong not end).
+fn acceleration_addresses() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AS_SRV_ADDRESS").is_none_or(|v| v != "0"))
+}
+
+/// The view addresses' words for `view` ([`write_address`]);
+/// `acceleration`: whether an acceleration structure view's are its
+/// location ([`acceleration_addresses`]).
+fn address_entry(view: &View, acceleration: bool) -> [u32; 4] {
+    match acceleration_address(view) {
+        Some(address) if acceleration => address_words(address),
+        // Not a texture, and no buffer of the title's to take as one.
+        Some(_) => [0; 4],
+        None => texture_words(view)
+            .unwrap_or_else(|| address_words(buffer_range(view).map_or(0, |(a, _)| a))),
+    }
+}
+
+/// A view address entry of the title address `address`.
+fn address_words(address: u64) -> [u32; 4] {
+    [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0]
+}
+
+/// The title address of the acceleration structure a shader view of
+/// dimension `RAYTRACING_ACCELERATION_STRUCTURE` (11) names: its
+/// description's location (words 4-5), a GPU address with no resource (the
+/// title passes none). Programs read it as the descriptor's dwords 0-1 and
+/// walk the structure from there through the page table
+/// (`victory_shader::emit`'s "Title memory"); entered as 0 they walk from
+/// address 0 and every ray misses.
+fn acceleration_address(view: &View) -> Option<u64> {
+    let words: &[u32] = match view {
+        View::Shader(_, Some(desc)) => desc,
+        View::Placed(false, _, desc) => desc,
+        _ => return None,
+    };
+    (words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32)
+        .then(|| u64::from(words[4]) | u64::from(words[5]) << 32)
 }
 
 /// A texture view's console image descriptor dwords 0-3 as far as its size
@@ -2537,6 +2578,37 @@ mod tests {
     ///
     /// Any heap size the host takes will do: a title heap of 4 slots leaves
     /// dynamic slots past it either way ([`DYNAMIC`] or [`MIN_DYNAMIC`]).
+    /// An acceleration structure view has no resource, only a location: the
+    /// view addresses hold it (the reader's TLAS base), not 0. Needs no GPU.
+    #[test]
+    fn an_acceleration_structure_view_enters_its_location() {
+        let entry = |view: &View| {
+            let mut slots = [[u32::MAX; 4]; 2];
+            write_address(slots.as_mut_ptr() as usize, 1, Some(view));
+            assert_eq!(slots[0], [u32::MAX; 4], "only its own slot");
+            slots[1]
+        };
+        // As the title made t355 and t356 (run s115-onT2).
+        for location in [0xd_5f20_7000u64, 0xd_601a_0c00] {
+            let mut desc = [0u32; 10];
+            (desc[1], desc[2]) = (11, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            (desc[4], desc[5]) = (location as u32, (location >> 32) as u32);
+            let view = View::Shader(0, Some(desc));
+            assert_eq!(acceleration_address(&view), Some(location));
+            assert_eq!(buffer_range(&view), None, "no buffer: nothing to copy or sync");
+            let words = entry(&view);
+            assert_eq!(u64::from(words[0]) | u64::from(words[1]) << 32, location);
+            assert_eq!(words[2..], [0, 0]);
+            assert_eq!(address_entry(&view, true), words);
+            assert_eq!(address_entry(&view, false), [0; 4], "VICTORY_AS_SRV_ADDRESS=0");
+        }
+        // Other views without a resource stay 0.
+        let mut desc = [0u32; 10];
+        (desc[1], desc[2], desc[4], desc[6]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0x5f20_7000, 16);
+        assert_eq!(entry(&View::Shader(0, Some(desc))), [0; 4]);
+        assert_eq!(entry(&View::Shader(0, None)), [0; 4]);
+    }
+
     #[test]
     fn view_addresses_cover_tables_made_afresh() {
         let Some(heap) = HostHeap::new(false, 4) else {
