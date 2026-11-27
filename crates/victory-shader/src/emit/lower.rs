@@ -1833,6 +1833,29 @@ impl<'a> Lower<'a> {
             }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::ThreadLimit(index) => {
+                return Val::I32(self.user_at(UserData {
+                    index,
+                    slot: 0,
+                    root: RootType::Constants,
+                    dword: super::THREAD_LIMIT,
+                }));
+            }
+            // The group's id as the program reads it (a split dispatch's
+            // offset added) times the group's size, plus the thread's id
+            // as the program reads it (its console lane's).
+            Input::ThreadLimitId => {
+                let Some([x, _, _]) = self.s.threads else {
+                    return Val::Missing("a thread limit outside compute");
+                };
+                let (Val::I32(group), Val::I32(thread)) = (self.input(Input::GroupId(0)), self.thread_id(0))
+                else {
+                    return Val::Missing("a thread limit without thread ids");
+                };
+                let (entry, x) = (self.s.entry, self.s.m.i32(x));
+                let first = self.s.m.bin(entry, Bin::Mul, group, x);
+                return Val::I32(self.s.m.bin(entry, Bin::Add, first, thread));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()

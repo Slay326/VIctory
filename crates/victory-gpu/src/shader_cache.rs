@@ -149,6 +149,47 @@ pub fn wide_groups(container: &[u8]) -> bool {
     list.iter().any(|h| hash.starts_with(h.as_str()))
 }
 
+/// Whether the compute program in `container` is translated to take a
+/// thread limit (`victory_shader::emit::Options::thread_limit`), so that
+/// the host can run a `DispatchX` that counts x in threads as the console
+/// does (`crate::draw::State::dispatch_x`). `VICTORY_DISPATCHX_THREADS`:
+/// unset or `0` none (as before the switch existed); `1` Grand Theft Auto
+/// VI's two BVH builder passes that are dispatched so (their x is nodes:
+/// 1..11,632 with groups of 64); else a list of content hashes as
+/// `VICTORY_WIDE_GROUPS` takes.
+// shortcut: a list, not found at run time (a program's dispatch flags are
+// known only after it is translated); a program missing from it is
+// dispatched as before and named once in the log.
+pub fn dispatch_threads(container: &[u8]) -> bool {
+    let list = DISPATCH_THREADS.get_or_init(dispatch_threads_env);
+    if list.is_empty() {
+        return false;
+    }
+    let hash = blake3::hash(container).to_hex();
+    list.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
+/// Whether `VICTORY_DISPATCHX_THREADS` names any program.
+pub fn dispatch_threads_on() -> bool {
+    !DISPATCH_THREADS.get_or_init(dispatch_threads_env).is_empty()
+}
+
+static DISPATCH_THREADS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn dispatch_threads_env() -> Vec<String> {
+    dispatch_threads_list(std::env::var("VICTORY_DISPATCHX_THREADS").ok().as_deref())
+}
+
+/// The hashes `VICTORY_DISPATCHX_THREADS` names ([`dispatch_threads`]).
+fn dispatch_threads_list(value: Option<&str>) -> Vec<String> {
+    let value = match value.map(str::trim) {
+        None | Some("" | "0") => return Vec::new(),
+        Some("1") => "caa78b8ca62bc3d6,28918b7150a7aad5",
+        Some(list) => list,
+    };
+    value.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
@@ -182,10 +223,17 @@ pub(crate) fn translate_container(
 }
 
 /// The key part of an entry: `build` ([`host_build`]), then a builder
-/// stage's own loop limit and its coherence (parts, `VICTORY_BVH_COHERENT`
-/// stage), each only when set, so every other entry keeps its key.
-fn entry_build(build: [u8; 32], loop_limit: Option<u32>, coherent: (u8, u8)) -> [u8; 32] {
+/// stage's own loop limit, its coherence (parts, `VICTORY_BVH_COHERENT`
+/// stage) and the thread limit ([`dispatch_threads`]), each only when set,
+/// so every other entry keeps its key.
+fn entry_build(build: [u8; 32], loop_limit: Option<u32>, coherent: (u8, u8), thread_limit: bool) -> [u8; 32] {
     let mut build = build;
+    if thread_limit {
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"thread limit: a dispatch's x in threads");
+        build = *h.finalize().as_bytes();
+    }
     if let Some(limit) = loop_limit {
         let mut h = blake3::Hasher::new();
         h.update(&build);
@@ -220,8 +268,23 @@ pub fn host_shader_with(
         view_marks: true,
         group_x_offset: wide_groups(container),
         loop_limit,
+        thread_limit: dispatch_threads(container),
     };
-    let translate = |c: &[u8]| translate_container(c, options, coherent.0);
+    let translate = |c: &[u8]| match translate_container(c, options, coherent.0) {
+        // A program the limit cannot be put before stays as it is without
+        // the switch: its translation has no limit entry, so its dispatches
+        // run as before (`crate::draw::State::dispatch_x` names it).
+        Err(error) if options.thread_limit => {
+            tracing::warn!(
+                container = %&blake3::hash(c).to_hex()[..16],
+                %error,
+                "VICTORY_DISPATCHX_THREADS: no thread limit for this program; translated without"
+            );
+            let options = victory_shader::emit::Options { thread_limit: false, ..options };
+            translate_container(c, options, coherent.0)
+        }
+        made => made,
+    };
     // The host first: making it says what its view heaps are like, which
     // translations depend on. Without a host they are as for most hosts.
     let _ = crate::host::host();
@@ -229,7 +292,7 @@ pub fn host_shader_with(
         victory_shader::emit::heap_views(),
         victory_shader::emit::title_views(),
     );
-    let build = entry_build(host_build(build(), views, title), loop_limit, coherent);
+    let build = entry_build(host_build(build(), views, title), loop_limit, coherent, options.thread_limit);
     if coherent.0 != 0 {
         let n = COHERENT.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::info!(
@@ -594,7 +657,7 @@ pub(crate) mod tests {
 
     /// The options the host translates with ([`host_shader_with`]).
     fn host_options() -> victory_shader::emit::Options {
-        victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None }
+        victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None, thread_limit: false }
     }
 
     /// `VICTORY_BVH_COHERENT` off (and for every stage not the builder's
@@ -627,13 +690,41 @@ pub(crate) mod tests {
             }
         };
         for limit in [None, Some(4096)] {
-            assert_eq!(entry_build(build, limit, (0, 0)), old(limit), "off: the key of today, {limit:?}");
+            assert_eq!(entry_build(build, limit, (0, 0), false), old(limit), "off: the key of today, {limit:?}");
             // No parts is off whatever the stage says.
-            assert_eq!(entry_build(build, limit, (0, 2)), old(limit), "no parts: the key of today, {limit:?}");
-            assert_ne!(entry_build(build, limit, (b, 1)), old(limit), "on: keyed apart, {limit:?}");
-            assert_ne!(entry_build(build, limit, (b, 1)), entry_build(build, limit, (b, 2)), "each stage its own key");
+            assert_eq!(entry_build(build, limit, (0, 2), false), old(limit), "no parts: the key of today, {limit:?}");
+            assert_ne!(entry_build(build, limit, (b, 1), false), old(limit), "on: keyed apart, {limit:?}");
+            assert_ne!(
+                entry_build(build, limit, (b, 1), false),
+                entry_build(build, limit, (b, 2), false),
+                "each stage its own key"
+            );
         }
-        assert_ne!(entry_build(build, None, (b, 1)), entry_build(build, Some(4096), (b, 1)));
+        assert_ne!(entry_build(build, None, (b, 1), false), entry_build(build, Some(4096), (b, 1), false));
+    }
+
+    /// `VICTORY_DISPATCHX_THREADS`: unset or 0 names no program, 1 the two
+    /// BVH builder passes, anything else is the list; a translation with
+    /// the thread limit is keyed apart from the one without (with every
+    /// other key part), and without it the key is the one of before.
+    #[test]
+    fn thread_limit_translations_are_listed_and_keyed_apart() {
+        assert!(dispatch_threads_list(None).is_empty());
+        assert!(dispatch_threads_list(Some("")).is_empty());
+        assert!(dispatch_threads_list(Some(" 0 ")).is_empty());
+        assert_eq!(dispatch_threads_list(Some("1")), ["caa78b8ca62bc3d6", "28918b7150a7aad5"]);
+        assert_eq!(dispatch_threads_list(Some("ABCD1234, 5062bc7a48e842f8,")), ["abcd1234", "5062bc7a48e842f8"]);
+        let build = [7u8; 32];
+        let b = victory_shader::emit::COHERENT_UAV;
+        for limit in [None, Some(4096)] {
+            for coherent in [(0, 0), (b, 1)] {
+                let without = entry_build(build, limit, coherent, false);
+                let with = entry_build(build, limit, coherent, true);
+                assert_ne!(with, without, "keyed apart: {limit:?} {coherent:?}");
+            }
+        }
+        assert_eq!(entry_build(build, None, (0, 0), false), build, "off: the key of before");
+        assert_ne!(entry_build(build, None, (0, 0), true), entry_build(build, Some(4096), (0, 0), true));
     }
 
     fn shader() -> HostShader {
