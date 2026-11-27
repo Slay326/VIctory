@@ -184,13 +184,23 @@ pub(crate) fn for_submitter<R>(f: impl FnOnce() -> R) -> R {
     done
 }
 
+/// Whether the calling thread holds the submission lock or works for the
+/// thread that does ([`for_submitter`]). Threads it hands work to and waits
+/// for are part of its submission as it is itself, and must be told so
+/// (`crate::texture::in_parallel`): what they do may need the lock
+/// ([`submission_idle`]: a page kept in the GPU's copy alone that they
+/// read), which their spawner holds until they are done.
+pub(crate) fn in_submission() -> bool {
+    SUBMITTER.load(Ordering::Relaxed) == this_thread() || FOR_SUBMITTER.get()
+}
+
 /// Runs `f` with no submission under way and the last one's copy-backs
 /// done: holding the submission lock, unless this thread holds it already
 /// or works for the thread that does (then `f` runs between that
 /// submission's own steps, where the GPU is idle for it as well: a
 /// submission is waited for before its copy-backs and writes start).
 pub(crate) fn submission_idle<R>(f: impl FnOnce() -> R) -> R {
-    if SUBMITTER.load(Ordering::Relaxed) == this_thread() || FOR_SUBMITTER.get() {
+    if in_submission() {
         return f();
     }
     let host = if HOST_ASKED.load(Ordering::Acquire) { host() } else { None };
@@ -574,6 +584,14 @@ pub(crate) mod tests {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Runs `f` holding the submission lock, as a submission's steps run
+    /// (`None` without a host GPU).
+    pub(crate) fn submitting<R>(f: impl FnOnce() -> R) -> Option<R> {
+        let host = super::host()?;
+        let _one = host.submission();
+        Some(f())
     }
 
     /// The barriers built on this thread since the last call.

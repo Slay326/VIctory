@@ -896,6 +896,44 @@ fn the_engines_own_accesses_sync_a_gpu_only_page() {
     assert_eq!(net::demotion(f.second() / PAGE + 1), Some((DemoteReason::Host, 2)));
 }
 
+/// (d) Threads a submission hands work to (textures refreshed, placed
+/// textures made: `crate::texture::in_parallel`) read title memory while
+/// the submitting thread waits for them with the submission lock held. A
+/// GPU-only page they meet is synced by them as part of that submission:
+/// asking for the lock themselves, they waited for it forever (the lock
+/// audit before the first run of stage 3).
+#[test]
+fn a_submissions_worker_threads_sync_the_gpu_only_pages_they_read() {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let Some((_on, f)) = Fixture::gpu_only(2) else {
+        return; // no host GPU here
+    };
+    f.marked(&[(16, 0xb0), (PAGE + 16, 0xb1)]);
+    let p = f.p;
+    // 0x100: not inside the submission (the read would wait forever);
+    // 0x200: the copy failed.
+    let seen = [AtomicU32::new(0), AtomicU32::new(0)];
+    crate::host::tests::submitting(|| {
+        crate::texture::in_parallel_on(2, 2, |k| {
+            if !crate::host::in_submission() {
+                seen[k].store(0x100, Relaxed);
+                return;
+            }
+            // The model is on by thread in tests.
+            let _on = ModelOn::new();
+            let mut bytes = [0u8; 4];
+            let read = crate::host::read_into((p + k * PAGE + 16) as *const u8, &mut bytes);
+            seen[k].store(if read { u32::from(bytes[0]) } else { 0x200 }, Relaxed);
+        });
+    })
+    .expect("a host GPU");
+    assert_eq!([seen[0].load(Relaxed), seen[1].load(Relaxed)], [0xb0, 0xb1], "the GPU's bytes, read by the workers");
+    for k in 0..2 {
+        assert_eq!(net::demotion(f.p / PAGE + k), Some((DemoteReason::Host, 2)), "page {k}: synced by its reader");
+        assert_eq!(f.title(k * PAGE + 16), 0xb0 + k as u8);
+    }
+}
+
 /// (d) The model closes pages of one section only, named by its size
 /// (`VICTORY_MEMMODEL_SECTION`): a section of another size, no section
 /// named, and memory that is no section's view are left as they are.

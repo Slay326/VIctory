@@ -490,25 +490,44 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
 /// fewer than two.
+///
+/// Called inside a submission (textures refreshed before its lists run,
+/// placed textures made after them), the threads work for the submitting
+/// thread, which waits for them with the submission lock held: see
+/// [`in_parallel_on`].
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4);
+    in_parallel_on(threads, n, f);
+}
+
+/// [`in_parallel`] on up to `threads` threads. If the caller holds the
+/// submission lock (or works for the thread that does), so do they while it
+/// waits for them (`crate::host::for_submitter`): reading title memory,
+/// they may meet a page kept in the GPU's copy alone (`VICTORY_MEMMODEL`),
+/// whose sync needs that lock, and waited for it forever when they asked
+/// for it as strangers. A caller outside a submission hands nothing on:
+/// its threads take the lock themselves, as it would.
+pub(crate) fn in_parallel_on(threads: usize, n: usize, f: impl Fn(usize) + Sync) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
+    let threads = threads.min(n);
     if threads < 2 {
         (0..n).for_each(f);
         return;
     }
+    let held = crate::host::in_submission();
     let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n {
+                break;
+            }
+            f(i);
+        }
+    };
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    f(i);
-                }
-            });
+            scope.spawn(|| if held { crate::host::for_submitter(work) } else { work() });
         }
     });
 }
@@ -844,6 +863,29 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threads working for a caller inside a submission are inside it too;
+    /// those of any other caller are not (they must take the lock).
+    #[test]
+    fn threads_of_a_caller_inside_a_submission_work_for_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let inside = |threads: usize| {
+            let (count, ran) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            in_parallel_on(threads, 8, |_| {
+                ran.fetch_add(1, Relaxed);
+                count.fetch_add(usize::from(crate::host::in_submission()), Relaxed);
+                // Long enough for every thread to get a turn.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            });
+            assert_eq!(ran.load(Relaxed), 8, "every piece of work ran once");
+            count.load(Relaxed)
+        };
+        for threads in [1, 2, 4] {
+            assert_eq!(inside(threads), 0, "{threads} threads, no submission: none claims one");
+            assert_eq!(crate::host::for_submitter(|| inside(threads)), 8, "{threads} threads of a submission's worker");
+            assert!(!crate::host::in_submission(), "and the caller is left as it was");
+        }
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
