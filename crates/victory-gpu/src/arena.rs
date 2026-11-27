@@ -609,7 +609,7 @@ pub(crate) fn want_constants(values: &[u32]) {
 }
 
 /// The addresses [`want_constants`] looks at.
-fn constant_addresses(values: &[u32]) -> Vec<u64> {
+pub(crate) fn constant_addresses(values: &[u32]) -> Vec<u64> {
     let pairs = values.windows(2).filter(|w| (1..256).contains(&w[1])).map(|w| u64::from(w[0]) | u64::from(w[1]) << 32);
     let units = values.iter().map(|&v| u64::from(v) << 8).filter(|&a| a >= 1 << 32);
     pairs.chain(units).collect()
@@ -1492,6 +1492,15 @@ pub(crate) fn fetch(pages: &[u64]) -> Vec<(u64, Vec<u8>)> {
             (at, bytes.to_vec())
         })
         .collect()
+}
+
+/// Every page the arena holds, for the BVH builder capture
+/// (`crate::bvh_replay`): its title address, chunk and byte offset there.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn capture_pages() -> Vec<(u64, u32, u64)> {
+    let guard = arena();
+    let Some(a) = guard.as_ref() else { return Vec::new() };
+    a.dir.pages().map(|(at, slot)| (at, slot.chunk() as u32, slot.offset())).collect()
 }
 
 /// Logs what the arena did since the last call, if it is on and did

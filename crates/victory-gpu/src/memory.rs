@@ -742,6 +742,33 @@ fn layout(key: usize) -> Arc<Layout> {
         .unwrap_or_default()
 }
 
+/// View heap `key`'s page table as lists read it now, for the BVH builder
+/// capture (`crate::bvh_replay`): the copies, the level-1 index of each
+/// block (block 0 the null one), the copy each entry names, and whether an
+/// entry names an arena page.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct CaptureLayout {
+    pub(crate) copies: Vec<Arc<Shadow>>,
+    pub(crate) blocks: Vec<usize>,
+    pub(crate) owner: Vec<Option<usize>>,
+    pub(crate) arena: Vec<bool>,
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn capture_layout(key: usize) -> CaptureLayout {
+    let l = layout(key);
+    CaptureLayout {
+        copies: l.copies.clone(),
+        blocks: l.blocks.clone(),
+        owner: l.owner.iter().map(|&o| (o != NO_OWNER).then_some(o as usize)).collect(),
+        arena: (0..l.owner.len()).map(|e| l.in_arena(e)).collect(),
+    }
+}
+
+/// Entries per level-2 block of a page table.
+#[cfg(feature = "diagnostics")]
+pub(crate) const CAPTURE_BLOCK: usize = BLOCK;
+
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
@@ -872,6 +899,25 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 }
             }
             m
+        });
+    }
+    // The BVH builder capture: the bitmap's set bits once the list ran,
+    // before the copy-backs clear it.
+    #[cfg(feature = "diagnostics")]
+    if crate::bvh_replay::capture::enabled() {
+        let capture_bitmap = Arc::clone(&pooled);
+        list.defer_bvh_bitmap(move || {
+            // SAFETY: the bitmap is mapped and the list's run is over.
+            let marks = unsafe { std::slice::from_raw_parts(capture_bitmap.data() as *const u32, BITMAP_WORDS) };
+            let mut set = Vec::new();
+            for (w, &mark) in marks.iter().enumerate() {
+                let mut bits = mark;
+                while bits != 0 {
+                    set.push((w * 32) as u32 + bits.trailing_zeros());
+                    bits &= bits - 1;
+                }
+            }
+            (key, set)
         });
     }
     list.defer_missed(move || {

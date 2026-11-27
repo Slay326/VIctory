@@ -22,6 +22,7 @@ mod arena;
 mod bindless;
 #[cfg(windows)]
 mod bvh_gt;
+pub mod bvh_replay;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
