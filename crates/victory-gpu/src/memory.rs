@@ -664,6 +664,7 @@ pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
     log_kept();
+    crate::unpacked::log_frame();
     crate::arena::log_frame();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {

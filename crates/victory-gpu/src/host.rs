@@ -1170,6 +1170,9 @@ struct Deferred {
     /// dispatches write (address, stage: `crate::bvh_gt::build_target`), in
     /// record order.
     gt_builds: Vec<(u64, u8)>,
+    /// With `VICTORY_BVH_UNPACK_BACK`: the bottom levels the list's
+    /// unpacking binds name (source, destination: `crate::unpacked::pair`).
+    unpacked: Vec<(u64, u64)>,
     /// With `VICTORY_BVH_ARENA`: ranges (copy, address, bytes) the BVH
     /// builder wrote through views of title buffers larger than
     /// [`crate::arena::BACK`]: they stay out of title memory.
@@ -1689,6 +1692,17 @@ impl Host {
             for work in &list.deferred().after {
                 work();
             }
+        }
+        // `VICTORY_BVH_UNPACK_BACK`: the bottom levels the submission's
+        // lists unpacked in place go into title memory, after everything
+        // else that goes back and before the title hears the GPU is done.
+        if crate::unpacked::level() != 0 {
+            let pairs: Vec<(u64, u64, bool)> = runs
+                .iter()
+                .zip(&missed)
+                .flat_map(|(l, &m)| l.take_unpacked().into_iter().map(move |(s, d)| (s, d, m)))
+                .collect();
+            crate::unpacked::back(*submitted, &pairs);
         }
         if let Some(gt) = &mut gt {
             gt.read_title(0);
@@ -2440,6 +2454,17 @@ impl HostList {
     /// The build targets [`HostList::note_gt_build`] kept, taken out.
     pub(crate) fn take_gt_builds(&self) -> Vec<(u64, u8)> {
         std::mem::take(&mut self.deferred().gt_builds)
+    }
+
+    /// With `VICTORY_BVH_UNPACK_BACK`: a bind of the list unpacks the bottom
+    /// level at `source` to `destination` (`crate::unpacked`).
+    pub(crate) fn note_unpacked(&self, source: u64, destination: u64) {
+        self.deferred().unpacked.push((source, destination));
+    }
+
+    /// What [`HostList::note_unpacked`] kept, taken out.
+    pub(crate) fn take_unpacked(&self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.deferred().unpacked)
     }
 
     /// With `VICTORY_BVH_CAPTURE`: a dispatch as recorded.

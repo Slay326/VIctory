@@ -70,6 +70,8 @@ mod texture;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod unpacked;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]

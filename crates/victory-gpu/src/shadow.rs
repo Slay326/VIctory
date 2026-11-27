@@ -693,6 +693,48 @@ impl Shadow {
         to - from
     }
 
+    /// The copy's bytes of title memory `[at, at + len)` (cut to the copy)
+    /// go into title memory where they differ from it, and nothing else of
+    /// their pages does (`crate::unpacked`: a structure the GPU rewrote in
+    /// place, after its submission; of a copy in the GPU's memory the
+    /// caller fetched the range first). By 32-byte lines, each 64 KiB page's
+    /// part on its own. Through our own view of the memory where there is
+    /// one, the copy's tracker is left as it was: the page's other bytes in
+    /// the copy stay (what shaders wrote beside the structure and nothing
+    /// put back). Else the page counts as changed, as after any write of
+    /// ours, and the copy takes it from title memory at its next refresh,
+    /// the structure as it is now there.
+    ///
+    /// Returns the bytes of the lines written, and whether every part could
+    /// be read and written (title memory unmapped meanwhile is left alone).
+    pub(crate) fn put_range(&self, at: usize, len: usize) -> (usize, bool) {
+        let (from, to) = self.inside(at, len);
+        let start = self.start as usize;
+        let (mut written, mut all) = (0, true);
+        TITLE.with(|title| {
+            let mut title = title.borrow_mut();
+            let mut o = from;
+            while o < to {
+                let a = start + o;
+                let n = (PAGE - a % PAGE).min(to - o);
+                // SAFETY: inside the mapping; only the submitting thread
+                // writes it, and the GPU is done with the submission.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(o), n) };
+                let title = &mut title[..n];
+                o += n;
+                if !crate::host::read_into(a as *const u8, title) {
+                    all = false;
+                    continue;
+                }
+                let runs = differing_rows(host, title);
+                if write_runs_by(a, host, &runs, self.tracked.as_ref()) != Put::Nothing {
+                    written += runs.iter().map(|r| r.1 - r.0).sum::<usize>();
+                }
+            }
+        });
+        (written, all)
+    }
+
     /// After a copy-back: the page at `page` is taken, then the copy's bytes
     /// `[from, to)` (title addresses) are read from title memory again. The
     /// title writes the page while it goes back, so bytes read before the
@@ -2166,6 +2208,32 @@ impl Arena {
         }
         free.insert(at, n);
     }
+}
+
+/// The 64 bytes at each title address as shaders left them in the copy
+/// beside it (`crate::unpacked`, after a submission): of copies in the
+/// GPU's memory fetched from there, all in one fetch, their CPU sides left
+/// as they were. None where the copy does not hold all 64 bytes.
+pub(crate) fn gpu_heads(at: &[(Arc<Shadow>, u64)]) -> Vec<Option<[u32; 16]>> {
+    let inside: Vec<Option<usize>> = at
+        .iter()
+        .map(|(c, a)| a.checked_sub(c.start).map(|o| o as usize).filter(|o| o + 64 <= c.len as usize))
+        .collect();
+    // SAFETY: inside the mapping (checked); only the submitting thread
+    // writes it, and the GPU is done with the submission.
+    let read = |c: &Shadow, o: usize| unsafe { c.data.add(o).cast::<[u32; 16]>().read_unaligned() };
+    let carded = |k: usize| inside[k].filter(|_| at[k].0.card.is_some());
+    let before: Vec<Option<[u32; 16]>> = (0..at.len()).map(|k| carded(k).map(|o| read(&at[k].0, o))).collect();
+    let fetch: Vec<(&Shadow, usize, usize)> = (0..at.len()).filter_map(|k| carded(k).map(|o| (&*at[k].0, o, o + 64))).collect();
+    crate::host::card_fetch(&fetch);
+    let out = (0..at.len()).map(|k| inside[k].map(|o| read(&at[k].0, o))).collect();
+    for (k, cpu) in before.iter().enumerate() {
+        if let (Some(cpu), Some(o)) = (cpu, inside[k]) {
+            // SAFETY: as above; the fetch is done.
+            unsafe { at[k].0.data.add(o).cast::<[u32; 16]>().write_unaligned(*cpu) };
+        }
+    }
+    out
 }
 
 /// Every host copy of title memory made so far (buffers and windows).

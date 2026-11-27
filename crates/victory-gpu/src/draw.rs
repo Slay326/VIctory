@@ -890,6 +890,14 @@ impl State {
                                 list.note_gt_build(at, mark);
                             }
                         }
+                        // `VICTORY_BVH_UNPACK_BACK`: the bottom level a
+                        // builder stage unpacks, looked at once the list ran.
+                        if crate::unpacked::level() != 0
+                            && crate::pipeline::is_builder(self.pipeline as This)
+                            && let Some((source, destination)) = crate::unpacked::pair(&p.name, &values)
+                        {
+                            list.note_unpacked(source, destination);
+                        }
                         #[cfg(feature = "diagnostics")]
                         if capturing {
                             let dwords = values
