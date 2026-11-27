@@ -9,6 +9,7 @@ pub mod format;
 pub(crate) mod capture;
 #[cfg(windows)]
 pub mod harness;
+pub mod reader;
 
 /// The adapter behind `device` and its driver version, for the capture's
 /// and the harness's reports.

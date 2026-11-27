@@ -1168,6 +1168,10 @@ struct Deferred {
     /// its page bitmaps' set bits once it has run (`crate::bvh_replay`).
     #[cfg(feature = "diagnostics")]
     bvh: Vec<crate::bvh_replay::capture::Recorded>,
+    /// With `VICTORY_READER_CAPTURE`: the reader program's dispatches as
+    /// recorded (`crate::bvh_replay::reader`).
+    #[cfg(feature = "diagnostics")]
+    reader: Vec<crate::bvh_replay::reader::Recorded>,
     #[cfg(feature = "diagnostics")]
     bvh_bitmaps: Vec<Box<dyn Fn() -> (usize, Vec<u32>) + Send>>,    /// A UAV barrier was recorded since the last recorded dispatch.
     #[cfg(feature = "diagnostics")]
@@ -1553,6 +1557,13 @@ impl Host {
             && runs.iter().any(|l| l.uses_pipeline(hash))
         {
             crate::bvh_gt::reader_check(*submitted);
+        }
+        // `VICTORY_READER_CAPTURE`: what the reader program's views hold
+        // now, before anything goes back (`crate::bvh_replay::reader`).
+        #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::reader::plan().is_some() {
+            let records: Vec<_> = runs.iter().flat_map(|l| l.take_reader()).collect();
+            crate::bvh_replay::reader::take(records, *submitted);
         }
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
@@ -2394,6 +2405,18 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn push_bvh(&self, record: crate::bvh_replay::capture::Recorded) {
         self.deferred().bvh.push(record);
+    }
+
+    /// With `VICTORY_READER_CAPTURE`: a reader dispatch as recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn push_reader(&self, record: crate::bvh_replay::reader::Recorded) {
+        self.deferred().reader.push(record);
+    }
+
+    /// The reader dispatches [`HostList::push_reader`] recorded, taken out.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn take_reader(&self) -> Vec<crate::bvh_replay::reader::Recorded> {
+        std::mem::take(&mut self.deferred().reader)
     }
 
     /// With `VICTORY_BVH_CAPTURE`: `read` gives a page bitmap's heap key and
