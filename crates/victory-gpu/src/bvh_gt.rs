@@ -19,6 +19,19 @@
 //! counts empty box16 boxes and +-FLT_MAX pairs in G and T. One compact
 //! log line per part, the first three findings with their addresses.
 //!
+//! A second validator (senior 96, `BVH GT s.. v2` lines next to the old
+//! ones, whose numbers stay comparable with earlier runs): bottom levels
+//! apart by their marks (fresh 0x8004, rehydrated 0x8002, still packed
+//! 0x8102 with their own check [`check_packed`], other), node boxes of a
+//! structure with a scale word in its stored units, rehydrated ones
+//! counted without and with the bit-30 rule (centre cb0..2 of the
+//! structure's 5e687674 dispatch, noted at its bind, else the header
+//! one-sided rule), and top levels by [`check_top`] (every instance reached
+//! once, no bad slots, instances by the kind of their bottom level, only
+//! those on rehydrated ones must have a finite box), following instances to
+//! bottom levels outside the compared pages
+//! (`VICTORY_BVH_GT_TOP_PAGES`, 256 pages of 64 KiB per submission).
+//!
 //! `VICTORY_BVH_GT_PAGES` (64): the most pages a submission compares.
 //! `VICTORY_BVH_GT_MAX` (200): the most submissions compared in a run.
 //! `VICTORY_BVH_UAV_BARRIER=1`: a global UAV barrier before every dispatch
@@ -195,6 +208,16 @@ pub(crate) fn reader_check(submission: u64) {
         kinds.join(", "),
         first.join(", "),
     );
+    // The second validator on the readers' bytes (top levels only with
+    // what these pages hold: nothing is read besides).
+    let v2 = v2_of(&now.iter().map(|(f, b)| (*f, &b[..])).collect::<Vec<_>>(), &last.headers, false);
+    tracing::info!(
+        target: "victory_gpu::bvh_gt",
+        "BVH GT reader s{submission} v2 (headers of builder s{}): {}; first invalid: {}",
+        last.submission,
+        v2.text(),
+        v2.first.join(", "),
+    );
     let mut total = TWO_POINT.lock().unwrap_or_else(|e| e.into_inner());
     for (t, p) in total.iter_mut().zip(pair) {
         *t += u64::from(p);
@@ -270,6 +293,8 @@ pub(crate) struct Gt {
     list_missed: bool,
     withholding: bool,
     g: Scan,
+    /// The second validator's counts of G's headers ([`v2_of`]).
+    v2: V2,
     t: [Option<Compare>; 2],
 }
 
@@ -309,6 +334,12 @@ impl Gt {
             Some(Page { from, page, copy: Some(copy), g })
         }));
         let g = scan(&pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>());
+        let v2 = v2_of(
+            &pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>(),
+            &g.headers.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            true,
+        );
+        V2_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V2::default).add(&v2);
         // Remembered for the readers' check ([`reader_check`]): the pages
         // with headers, where they live.
         if reader_target().is_some() && !g.headers.is_empty() {
@@ -331,6 +362,7 @@ impl Gt {
             list_missed: false,
             withholding: false,
             g,
+            v2,
             t: [None, None],
         })
     }
@@ -513,6 +545,15 @@ impl Gt {
             parents.2,
             self.g.patterns(),
         );
+        let total = V2_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        tracing::info!(
+            target: "victory_gpu::bvh_gt",
+            "BVH GT s{s} v2: {}; first invalid: {}; cb dispatches with other values for a bottom level seen before {}",
+            self.v2.text(),
+            self.v2.first.join(", "),
+            CB_DIFFER.load(Ordering::Relaxed),
+        );
+        tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} v2 run so far: {}", total.text());
         for (k, t) in self.t.iter().enumerate() {
             let Some(t) = t else { continue };
             let first: Vec<String> = t.first.iter().map(|(a, g, t)| format!("{a:#x} G={g:#010x} T={t:#010x}")).collect();
@@ -694,6 +735,21 @@ pub(crate) fn check(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> Check {
 /// [`check`] with `extra` bytes added to the size dword 1 gives: 64 reads
 /// the size as the nodes past the header (an open question of the format).
 pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64) -> Check {
+    check_core(read, base, extra, None)
+}
+
+/// The second validator (senior 96, `BVH GT s.. v2` lines; [`check`] stays
+/// as it was so that its numbers compare with earlier runs): still packed
+/// bottom levels get their own check ([`check_packed`], the logic of
+/// rt/packed-validator e56de5c), and node boxes of a structure with a scale
+/// word (rehydrated ones) are compared in their stored units, around
+/// `centre` ([`Centre`]).
+pub(crate) fn check_v2(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> Check {
+    check_core(read, base, 64, Some(centre))
+}
+
+/// [`check_with`] (`v2` none: as before) or [`check_v2`].
+fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Option<Centre>) -> Check {
     let mut c = Check::default();
     let fail = |c: &mut Check, why: String| {
         if c.why.is_none() {
@@ -706,6 +762,8 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
     };
     if !is_header(h[0], h[1]) {
         fail(&mut c, format!("dword 0/1 {:#x}/{}", h[0], h[1]));
+    } else if v2.is_some() && (h[0] >> 16) & PACKED != 0 {
+        return check_packed(read, base, &h);
     }
     let bytes = u64::from(h[1]) * 64 + extra;
     let root = h[12];
@@ -721,7 +779,13 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
         fail(&mut c, format!("bounds {bounds:?}"));
     }
     let parents = h[14] as i32 as i64;
-    let mut queue = vec![(root, bounds, true)];
+    // v2: node boxes of a structure with a scale word (rehydrated ones) are
+    // in stored units, the header's bounds in object units.
+    let start = match v2 {
+        Some(centre) => to_stored(h[15], &bounds, centre),
+        None => bounds,
+    };
+    let mut queue = vec![(root, start, true)];
     let mut seen = std::collections::HashSet::new();
     while let Some((p, bounds, is_root)) = queue.pop() {
         let kind = p & 7;
@@ -784,6 +848,734 @@ pub(crate) fn check_with(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u6
     }
     c.valid = c.why.is_none();
     c
+}
+
+/// Header dword 0 mark (high half): the structure is still packed.
+const PACKED: u32 = 0x100;
+
+/// How the centre of a structure with a scale word is taken ([`to_stored`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Centre {
+    /// As rt/packed-validator e56de5c (senior 81): with bit 30 every axis
+    /// around 0.5 (min + max) of the header bounds, without it around 0.
+    /// "Without the bit-30 rule" in the v2 lines.
+    Bit30AllAxes,
+    /// Per axis the given centre in object units, with or without bit 30
+    /// (Fable Aufruf 5 point 9: cb0..2 of the 5e687674 dispatch of this
+    /// structure, the title's values, also 0; or, where no such dispatch was
+    /// seen, [`one_sided_centre`]). "With the rule" in the v2 lines.
+    Given([f32; 3]),
+}
+
+/// The header bounds in the units the nodes are stored in. Dword 15 with
+/// bit 31 set is a scale word (packed and rehydrated bottom levels, e.g.
+/// 0x808e8e8d): axis a is stored in units of 2^(e_a - 127), e_a = byte a
+/// (x = byte 0), relative to the centre `centre` names. Without bit 31
+/// (built ones, 0x007f7f7f) the units are the same. Read from capture data
+/// (senior 81, 85, 93), unverified.
+fn to_stored(d15: u32, b: &Aabb, centre: Centre) -> Aabb {
+    if d15 & 0x8000_0000 == 0 {
+        return *b;
+    }
+    let mut out = *b;
+    for a in 0..3 {
+        let unit = 2f32.powi(127 - ((d15 >> (8 * a)) & 0xff) as i32);
+        let c = match centre {
+            Centre::Bit30AllAxes if d15 & 0x4000_0000 != 0 => 0.5 * (b.0[a] + b.1[a]),
+            Centre::Bit30AllAxes => 0.0,
+            Centre::Given(c) => c[a],
+        };
+        out.0[a] = (b.0[a] - c) / unit;
+        out.1[a] = (b.1[a] - c) / unit;
+    }
+    out
+}
+
+/// The centre when no 5e687674 dispatch of the structure was seen (senior
+/// 85, header one-sided): per axis 0.5 (min + max) where the header box lies
+/// wholly on one side of 0 (min > 0 or max < 0), else 0. In the captures
+/// cb_a != 0 exactly on such axes (54/54); unverified, for Fable.
+pub(crate) fn one_sided_centre(h: &[u32]) -> [f32; 3] {
+    let f = |i: usize| f32::from_bits(h[i]);
+    std::array::from_fn(|a| {
+        let (lo, hi) = (f(4 + a), f(7 + a));
+        if lo > 0.0 || hi < 0.0 { 0.5 * (lo + hi) } else { 0.0 }
+    })
+}
+
+/// A packed node word: its children (bits 24..31, 1 to 4) and the mask of
+/// the box components stored as f32 after its group's pointers (bits 0..23,
+/// bit 6 x child + component; components min x, y, z, max x, y, z).
+fn node_word(w: u32) -> Option<(usize, u32)> {
+    let children = (w >> 24) as usize;
+    (1..=4).contains(&children).then_some((children, w & 0xff_ffff))
+}
+
+/// A group of packed box nodes: where it starts and each node's children.
+struct Group {
+    at: u64,
+    children: Vec<Vec<u32>>,
+}
+
+/// The box nodes of a packed structure ([`check_packed`]), group by group.
+fn packed_groups(read: &dyn Fn(u64) -> Option<u32>, base: u64, h: &[u32]) -> Result<Vec<Group>, String> {
+    let size = u64::from(h[1]) * 64;
+    let word = |o: u64| read(base + o).ok_or_else(|| format!("node word +{o:#x} not read"));
+    let mut groups = Vec::new();
+    let mut s = u64::from(h[10]);
+    while s < size {
+        let w0 = word(s)?;
+        if w0 == 0 {
+            // Padding (a box32 node's second half, a group's unused slots),
+            // or the trailer some large structures end with (e.g. 0x1080,
+            // or 0x4b00 0x5100 0x6600 in the last words): nothing past it is
+            // parsed, nodes there count as missing in the walk.
+            let mut empty = true;
+            for i in 0..16 {
+                empty &= word(s + 4 * i)? == 0;
+            }
+            if !empty {
+                break;
+            }
+            s += 64;
+            continue;
+        }
+        let mut words = Vec::new();
+        while let Some(w) = node_word(word(s + 4 * words.len() as u64)?) {
+            words.push(w);
+        }
+        if words.is_empty() {
+            return Err(format!("slot +{s:#x} word 0 {w0:#x} not a node word"));
+        }
+        let mut o = s + 4 * words.len() as u64;
+        let mut children = Vec::with_capacity(words.len());
+        for &(n, _) in &words {
+            let mut node = Vec::with_capacity(n);
+            for _ in 0..n {
+                node.push(word(o)?);
+                o += 4;
+            }
+            children.push(node);
+        }
+        o += 4 * words.iter().map(|&(_, mask)| u64::from(mask.count_ones())).sum::<u64>();
+        if o > size {
+            return Err(format!("group +{s:#x} past the size"));
+        }
+        let next = (o + 63) & !63;
+        while o < next {
+            if word(o)? != 0 {
+                return Err(format!("group +{s:#x} tail not zero at +{o:#x}"));
+            }
+            o += 4;
+        }
+        groups.push(Group { at: s, children });
+        s = next;
+    }
+    Ok(groups)
+}
+
+/// From the root down through packed groups: every box node reached once,
+/// leaves (types 0-3) in the leaf area and each reached once. A group's
+/// stride is 64 bytes for box16 nodes (pointer type 4) and 128 for box32
+/// (type 5), known only from the pointers. Box nodes and leaves reached.
+fn packed_walk(groups: &[Group], root: u32, h: &[u32]) -> Result<(u32, u32), String> {
+    let size = u64::from(h[1]) * 64;
+    let (boxes, leaves_at) = (u64::from(h[10]), u64::from(h[13]));
+    let at = |p: u32| u64::from(p & !7) << 3;
+    let mut stride = vec![0u64; groups.len()];
+    let mut seen = std::collections::HashSet::new();
+    let mut leaves = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+        let (a, step) = (at(p), if p & 7 == 4 { 64 } else { 128 });
+        let node = groups
+            .partition_point(|g| g.at <= a)
+            .checked_sub(1)
+            .map(|g| (g, a - groups[g].at))
+            .filter(|&(g, off)| off % step == 0 && ((off / step) as usize) < groups[g].children.len());
+        let Some((g, off)) = node else {
+            return Err(format!("box pointer {p:#x} to no node"));
+        };
+        if stride[g] != 0 && stride[g] != step {
+            return Err(format!("group +{:#x} reached as box16 and box32", groups[g].at));
+        }
+        stride[g] = step;
+        if !seen.insert(a) {
+            return Err(format!("node +{a:#x} reached twice"));
+        }
+        for &child in &groups[g].children[(off / step) as usize] {
+            match child & 7 {
+                4 | 5 if (boxes..size).contains(&at(child)) => stack.push(child),
+                0..=3 if (leaves_at..boxes).contains(&at(child)) => {
+                    if !leaves.insert(at(child)) {
+                        return Err(format!("leaf {child:#x} reached twice"));
+                    }
+                }
+                _ => return Err(format!("child {child:#x} of +{a:#x} outside its area")),
+            }
+        }
+    }
+    let nodes: usize = groups.iter().map(|g| g.children.len()).sum();
+    if seen.len() != nodes {
+        return Err(format!("{} of {nodes} box nodes reached", seen.len()));
+    }
+    for (g, group) in groups.iter().enumerate() {
+        let end = groups.get(g + 1).map_or(size, |next| next.at);
+        if group.at + group.children.len() as u64 * stride[g] > end {
+            return Err(format!("group +{:#x} of {} nodes overlaps the next", group.at, group.children.len()));
+        }
+    }
+    Ok((seen.len() as u32, leaves.len() as u32))
+}
+
+/// Checks a still packed bottom level (mark 0x100, e.g. 0x8102_0006; format
+/// read from capture data by senior 81, unverified, see
+/// bvh-harness-design-fable.md "Gepacktes BLAS-Format"). Its box nodes hold
+/// no boxes, only the tree: from dword 10 on, groups of n nodes stored as n
+/// node words ([`node_word`]), then all their child pointers in node order,
+/// then the f32 box components the masks name, zeros up to the next 64-byte
+/// slot. The leaves [dword 13, dword 10) are a compressed stream (vertices
+/// come from the geometry at rehydration) and are not decoded. Checked: the
+/// header bounds (finite, not the start values), the offsets, the scale
+/// word (dword 15), and the tree: every node reached once, every leaf once,
+/// as many leaves as dword 3 counts. Words not read make it not valid.
+pub(crate) fn check_packed(read: &dyn Fn(u64) -> Option<u32>, base: u64, h: &[u32]) -> Check {
+    let mut c = Check::default();
+    let why = (|| {
+        let size = u64::from(h[1]) * 64;
+        let (boxes, leaves, elements) = (u64::from(h[10]), u64::from(h[13]), u64::from(h[3]));
+        let f = |i: usize| f32::from_bits(h[i]);
+        let bounds: Aabb = ([f(4), f(5), f(6)], [f(7), f(8), f(9)]);
+        if h[0] >> 16 & 0x8000 == 0 {
+            return Err(format!("dword 0 {:#x}: packed but not bottom level", h[0]));
+        }
+        if (4..10).any(|i| f(i).abs() == f32::MAX) {
+            return Err("bounds +-FLT_MAX (start values)".into());
+        }
+        if (4..10).any(|i| !f(i).is_finite()) || empty(&bounds) {
+            return Err(format!("bounds {bounds:?}"));
+        }
+        if !(64 <= leaves && leaves < boxes && boxes < size && leaves % 64 == 0 && boxes % 64 == 0) {
+            return Err(format!("offsets leaves {leaves:#x} boxes {boxes:#x} (size {size:#x})"));
+        }
+        if leaves + 64 * elements > boxes {
+            return Err(format!("{elements} leaves past the box nodes"));
+        }
+        if h[15] & 0x8000_0000 == 0 || h[15] & 0x3f00_0000 != 0 {
+            return Err(format!("dword 15 {:#x} not a scale word", h[15]));
+        }
+        let root = h[12];
+        let at = u64::from(root & !7) << 3;
+        if !(root & 7 == 4 || root & 7 == 5) || !(boxes..size).contains(&at) {
+            return Err(format!("root +48 {root:#x} (size {size:#x})"));
+        }
+        let groups = packed_groups(read, base, h).inspect_err(|_| c.missing += 1)?;
+        let (nodes, reached) = packed_walk(&groups, root, h)?;
+        c.boxes = nodes;
+        if u64::from(reached) != elements {
+            return Err(format!("{reached} leaves reached, dword 3 counts {elements}"));
+        }
+        Ok(())
+    })();
+    c.why = why.err();
+    c.valid = c.why.is_none();
+    c
+}
+
+/// What a bottom-level header's dword 0 marks it as, for the v2 counts:
+/// still packed (0x100), rehydrated (0x8002), built fresh (0x8004), or
+/// another bottom level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Bottom {
+    Packed,
+    Rehydrated,
+    Fresh,
+    Other,
+}
+
+/// [`Bottom`] of a bottom-level header's dword 0; none for a top level.
+pub(crate) fn bottom_kind(d0: u32) -> Option<Bottom> {
+    let marks = d0 >> 16;
+    Some(if marks & PACKED != 0 {
+        Bottom::Packed
+    } else if marks & 0x8000 == 0 {
+        return None;
+    } else if marks & 0x2 != 0 {
+        Bottom::Rehydrated
+    } else if marks & 0x4 != 0 {
+        Bottom::Fresh
+    } else {
+        Bottom::Other
+    })
+}
+
+/// A top-level structure's v2 check ([`check_top`]).
+#[derive(Default, Debug, Clone)]
+pub(crate) struct TopCheck {
+    pub(crate) valid: bool,
+    /// The first reason it is not.
+    pub(crate) why: Option<String>,
+    /// Instances by the header (dword 3).
+    pub(crate) instances: u32,
+    /// Instances reached from the root at least once, never, more than once.
+    pub(crate) reached: u32,
+    pub(crate) never: u32,
+    pub(crate) twice: u32,
+    /// Slots whose pointer is neither empty (0xffffffff), a box node inside
+    /// the size nor an instance of the list; box nodes reached twice.
+    pub(crate) bad_slots: u32,
+    pub(crate) nodes_twice: u32,
+    /// Box nodes or instances not in what was read.
+    pub(crate) missing: u32,
+    /// Reached instances by the kind of their bottom level, and those whose
+    /// bottom-level header was not read or is no header.
+    pub(crate) on: [u32; 4],
+    pub(crate) blas_unread: u32,
+    /// Of the reached instances on rehydrated (index 1) and fresh (2) bottom
+    /// levels, those whose box in their parent's slot is finite (not
+    /// +-FLT_MAX, min <= max).
+    pub(crate) finite: [u32; 4],
+    /// The header bounds still hold +-FLT_MAX (instances on packed bottom
+    /// levels keep the builder's start values: 190fbf0e leaves them off).
+    pub(crate) bounds_start: bool,
+}
+
+/// Index of `b` in [`TopCheck::on`] and [`TopCheck::finite`].
+fn bottom_index(b: Bottom) -> usize {
+    match b {
+        Bottom::Packed => 0,
+        Bottom::Rehydrated => 1,
+        Bottom::Fresh => 2,
+        Bottom::Other => 3,
+    }
+}
+
+/// Checks the top-level structure whose header is at `base` (Fable Aufruf
+/// 6 point 4; the method of senior 90's reach90/node90): from the root
+/// (dword 12) down every box node (pointer types 4, 5), each instance slot
+/// (type 6) naming an entry of the instance list (dword 13 on, 128 bytes
+/// each, dword 3 of them); every instance reached exactly once, no other
+/// pointer, no box node twice. Each reached instance's bottom level (entry
+/// dword 15 << 8) is classed by its header ([`bottom_kind`]); only those on
+/// rehydrated bottom levels (0x8002) must have a finite box in their slot,
+/// instances on still packed ones keep +-FLT_MAX (190fbf0e leaves them
+/// off, senior 85), and the header bounds may then hold +-FLT_MAX too.
+/// Child boxes are not compared with their parent's (that is [`check`]'s,
+/// which counts the packed instances' +-FLT_MAX as outside).
+pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopCheck {
+    let mut t = TopCheck::default();
+    let mut why: Option<String> = None;
+    let fail = |why: &mut Option<String>, w: String| {
+        if why.is_none() {
+            *why = Some(w);
+        }
+    };
+    let Some(h) = (0..16).map(|i| read(base + 4 * i)).collect::<Option<Vec<u32>>>() else {
+        t.why = Some("header not read".into());
+        return t;
+    };
+    let f = |i: usize| f32::from_bits(h[i]);
+    t.bounds_start = (4..10).any(|i| f(i).abs() == f32::MAX);
+    t.instances = h[3];
+    let bytes = u64::from(h[1]) * 64 + 64;
+    let at = |p: u32| u64::from(p & !7) << 3;
+    let list = u64::from(h[13]);
+    let root = h[12];
+    if !is_header(h[0], h[1]) || bottom_kind(h[0]).is_some() {
+        fail(&mut why, format!("dword 0/1 {:#x}/{}: not a top level", h[0], h[1]));
+    }
+    if !(root & 7 == 4 || root & 7 == 5) || at(root) == 0 || at(root) >= bytes {
+        fail(&mut why, format!("root +48 {root:#x} (size {bytes:#x})"));
+    }
+    if list == 0 || list % 64 != 0 || list + 128 * u64::from(h[3]) > bytes {
+        fail(&mut why, format!("instance list +{list:#x} of {} (size {bytes:#x})", h[3]));
+    }
+    let mut count = std::collections::HashMap::<u64, u32>::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = if why.is_none() { vec![root] } else { Vec::new() };
+    while let Some(p) = stack.pop() {
+        if !seen.insert(at(p)) {
+            t.nodes_twice += 1;
+            fail(&mut why, format!("box node {p:#x} reached twice"));
+            continue;
+        }
+        if seen.len() > 1 << 16 {
+            fail(&mut why, "more than 65536 box nodes".into());
+            break;
+        }
+        let n = if p & 7 == 4 { 16 } else { 28 };
+        let Some(w) = (0..n).map(|i| read(base + at(p) + 4 * i)).collect::<Option<Vec<u32>>>() else {
+            t.missing += 1;
+            fail(&mut why, format!("box node {p:#x} not read"));
+            continue;
+        };
+        for i in 0..4 {
+            let child = w[i];
+            if child == u32::MAX {
+                continue;
+            }
+            let b: Aabb = if p & 7 == 4 {
+                let (a, b, d) = (w[4 + 3 * i], w[5 + 3 * i], w[6 + 3 * i]);
+                ([half(a), half(a >> 16), half(b)], [half(b >> 16), half(d), half(d >> 16)])
+            } else {
+                let g = |k: usize| f32::from_bits(w[4 + 6 * i + k]);
+                ([g(0), g(1), g(2)], [g(3), g(4), g(5)])
+            };
+            match child & 7 {
+                4 | 5 if at(child) != 0 && at(child) < bytes => stack.push(child),
+                6 if at(child) >= list && (at(child) - list) % 128 == 0 && (at(child) - list) / 128 < u64::from(h[3]) => {
+                    let index = (at(child) - list) / 128;
+                    let k = count.entry(index).or_default();
+                    *k += 1;
+                    if *k > 1 {
+                        continue;
+                    }
+                    let entry = base + at(child);
+                    let Some(e15) = read(entry + 60) else {
+                        t.missing += 1;
+                        fail(&mut why, format!("instance {index} not read"));
+                        continue;
+                    };
+                    let blas = u64::from(e15) << 8;
+                    let kind = match (read(blas), read(blas + 4)) {
+                        (Some(d0), Some(d1)) if is_header(d0, d1) => bottom_kind(d0),
+                        _ => None,
+                    };
+                    let Some(kind) = kind else {
+                        t.blas_unread += 1;
+                        fail(&mut why, format!("instance {index}: bottom level {blas:#x} not read or no header"));
+                        continue;
+                    };
+                    let k = bottom_index(kind);
+                    t.on[k] += 1;
+                    let finite = (0..3).all(|a| {
+                        b.0[a].is_finite() && b.1[a].is_finite() && b.0[a].abs() < f32::MAX && b.1[a].abs() < f32::MAX && b.0[a] <= b.1[a]
+                    });
+                    t.finite[k] += u32::from(finite);
+                    if kind == Bottom::Rehydrated && !finite {
+                        fail(&mut why, format!("instance {index} on rehydrated {blas:#x}: box {b:?}"));
+                    }
+                }
+                _ => {
+                    t.bad_slots += 1;
+                    fail(&mut why, format!("slot {i} of {p:#x}: pointer {child:#x}"));
+                }
+            }
+        }
+    }
+    t.reached = count.len() as u32;
+    t.twice = count.values().filter(|&&k| k > 1).count() as u32;
+    t.never = t.instances.saturating_sub(t.reached);
+    if why.is_none() && t.twice > 0 {
+        why = Some(format!("{} instances reached more than once", t.twice));
+    }
+    if why.is_none() && t.never > 0 {
+        why = Some(format!("{} of {} instances never reached", t.never, t.instances));
+    }
+    t.valid = why.is_none();
+    t.why = why;
+    t
+}
+
+/// `VICTORY_BVH_GT` v2: cb0..2 (user data 16..18) of the builder's
+/// rehydrating stage 5e687674 by the bottom level it rehydrates (user data
+/// 35 and 36, its address), as the host bound them (senior 85 ax85.py,
+/// senior 89 capture layout). The first value is kept; later dispatches
+/// with other values are counted.
+static CB: std::sync::Mutex<Option<std::collections::HashMap<u64, [u32; 3]>>> = std::sync::Mutex::new(None);
+static CB_DIFFER: AtomicU64 = AtomicU64::new(0);
+
+/// The rehydrating stage's shader hash (prefix) and where its values lie.
+const REHYDRATE: &str = "5e687674";
+
+/// A compute bind's root constants `values` (by user-data index) of the
+/// pipeline named `name` (`crate::draw`, only with `VICTORY_BVH_GT`): a
+/// 5e687674 bind notes its cb0..2 for its bottom level.
+pub(crate) fn note_bind(name: &str, values: &[u32]) {
+    if values.len() <= 36 || !name.contains(REHYDRATE) {
+        return;
+    }
+    note_cb(u64::from(values[35]) | u64::from(values[36]) << 32, [values[16], values[17], values[18]]);
+}
+
+fn note_cb(blas: u64, cb: [u32; 3]) {
+    let mut g = CB.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    match map.get(&blas) {
+        Some(old) if *old != cb => {
+            CB_DIFFER.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(_) => {}
+        None if map.len() < 1 << 20 => {
+            map.insert(blas, cb);
+        }
+        None => {}
+    }
+}
+
+fn cb_of(blas: u64) -> Option<[u32; 3]> {
+    CB.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&blas).copied()
+}
+
+/// v2 of one bottom level: valid as e56de5c ([`Centre::Bit30AllAxes`]),
+/// valid with the rule (centre cb0..2 if a 5e687674 dispatch of it was
+/// seen, else [`one_sided_centre`]), whether cb was known, and whether a
+/// known cb differs from the one-sided prediction on an axis (Fable Aufruf
+/// 5 point 9, reported apart, no validity criterion).
+#[derive(Debug)]
+pub(crate) struct BottomCheck {
+    pub(crate) without_rule: Check,
+    pub(crate) with_rule: Check,
+    pub(crate) cb_known: bool,
+    pub(crate) cb_not_predicted: bool,
+}
+
+/// [`BottomCheck`] of the bottom level at `base` (header dword 0 `d0`),
+/// with `cb` its 5e687674 values if known.
+pub(crate) fn check_bottom(read: &dyn Fn(u64) -> Option<u32>, base: u64, kind: Bottom, cb: Option<[u32; 3]>) -> BottomCheck {
+    let without_rule = check_v2(read, base, Centre::Bit30AllAxes);
+    let h: Option<Vec<u32>> = (0..16).map(|i| read(base + 4 * i)).collect();
+    let predicted = h.as_deref().map(one_sided_centre);
+    let centre = match (cb, predicted) {
+        (Some(cb), _) => Some(cb.map(f32::from_bits)),
+        (None, p) => p,
+    };
+    let with_rule = match centre {
+        Some(c) if kind != Bottom::Packed => check_v2(read, base, Centre::Given(c)),
+        // Packed ones hold no node boxes: the centre does not apply.
+        _ => check_v2(read, base, Centre::Bit30AllAxes),
+    };
+    let cb_not_predicted = match (cb, predicted) {
+        (Some(cb), Some(p)) => (0..3).any(|a| {
+            let c = f32::from_bits(cb[a]);
+            (c - p[a]).abs() > 1e-5 * c.abs().max(p[a].abs()).max(1.0)
+        }),
+        _ => false,
+    };
+    BottomCheck { without_rule, with_rule, cb_known: cb.is_some(), cb_not_predicted }
+}
+
+/// The v2 counts of one submission's headers ([`v2_of`]), and of the run.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct V2 {
+    /// By [`bottom_index`]: headers, valid without the bit-30 rule
+    /// ([`Centre::Bit30AllAxes`]), valid with it ([`check_bottom`]).
+    pub(crate) bottom: [[u32; 3]; 4],
+    /// Rehydrated ones: centre from a 5e687674 dispatch's cb, from the
+    /// header one-sided rule (no dispatch seen); cb known and not as the
+    /// one-sided rule predicts.
+    pub(crate) cb_known: u32,
+    pub(crate) cb_fallback: u32,
+    pub(crate) cb_not_predicted: u32,
+    /// Top levels with finite header bounds and with +-FLT_MAX in them:
+    /// headers, valid ([`check_top`]).
+    pub(crate) tops: [[u32; 2]; 2],
+    /// [`TopCheck`] summed over the top levels.
+    pub(crate) instances: u64,
+    pub(crate) reached: u64,
+    pub(crate) never: u64,
+    pub(crate) twice: u64,
+    pub(crate) bad_slots: u64,
+    pub(crate) nodes_twice: u64,
+    pub(crate) missing: u64,
+    pub(crate) on: [u64; 4],
+    pub(crate) blas_unread: u64,
+    pub(crate) finite: [u64; 4],
+    /// Pages read besides the compared ones for the top levels: from the
+    /// arena, from title memory, wanted past the budget.
+    pub(crate) extra: [u64; 3],
+    /// The first invalid ones (rehydrated with the rule, top levels).
+    pub(crate) first: Vec<String>,
+}
+
+impl V2 {
+    fn add(&mut self, o: &V2) {
+        for (a, b) in self.bottom.iter_mut().flatten().zip(o.bottom.iter().flatten()) {
+            *a += b;
+        }
+        for (a, b) in self.tops.iter_mut().flatten().zip(o.tops.iter().flatten()) {
+            *a += b;
+        }
+        self.cb_known += o.cb_known;
+        self.cb_fallback += o.cb_fallback;
+        self.cb_not_predicted += o.cb_not_predicted;
+        self.instances += o.instances;
+        self.reached += o.reached;
+        self.never += o.never;
+        self.twice += o.twice;
+        self.bad_slots += o.bad_slots;
+        self.nodes_twice += o.nodes_twice;
+        self.missing += o.missing;
+        self.blas_unread += o.blas_unread;
+        for k in 0..4 {
+            self.on[k] += o.on[k];
+            self.finite[k] += o.finite[k];
+        }
+        for k in 0..3 {
+            self.extra[k] += o.extra[k];
+        }
+    }
+
+    fn add_top(&mut self, t: &TopCheck) {
+        let k = usize::from(t.bounds_start);
+        self.tops[k][0] += 1;
+        self.tops[k][1] += u32::from(t.valid);
+        self.instances += u64::from(t.instances);
+        self.reached += u64::from(t.reached);
+        self.never += u64::from(t.never);
+        self.twice += u64::from(t.twice);
+        self.bad_slots += u64::from(t.bad_slots);
+        self.nodes_twice += u64::from(t.nodes_twice);
+        self.missing += u64::from(t.missing);
+        self.blas_unread += u64::from(t.blas_unread);
+        for k in 0..4 {
+            self.on[k] += u64::from(t.on[k]);
+            self.finite[k] += u64::from(t.finite[k]);
+        }
+    }
+
+    /// The counts as one log line's text.
+    pub(crate) fn text(&self) -> String {
+        let b = |k: usize| format!("{}/{} (with the rule {})", self.bottom[k][1], self.bottom[k][0], self.bottom[k][2]);
+        format!(
+            "bottom fresh {}; rehydrated without the bit-30 rule {}/{}, with it {}/{} (centre from cb {}, from header one-sided {}; cb not as one-sided predicts {}); other bottom {}; packed {}/{}; top {}/{}, top with +-FLT_MAX header bounds {}/{} (instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}, not read {}; on packed {}, on 0x8002 {} (finite {}), on 0x8004 {} (finite {}), on other bottom {}, bottom level not read {}; pages read besides {} from the arena, {} from title memory, {} past the budget)",
+            b(2),
+            self.bottom[1][1],
+            self.bottom[1][0],
+            self.bottom[1][2],
+            self.bottom[1][0],
+            self.cb_known,
+            self.cb_fallback,
+            self.cb_not_predicted,
+            b(3),
+            self.bottom[0][1],
+            self.bottom[0][0],
+            self.tops[0][1],
+            self.tops[0][0],
+            self.tops[1][1],
+            self.tops[1][0],
+            self.instances,
+            self.reached,
+            self.never,
+            self.twice,
+            self.bad_slots,
+            self.nodes_twice,
+            self.missing,
+            self.on[0],
+            self.on[1],
+            self.finite[1],
+            self.on[2],
+            self.finite[2],
+            self.on[3],
+            self.blas_unread,
+            self.extra[0],
+            self.extra[1],
+            self.extra[2],
+        )
+    }
+}
+
+/// v2 totals of the run ([`Gt::take`]).
+static V2_TOTAL: std::sync::Mutex<Option<V2>> = std::sync::Mutex::new(None);
+
+/// `VICTORY_BVH_GT_TOP_PAGES` (256): the most 64 KiB pages a submission
+/// reads besides the compared ones to follow its top levels' instances to
+/// their bottom levels.
+fn most_top_pages() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_GT_TOP_PAGES", 256) as usize)
+}
+
+/// Pages for the top levels' check that the compared ones lack (title
+/// addresses of 64 KiB pages): the arena's bytes where it holds them, else
+/// title memory. Counts into `extra` ([`V2::extra`]).
+fn more_pages(want: &std::collections::BTreeSet<u64>, budget: &mut usize, extra: &mut [u64; 3]) -> Vec<(usize, Vec<u8>)> {
+    let wanted: Vec<u64> = want.iter().copied().take(*budget).collect();
+    extra[2] += (want.len() - wanted.len()) as u64;
+    *budget -= wanted.len();
+    let mut got: Vec<(usize, Vec<u8>)> = crate::arena::fetch(&wanted).into_iter().map(|(at, b)| (at as usize, b)).collect();
+    extra[0] += got.len() as u64;
+    for &page in &wanted {
+        if got.iter().any(|(at, _)| *at as u64 == page) {
+            continue;
+        }
+        let mut b = vec![0u8; 1 << 16];
+        if crate::host::read_into(page as *const u8, &mut b) {
+            extra[1] += 1;
+            got.push((page as usize, b));
+        }
+    }
+    got
+}
+
+/// The v2 counts of the structures with headers at `headers` in `pages`
+/// (start, bytes). With `fetch`, a top level's box nodes, instances and
+/// their bottom levels' headers not in `pages` are read besides
+/// ([`more_pages`], within [`most_top_pages`]); without it they count as
+/// not read.
+pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> V2 {
+    let mut v = V2::default();
+    let read = reader(pages);
+    let mut extra_pages: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut budget = if fetch { most_top_pages() } else { 0 };
+    for &at in headers {
+        let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
+        if !is_header(d0, d1) {
+            continue;
+        }
+        match bottom_kind(d0) {
+            Some(kind) => {
+                let cb = if kind == Bottom::Rehydrated { cb_of(at) } else { None };
+                let c = check_bottom(&read, at, kind, cb);
+                let k = bottom_index(kind);
+                v.bottom[k][0] += 1;
+                v.bottom[k][1] += u32::from(c.without_rule.valid);
+                v.bottom[k][2] += u32::from(c.with_rule.valid);
+                if kind == Bottom::Rehydrated {
+                    if c.cb_known {
+                        v.cb_known += 1;
+                    } else {
+                        v.cb_fallback += 1;
+                    }
+                    v.cb_not_predicted += u32::from(c.cb_not_predicted);
+                    if !c.with_rule.valid && v.first.len() < 3 {
+                        v.first.push(format!("rehydrated {at:#x} {}", c.with_rule.why.as_deref().unwrap_or("?")));
+                    }
+                }
+            }
+            None => {
+                let mut t = TopCheck::default();
+                for round in 0..3 {
+                    let missed = std::cell::RefCell::new(std::collections::BTreeSet::new());
+                    {
+                        let more = reader(&extra_pages);
+                        let read_all = |a: u64| {
+                            let w = read(a).or_else(|| more(a));
+                            if w.is_none() {
+                                missed.borrow_mut().insert(a & !0xffff);
+                            }
+                            w
+                        };
+                        t = check_top(&read_all, at);
+                    }
+                    let missed = missed.into_inner();
+                    if missed.is_empty() || round == 2 || !fetch {
+                        break;
+                    }
+                    let got = more_pages(&missed, &mut budget, &mut v.extra);
+                    if got.is_empty() {
+                        break;
+                    }
+                    extra_pages.extend(got);
+                }
+                v.add_top(&t);
+                if !t.valid && v.first.len() < 3 {
+                    v.first.push(format!("top {at:#x} {}", t.why.as_deref().unwrap_or("?")));
+                }
+            }
+        }
+    }
+    v
 }
 
 /// A small valid bottom-level structure of 64 dwords (256 bytes): header,
@@ -861,6 +1653,275 @@ mod tests {
         let mut w = good;
         w[21] = 0x4400_0000;
         assert!(check(&read_of(&w, base), base).why.unwrap().contains("outside"));
+    }
+
+    /// A small packed bottom level of 144 dwords (rt/packed-validator
+    /// e56de5c): header, parent area at +64, three leaf slots at +128, a
+    /// group of two box16 nodes at +320 (node 0: leaves +128 and +192; node
+    /// 1: leaf +256 with its box stored as six f32, mask 0x3f), a box32 root
+    /// at +448 with the two nodes.
+    fn mini_packed() -> [u32; 144] {
+        let mut w = [0u32; 144];
+        let one = 1f32.to_bits();
+        w[0] = 0x8102 << 16 | 6;
+        w[1] = 9;
+        w[3] = 3;
+        w[4..10].copy_from_slice(&[0, 0, 0, one, one, one]);
+        w[10] = 320;
+        w[12] = (448 >> 3) | 5;
+        w[13] = 128;
+        w[14] = 64;
+        w[15] = 0x8090_8f8f;
+        w[80..85].copy_from_slice(&[0x0200_0000, 0x0100_003f, 128 >> 3, 192 >> 3, 256 >> 3]);
+        w[85..91].copy_from_slice(&[0, 0, 0, 0x4000_0000, 0x4000_0000, 0x4000_0000]);
+        w[112..115].copy_from_slice(&[0x0200_0000, (320 >> 3) | 4, (384 >> 3) | 4]);
+        w
+    }
+
+    const V2_ALL: Centre = Centre::Bit30AllAxes;
+
+    /// v2 checks still packed structures (the old validator has no such
+    /// check: every one is invalid there, s94 "packed 0/186").
+    #[test]
+    fn a_packed_structure_passes_v2_and_broken_ones_do_not() {
+        let base = 0x2000;
+        let good = mini_packed();
+        assert!(!check(&read_of(&good, base), base).valid, "old logic: not valid");
+        let c = check_v2(&read_of(&good, base), base, V2_ALL);
+        assert!(c.valid, "{c:?}");
+        assert_eq!(c.boxes, 3);
+        let why = |w: &[u32]| check_v2(&read_of(w, base), base, V2_ALL).why.unwrap_or_default();
+        // A leaf reached twice (node 1 names node 0's first leaf).
+        let mut w = good;
+        w[84] = 128 >> 3;
+        assert!(why(&w).contains("reached twice"), "{}", why(&w));
+        // A child pointer to no node.
+        let mut w = good;
+        w[114] = (512 >> 3) | 4;
+        assert!(!why(&w).is_empty());
+        // More elements than leaves in the tree.
+        let mut w = good;
+        w[3] = 4;
+        assert!(why(&w).contains("leaves"), "{}", why(&w));
+        // The builder's start values in the bounds.
+        let mut w = good;
+        w[4] = f32::MAX.to_bits();
+        assert!(why(&w).contains("FLT_MAX"));
+        // A mask naming one stored f32 too few: the sixth is left over.
+        let mut w = good;
+        w[81] = 0x0100_001f;
+        assert!(!why(&w).is_empty());
+    }
+
+    /// v2 compares a rehydrated structure's node boxes in its stored units
+    /// (scale word, dword 15); the old validator compares them with the
+    /// header's object units.
+    #[test]
+    fn rehydrated_boxes_are_compared_in_stored_units() {
+        // Scale word 0x8080_8080: every axis stored in units of 2^(127 - 128),
+        // so the header's 0..1 is 0..2 in the nodes.
+        let base = 0x1000;
+        let mut w = mini_bvh();
+        w[0] = 0x8002 << 16 | 6;
+        w[15] = 0x8080_8080;
+        w[20..23].copy_from_slice(&[0x0000_0000, 0x4000_0000, 0x4000_4000]);
+        assert!(!check(&read_of(&w, base), base).valid, "old logic: 0..2 outside 0..1");
+        let c = check_v2(&read_of(&w, base), base, V2_ALL);
+        assert!(c.valid, "{c:?}");
+        // 0..4 stored is 0..2 in object units, outside the header's 0..1.
+        w[21] = 0x4400_0000;
+        assert!(check_v2(&read_of(&w, base), base, V2_ALL).why.unwrap().contains("outside"));
+        // With the centre bit the stored box is around the centre 0.5.
+        let mut w = mini_bvh();
+        w[15] = 0xc080_8080;
+        w[20..23].copy_from_slice(&[0xbc00_bc00, 0x3c00_bc00, 0x3c00_3c00]);
+        assert!(check_v2(&read_of(&w, base), base, V2_ALL).valid);
+    }
+
+    /// A rehydrated bottom level with bit 30 whose header box covers 0 on x
+    /// (-1..3) and lies on one side on y (2..4): the title centres y only
+    /// (cb = 0, 3, 0), as the rule says; centring every axis (e56de5c) puts
+    /// x's stored box off by half the extent.
+    fn bit30_bvh() -> [u32; 64] {
+        let mut w = mini_bvh();
+        let f = |x: f32| x.to_bits();
+        w[0] = 0x8002 << 16 | 6;
+        w[4..10].copy_from_slice(&[f(-1.0), f(2.0), f(-1.0), f(3.0), f(4.0), f(1.0)]);
+        // Stored = object x 2 on every axis (exponent 0x80), bit 30.
+        w[15] = 0xc080_8080;
+        // Child box = the header box in stored units around (0, 3, 0):
+        // x -2..6, y -2..2, z -2..2 (f16 c000, 4600, 4000).
+        w[20..23].copy_from_slice(&[0xc000_c000, 0x4600_c000, 0x4000_4000]);
+        w
+    }
+
+    #[test]
+    fn the_bit_30_rule_takes_the_centre_from_cb_per_axis() {
+        let base = 0x3000;
+        let w = bit30_bvh();
+        let read = read_of(&w, base);
+        let cb = [0f32, 3.0, 0.0].map(f32::to_bits);
+        // Without the rule (e56de5c: every axis centred) not valid, with it valid.
+        let c = check_bottom(&read, base, Bottom::Rehydrated, Some(cb));
+        assert!(!c.without_rule.valid, "{c:?}");
+        assert!(c.without_rule.why.as_deref().unwrap().contains("outside"));
+        assert!(c.with_rule.valid, "{c:?}");
+        assert!(c.cb_known && !c.cb_not_predicted);
+        // The rule can fail: cb centring x too is wrong.
+        let c = check_bottom(&read, base, Bottom::Rehydrated, Some([1f32, 3.0, 0.0].map(f32::to_bits)));
+        assert!(!c.with_rule.valid, "{c:?}");
+        assert!(c.cb_not_predicted, "x = 1 where the header covers 0");
+    }
+
+    #[test]
+    fn without_cb_the_header_one_sided_rule_gives_the_centre() {
+        let base = 0x3000;
+        let w = bit30_bvh();
+        assert_eq!(one_sided_centre(&w[..16]), [0.0, 3.0, 0.0]);
+        let c = check_bottom(&read_of(&w, base), base, Bottom::Rehydrated, None);
+        assert!(!c.without_rule.valid);
+        assert!(c.with_rule.valid, "{c:?}");
+        assert!(!c.cb_known && !c.cb_not_predicted);
+    }
+
+    #[test]
+    fn bottom_levels_are_classed_by_their_marks() {
+        assert_eq!(bottom_kind(0x8004_0006), Some(Bottom::Fresh));
+        assert_eq!(bottom_kind(0x8002_0006), Some(Bottom::Rehydrated));
+        assert_eq!(bottom_kind(0x8102_0006), Some(Bottom::Packed));
+        assert_eq!(bottom_kind(0x8000_0006), Some(Bottom::Other));
+        assert_eq!(bottom_kind(0x0000_0006), None);
+    }
+
+    /// A 5e687674 bind notes cb0..2 (user data 16..18) for the bottom level
+    /// at user data 35/36; other programs are not looked at.
+    #[test]
+    fn a_rehydrating_bind_notes_its_centre_values() {
+        let mut values = vec![0u32; 39];
+        values[16..19].copy_from_slice(&[1, 2, 3]);
+        values[35] = 0x5f00_0000;
+        values[36] = 0x77;
+        note_bind("[\"cs 5e68767498c57eb6\"]", &values);
+        assert_eq!(cb_of(0x77_5f00_0000), Some([1, 2, 3]));
+        values[36] = 0x78;
+        note_bind("[\"cs 190fbf0e00000000\"]", &values);
+        assert_eq!(cb_of(0x78_5f00_0000), None);
+        note_bind("cs 5e687674", &values[..36]);
+        assert_eq!(cb_of(0x78_5f00_0000), None, "too few values");
+    }
+
+    /// A top level at 0x10000: a box32 root at +64 with three instances
+    /// (list at +192, 128 bytes each) on a rehydrated (0x20000), a still
+    /// packed (0x20100) and a fresh (0x20200) bottom level. The packed one's
+    /// slot box and the header bounds keep +-FLT_MAX (190fbf0e leaves it off).
+    fn mini_top() -> std::collections::HashMap<u64, u32> {
+        let base = 0x10000u64;
+        let mut m = std::collections::HashMap::new();
+        let mut put = |at: u64, w: u32| {
+            m.insert(at, w);
+        };
+        let f = |x: f32| x.to_bits();
+        let header = [6, 9, 0, 3, f(f32::MAX), f(f32::MAX), f(f32::MAX), f(-f32::MAX), f(-f32::MAX), f(-f32::MAX), 64, 0, (64 >> 3) | 5, 192, 0, 0];
+        for (i, w) in header.iter().enumerate() {
+            put(base + 4 * i as u64, *w);
+        }
+        let boxes: [[f32; 6]; 3] = [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [f32::MAX, f32::MAX, f32::MAX, -f32::MAX, -f32::MAX, -f32::MAX], [2.0, 2.0, 2.0, 3.0, 3.0, 3.0]];
+        for i in 0..4u64 {
+            let child = if i < 3 { ((192 + 128 * i as u32) >> 3) | 6 } else { u32::MAX };
+            put(base + 64 + 4 * i, child);
+            for k in 0..6u64 {
+                let v = if i < 3 { f(boxes[i as usize][k as usize]) } else { 0 };
+                put(base + 64 + 16 + 4 * (6 * i + k), v);
+            }
+        }
+        for (i, blas) in [0x20000u64, 0x20100, 0x20200].into_iter().enumerate() {
+            let entry = base + 192 + 128 * i as u64;
+            for k in 0..32u64 {
+                put(entry + 4 * k, 0);
+            }
+            put(entry + 60, (blas >> 8) as u32);
+        }
+        for (blas, d0) in [(0x20000u64, 0x8002_0006u32), (0x20100, 0x8102_0006), (0x20200, 0x8004_0006)] {
+            put(blas, d0);
+            put(blas + 4, 4);
+        }
+        m
+    }
+
+    fn read_map(m: &std::collections::HashMap<u64, u32>) -> impl Fn(u64) -> Option<u32> + '_ {
+        move |at| m.get(&at).copied()
+    }
+
+    #[test]
+    fn a_top_level_with_a_packed_instance_passes_v2() {
+        let m = mini_top();
+        let t = check_top(&read_map(&m), 0x10000);
+        assert!(t.valid, "{t:?}");
+        assert_eq!((t.instances, t.reached, t.never, t.twice, t.bad_slots), (3, 3, 0, 0, 0));
+        assert_eq!(t.on, [1, 1, 1, 0]);
+        assert_eq!((t.finite[1], t.finite[2], t.finite[0]), (1, 1, 0));
+        assert!(t.bounds_start);
+        // The old logic counts the packed instance's start values as invalid.
+        assert!(!check(&read_map(&m), 0x10000).valid);
+    }
+
+    #[test]
+    fn a_top_level_check_finds_twice_never_bad_slots_and_open_instances() {
+        let base = 0x10000u64;
+        // Slot 2 names instance 0 again: 0 twice, 2 never.
+        let mut m = mini_top();
+        m.insert(base + 64 + 8, (192 >> 3) | 6);
+        let t = check_top(&read_map(&m), base);
+        assert!(!t.valid);
+        assert_eq!((t.twice, t.never), (1, 1));
+        // A pointer of type 7 in slot 3.
+        let mut m = mini_top();
+        m.insert(base + 64 + 12, 0x1007);
+        let t = check_top(&read_map(&m), base);
+        assert_eq!(t.bad_slots, 1);
+        assert!(t.why.unwrap().contains("slot 3"));
+        // An instance slot between two entries.
+        let mut m = mini_top();
+        m.insert(base + 64 + 4, ((192 + 64) >> 3) | 6);
+        let t = check_top(&read_map(&m), base);
+        assert_eq!((t.bad_slots, t.never), (1, 1));
+        // The rehydrated instance with the start values in its slot box.
+        let mut m = mini_top();
+        m.insert(base + 64 + 16, f32::MAX.to_bits());
+        let t = check_top(&read_map(&m), base);
+        assert!(!t.valid);
+        assert_eq!(t.finite[1], 0);
+        assert!(t.why.unwrap().contains("rehydrated"));
+        // The fresh instance's bottom level not read.
+        let mut m = mini_top();
+        m.remove(&0x20200);
+        let t = check_top(&read_map(&m), base);
+        assert_eq!(t.blas_unread, 1);
+        assert!(!t.valid);
+    }
+
+    #[test]
+    fn v2_counts_fresh_rehydrated_packed_and_top_apart() {
+        let mut page = vec![0u8; 0x1000];
+        let put = |page: &mut Vec<u8>, at: usize, w: &[u32]| {
+            for (i, x) in w.iter().enumerate() {
+                page[at + 4 * i..at + 4 * i + 4].copy_from_slice(&x.to_le_bytes());
+            }
+        };
+        let from = 0x4_0000_0000usize;
+        let mut fresh = mini_bvh();
+        fresh[0] = 0x8004 << 16 | 6;
+        put(&mut page, 0, &fresh);
+        put(&mut page, 0x100, &bit30_bvh());
+        put(&mut page, 0x200, &mini_packed());
+        // cb of the rehydrated one as the title bound it.
+        note_cb(from as u64 + 0x100, [0f32, 3.0, 0.0].map(f32::to_bits));
+        let v = v2_of(&[(from, &page)], &[from as u64, from as u64 + 0x100, from as u64 + 0x200], false);
+        assert_eq!(v.bottom[bottom_index(Bottom::Fresh)], [1, 1, 1]);
+        assert_eq!(v.bottom[bottom_index(Bottom::Rehydrated)], [1, 0, 1], "without / with the rule");
+        assert_eq!(v.bottom[bottom_index(Bottom::Packed)], [1, 1, 1]);
+        assert_eq!((v.cb_known, v.cb_fallback, v.cb_not_predicted), (1, 0, 0));
+        assert!(v.text().contains("rehydrated without the bit-30 rule 0/1, with it 1/1"), "{}", v.text());
     }
 
     #[test]

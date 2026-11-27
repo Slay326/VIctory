@@ -871,6 +871,11 @@ impl State {
                 unsafe {
                     if compute {
                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        // `VICTORY_BVH_GT` (diagnostics, off by default): the
+                        // rehydrating stage's centre values per bottom level.
+                        if crate::bvh_gt::target().is_some() {
+                            crate::bvh_gt::note_bind(&p.name, &values);
+                        }
                         #[cfg(feature = "diagnostics")]
                         if capturing {
                             let dwords = values
