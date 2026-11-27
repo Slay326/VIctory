@@ -751,20 +751,26 @@ fn run_prefix(
         // SAFETY: an open list; every object lives until the run is waited for.
         unsafe {
             list.SetDescriptorHeaps(&[Some(heap.clone()), Some(samplers.clone())]);
-            for d in c
+            let cb5 = cb5_table();
+            for (dk, d) in c
                 .dispatches
                 .iter()
-                .filter(|d| o.all || d.builder)
+                .enumerate()
+                .filter(|(_, d)| o.all || d.builder)
                 .take(upto)
             {
                 let (root, pso) = &psos[&d.pipeline];
                 list.SetComputeRootSignature(root);
                 list.SetPipelineState(pso);
+                // senior 82 diag (VICTORY_S82_THREADLIMIT=1): a pipeline whose
+                // program got the thread-limit prologue takes its x as threads.
+                let limited = matches!(d.groups, Groups::Direct(_))
+                    && thread_limited(&c.pipelines[d.pipeline as usize].hash);
                 for a in &d.args {
                     match a {
                         RootArg::Constants { param, dwords } => {
                             let mut values = Vec::with_capacity(dwords.len());
-                            for x in dwords {
+                            for (xi, x) in dwords.iter().enumerate() {
                                 values.push(match x.kind {
                                     DwordKind::RootViewSrv | DwordKind::RootViewUav => {
                                         let s = seg_of(x.address)
@@ -777,9 +783,20 @@ fn run_prefix(
                                             })?;
                                         s.pair + u32::from(x.kind == DwordKind::RootViewUav)
                                     }
-                                    DwordKind::GroupXOffset => 0,
+                                    // senior 82 diag: Fix B emulated from a table
+                                    // (VICTORY_S82_CB5_FILE), else as captured (0).
+                                    DwordKind::GroupXOffset => {
+                                        cb5.get(&(dk + 1, xi)).copied().unwrap_or(0)
+                                    }
                                     _ => x.value,
                                 });
+                            }
+                            if limited {
+                                if let (Groups::Direct([x, ..]), Some(v)) =
+                                    (&d.groups, values.get_mut(THREAD_LIMIT_INDEX))
+                                {
+                                    *v = *x;
+                                }
                             }
                             list.SetComputeRoot32BitConstants(
                                 *param,
@@ -819,6 +836,7 @@ fn run_prefix(
                     list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
                 }
                 match &d.groups {
+                    Groups::Direct([x, y, z]) if limited => list.Dispatch(x.div_ceil(64), *y, *z),
                     Groups::Direct([x, y, z]) => list.Dispatch(*x, *y, *z),
                     Groups::Indirect {
                         stride,
@@ -1561,8 +1579,14 @@ fn retranslate(
             );
             continue;
         };
-        let host = victory_shader::emit::translate_with(container, options)
-            .map_err(|e| anyhow::anyhow!("translating {}: {e}", p.hash))?;
+        let limit = thread_limit_on() && THREAD_LIMITED.iter().any(|h| p.hash.starts_with(h));
+        if limit {
+            println!("retranslate {}: thread-limit prologue (x threads from user data {THREAD_LIMIT_INDEX})", p.hash);
+            victory_shader::emit::set_diag_code_patch(Some(thread_limit_patch));
+        }
+        let host = victory_shader::emit::translate_with(container, options);
+        victory_shader::emit::set_diag_code_patch(None);
+        let host = host.map_err(|e| anyhow::anyhow!("translating {}: {e}", p.hash))?;
         println!(
             "retranslate {}: coherent {coherent}, wave lanes {lanes}, view heap {views}, {} bytes, captured {} bytes, byte-equal to the captured DXIL: {}",
             p.hash,
@@ -1587,4 +1611,76 @@ fn retranslate(
         bail!("no pipeline of {only:?} retranslated");
     }
     Ok(())
+}
+
+/// senior 82 diag (Fable "Rehydrier-Kette", Auftrag 4; not a production path):
+/// the unpack passes the title dispatches with x = threads (nodes).
+const THREAD_LIMITED: [&str; 2] = ["caa78b8c", "28918b71"];
+/// The user-data dword that carries x: root constant 15 of these programs
+/// (user data 16 + 15), which they do not read.
+const THREAD_LIMIT_INDEX: usize = 31;
+
+fn thread_limit_on() -> bool {
+    std::env::var("VICTORY_S82_THREADLIMIT").is_ok_and(|v| v.trim() == "1")
+}
+
+fn thread_limited(hash: &str) -> bool {
+    thread_limit_on() && THREAD_LIMITED.iter().any(|h| hash.starts_with(h))
+}
+
+/// Replaces the native program's first 40 bytes (two v_nop, s_inst_prefetch,
+/// `s_and_b32 s3, s1, 0xff`, `s_mov_b32 s2, s0`) with the same two
+/// instructions plus a prologue that takes lanes with global thread id >= x
+/// out of EXEC: `s_load_dword s5, s[2:3], 0x3c` (root constant 15 = x),
+/// `v_lshl_add_u32 v4, s4, 6, v0` (group * 64 + lane), `v_cmpx_gt_u32 exec,
+/// s5, v4`. s5 and v4 are written by the program before it reads them.
+fn thread_limit_patch(code: &mut Vec<u8>) -> Result<(), ()> {
+    let word = |c: &[u8], i: usize| u32::from_le_bytes([c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]);
+    // v_nop (3 words), v_nop (3 words), s_inst_prefetch, s_and_b32 s3, s1, 0xff, s_mov_b32 s2, s0.
+    if code.len() < 40
+        || word(code, 0) >> 16 != 0xD580
+        || word(code, 3) >> 16 != 0xD580
+        || word(code, 6) != 0xBFA0_0003
+        || word(code, 7) != 0x8703_FF01
+        || word(code, 8) != 0x0000_00FF
+        || word(code, 9) != 0xBE82_0300
+    {
+        return Err(());
+    }
+    let prologue: [u32; 10] = [
+        0x8703_FF01, 0x0000_00FF, // s_and_b32 s3, s1, 0xff
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xF400_0141, 0xFA00_003C, // s_load_dword s5, s[2:3], 0x3c
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD746_0004, 0x0401_0C04, // v_lshl_add_u32 v4, s4, 6, v0
+        0x7DA8_0805, // v_cmpx_gt_u32 exec, s5, v4
+        0xBF80_0000, // s_nop 0
+    ];
+    for (i, w) in prologue.iter().enumerate() {
+        code[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// senior 82 diag: the title's values of root-constant dwords the host
+/// zeroed as "group x offset" (Fix B emulation), from
+/// `VICTORY_S82_CB5_FILE`: lines `<dispatch number, 1-based> <dword index>
+/// <value hex>`.
+fn cb5_table() -> HashMap<(usize, usize), u32> {
+    let Ok(path) = std::env::var("VICTORY_S82_CB5_FILE") else {
+        return HashMap::new();
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let t: HashMap<(usize, usize), u32> = text
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let k = it.next()?.parse().ok()?;
+            let i = it.next()?.parse().ok()?;
+            let v = u32::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+            Some(((k, i), v))
+        })
+        .collect();
+    println!("senior 82 diag: {} root-constant values from {path} (Fix B emulation)", t.len());
+    t
 }
