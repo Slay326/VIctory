@@ -189,6 +189,9 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Translated to take a split dispatch's group offset
+    /// (`victory_shader::emit::Options::group_x_offset`).
+    pub(crate) group_x_offset: bool,
 }
 
 #[cfg(windows)]
@@ -266,7 +269,10 @@ fn translate(container: &[u8], loop_limit: Option<u32>, coherent: (u8, u8)) -> (
     // key) its widest wave.
     crate::host::host();
     let (host, cached) = crate::shader_cache::host_shader_with(container, loop_limit, coherent);
-    (host.and_then(|host| with_resources(container, host)), cached)
+    // The same choice as the translation's options.
+    let group_x_offset = crate::shader_cache::wide_groups(container);
+    let made = host.and_then(|host| with_resources(container, host));
+    (made.map(|t| Translated { group_x_offset, ..t }), cached)
 }
 
 #[cfg(windows)]
@@ -290,7 +296,7 @@ fn with_resources(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(Translated { host, used, group_x_offset: false })
 }
 
 #[repr(C)]
