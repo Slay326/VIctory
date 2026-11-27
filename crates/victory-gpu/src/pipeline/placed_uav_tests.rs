@@ -85,6 +85,7 @@ fn store_shader() -> Arc<Shader> {
             group_x_offset: false,
             thread_limit: None,
         })),
+        builder: Default::default(),
     })
 }
 
@@ -123,7 +124,7 @@ fn placed_uav_dispatch_writes_its_texture() {
 
     let mut pipeline = std::ptr::null();
     assert_eq!(
-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
+        hand_out(vec![store_shader()], None, &[], &PIPELINE_IIDS[0], &mut pipeline),
         S_OK
     );
     let pipeline = Guest(pipeline);
