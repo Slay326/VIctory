@@ -1152,7 +1152,9 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// counts groups or threads (`crate::draw::State::dispatch_x`).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(all(windows, feature = "diagnostics"))]
-    log_dispatch_x(this, x, y, z, flags);
+    if dispatch_x_log() {
+        log_dispatch_x(this, x, y, z, flags);
+    }
     #[cfg(windows)]
     state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
@@ -1165,7 +1167,22 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
 /// Diagnostics (senior 82, Fable "Rehydrier-Kette" Auftrag 3): which
 /// programs the title dispatches with `DispatchX` and with which flags.
 /// The first 4 calls of each (shaders, flags) are logged one by one, then
-/// a summary (calls, x min/max, y, z) every 1024 DispatchX calls.
+/// a summary (calls, x min/max, y, z) every 1024 DispatchX calls. Only with
+/// `VICTORY_DISPATCHX_LOG=1` ([`dispatch_x_log`]; senior 98 review point 3):
+/// without it a DispatchX costs one `OnceLock` load here, no lock, no map,
+/// no allocation.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dispatch_x_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| dispatch_x_log_from(std::env::var("VICTORY_DISPATCHX_LOG").ok().as_deref()))
+}
+
+/// [`dispatch_x_log`] from the variable's value: on only for "1".
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dispatch_x_log_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn log_dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     use std::collections::HashMap;
@@ -1973,6 +1990,19 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    /// senior 98 review point 3: the DispatchX log (mutex, map, strings per
+    /// call) runs only with `VICTORY_DISPATCHX_LOG=1`, not in every
+    /// diagnostics build.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn the_dispatch_x_log_is_off_without_its_switch() {
+        assert!(!dispatch_x_log_from(None));
+        assert!(!dispatch_x_log_from(Some("")));
+        assert!(!dispatch_x_log_from(Some("0")));
+        assert!(dispatch_x_log_from(Some("1")));
+        assert!(dispatch_x_log_from(Some(" 1 ")));
+    }
 
     struct PipelineBinds(Arc<AtomicUsize>);
 

@@ -32,6 +32,15 @@
 //! bottom levels outside the compared pages
 //! (`VICTORY_BVH_GT_TOP_PAGES`, 256 pages of 64 KiB per submission).
 //!
+//! A third validator (senior 100, `BVH GT s.. v3` lines, Fable Aufruf 7
+//! point 4b): every structure valid, invalid or not judged ([`Verdict`]);
+//! not judged (header, box nodes, instances or a bottom level not read,
+//! pages past the budget, a header that is no plausible top level) counts
+//! neither way and is shown apart. Bottom levels end exactly at D1 * 64, a
+//! top level's instance list must lie within D1 * 64 (its box nodes may end
+//! at D1 * 64 + 64, measured on the harness dumps), and rehydrated ones with
+//! the header one-sided fallback are counted apart from the bit-30 rule's.
+//!
 //! `VICTORY_BVH_GT_PAGES` (64): the most pages a submission compares.
 //! `VICTORY_BVH_GT_MAX` (200): the most submissions compared in a run.
 //! `VICTORY_BVH_UAV_BARRIER=1`: a global UAV barrier before every dispatch
@@ -210,13 +219,21 @@ pub(crate) fn reader_check(submission: u64) {
     );
     // The second validator on the readers' bytes (top levels only with
     // what these pages hold: nothing is read besides).
-    let v2 = v2_of(&now.iter().map(|(f, b)| (*f, &b[..])).collect::<Vec<_>>(), &last.headers, false);
+    let (v2, v3) = validate(&now.iter().map(|(f, b)| (*f, &b[..])).collect::<Vec<_>>(), &last.headers, false);
     tracing::info!(
         target: "victory_gpu::bvh_gt",
         "BVH GT reader s{submission} v2 (headers of builder s{}): {}; first invalid: {}",
         last.submission,
         v2.text(),
         v2.first.join(", "),
+    );
+    tracing::info!(
+        target: "victory_gpu::bvh_gt",
+        "BVH GT reader s{submission} v3 (headers of builder s{}): {}; first invalid: {}; first not judged: {}",
+        last.submission,
+        v3.text(),
+        v3.first.join(", "),
+        v3.first_not_judged.join(", "),
     );
     let mut total = TWO_POINT.lock().unwrap_or_else(|e| e.into_inner());
     for (t, p) in total.iter_mut().zip(pair) {
@@ -293,8 +310,10 @@ pub(crate) struct Gt {
     list_missed: bool,
     withholding: bool,
     g: Scan,
-    /// The second validator's counts of G's headers ([`v2_of`]).
+    /// The second and third validator's counts of G's headers
+    /// ([`validate`]).
     v2: V2,
+    v3: V3,
     t: [Option<Compare>; 2],
 }
 
@@ -334,12 +353,13 @@ impl Gt {
             Some(Page { from, page, copy: Some(copy), g })
         }));
         let g = scan(&pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>());
-        let v2 = v2_of(
+        let (v2, v3) = validate(
             &pages.iter().map(|p| (p.from, &p.g[..])).collect::<Vec<_>>(),
             &g.headers.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
             true,
         );
         V2_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V2::default).add(&v2);
+        V3_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(V3::default).add(&v3);
         // Remembered for the readers' check ([`reader_check`]): the pages
         // with headers, where they live.
         if reader_target().is_some() && !g.headers.is_empty() {
@@ -363,6 +383,7 @@ impl Gt {
             withholding: false,
             g,
             v2,
+            v3,
             t: [None, None],
         })
     }
@@ -554,6 +575,18 @@ impl Gt {
             CB_DIFFER.load(Ordering::Relaxed),
         );
         tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} v2 run so far: {}", total.text());
+        // v3 (senior 100): "not judged" apart from valid and invalid. Per
+        // submission is the number to read; "run so far" sums a structure
+        // again in every submission that compares it.
+        tracing::info!(
+            target: "victory_gpu::bvh_gt",
+            "BVH GT s{s} v3: {}; first invalid: {}; first not judged: {}",
+            self.v3.text(),
+            self.v3.first.join(", "),
+            self.v3.first_not_judged.join(", "),
+        );
+        let total3 = V3_TOTAL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        tracing::info!(target: "victory_gpu::bvh_gt", "BVH GT s{s} v3 run so far: {}", total3.text());
         for (k, t) in self.t.iter().enumerate() {
             let Some(t) = t else { continue };
             let first: Vec<String> = t.first.iter().map(|(a, g, t)| format!("{a:#x} G={g:#010x} T={t:#010x}")).collect();
@@ -1138,6 +1171,15 @@ pub(crate) struct TopCheck {
     /// The header bounds still hold +-FLT_MAX (instances on packed bottom
     /// levels keep the builder's start values: 190fbf0e leaves them off).
     pub(crate) bounds_start: bool,
+    /// v3: of [`TopCheck::blas_unread`], those whose bottom-level page was
+    /// read but holds no bottom-level header there.
+    pub(crate) blas_no_header: u32,
+    /// v3: the first reason that is a defect in what was read (a bad slot, a
+    /// box node or instance twice, the list or root outside the size, a
+    /// bottom level that is no header, a rehydrated instance's open box),
+    /// and the first thing not read (box node, instance, bottom level).
+    pub(crate) first_defect: Option<String>,
+    pub(crate) first_unread: Option<String>,
 }
 
 /// Index of `b` in [`TopCheck::on`] and [`TopCheck::finite`].
@@ -1163,11 +1205,28 @@ fn bottom_index(b: Bottom) -> usize {
 /// Child boxes are not compared with their parent's (that is [`check`]'s,
 /// which counts the packed instances' +-FLT_MAX as outside).
 pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopCheck {
+    check_top_core(read, base, 64)
+}
+
+/// [`check_top`] with the instance list ending by D1 * 64 + `list_extra`
+/// (v2: 64; v3: 0, the list lies within D1 * 64). Box nodes may end up to
+/// D1 * 64 + 64 in both: on all 8 top levels of the s89-1 harness dumps
+/// (senior 92, 100) the root is the last node and starts at D1 * 64 - 64
+/// (box32) or at D1 * 64 (box16), so a top level's D1 does not count its
+/// header, unlike a bottom level's (spec point 1). Measured, unverified, for
+/// Fable.
+fn check_top_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, list_extra: u64) -> TopCheck {
     let mut t = TopCheck::default();
     let mut why: Option<String> = None;
+    let (mut defect, mut unread): (Option<String>, Option<String>) = (None, None);
     let fail = |why: &mut Option<String>, w: String| {
         if why.is_none() {
             *why = Some(w);
+        }
+    };
+    let note = |first: &mut Option<String>, w: &str| {
+        if first.is_none() {
+            *first = Some(w.to_string());
         }
     };
     let Some(h) = (0..16).map(|i| read(base + 4 * i)).collect::<Option<Vec<u32>>>() else {
@@ -1178,6 +1237,7 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
     t.bounds_start = (4..10).any(|i| f(i).abs() == f32::MAX);
     t.instances = h[3];
     let bytes = u64::from(h[1]) * 64 + 64;
+    let list_end = u64::from(h[1]) * 64 + list_extra;
     let at = |p: u32| u64::from(p & !7) << 3;
     let list = u64::from(h[13]);
     let root = h[12];
@@ -1187,8 +1247,11 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
     if !(root & 7 == 4 || root & 7 == 5) || at(root) == 0 || at(root) >= bytes {
         fail(&mut why, format!("root +48 {root:#x} (size {bytes:#x})"));
     }
-    if list == 0 || list % 64 != 0 || list + 128 * u64::from(h[3]) > bytes {
-        fail(&mut why, format!("instance list +{list:#x} of {} (size {bytes:#x})", h[3]));
+    if list == 0 || list % 64 != 0 || list + 128 * u64::from(h[3]) > list_end {
+        fail(&mut why, format!("instance list +{list:#x} of {} (size {list_end:#x})", h[3]));
+    }
+    if let Some(w) = &why {
+        note(&mut defect, w);
     }
     let mut count = std::collections::HashMap::<u64, u32>::new();
     let mut seen = std::collections::HashSet::new();
@@ -1196,17 +1259,22 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
     while let Some(p) = stack.pop() {
         if !seen.insert(at(p)) {
             t.nodes_twice += 1;
-            fail(&mut why, format!("box node {p:#x} reached twice"));
+            let w = format!("box node {p:#x} reached twice");
+            note(&mut defect, &w);
+            fail(&mut why, w);
             continue;
         }
         if seen.len() > 1 << 16 {
+            note(&mut unread, "more than 65536 box nodes");
             fail(&mut why, "more than 65536 box nodes".into());
             break;
         }
         let n = if p & 7 == 4 { 16 } else { 28 };
         let Some(w) = (0..n).map(|i| read(base + at(p) + 4 * i)).collect::<Option<Vec<u32>>>() else {
             t.missing += 1;
-            fail(&mut why, format!("box node {p:#x} not read"));
+            let w = format!("box node {p:#x} not read");
+            note(&mut unread, &w);
+            fail(&mut why, w);
             continue;
         };
         for i in 0..4 {
@@ -1233,16 +1301,25 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
                     let entry = base + at(child);
                     let Some(e15) = read(entry + 60) else {
                         t.missing += 1;
-                        fail(&mut why, format!("instance {index} not read"));
+                        let w = format!("instance {index} not read");
+                        note(&mut unread, &w);
+                        fail(&mut why, w);
                         continue;
                     };
                     let blas = u64::from(e15) << 8;
-                    let kind = match (read(blas), read(blas + 4)) {
+                    let header = (read(blas), read(blas + 4));
+                    let kind = match header {
                         (Some(d0), Some(d1)) if is_header(d0, d1) => bottom_kind(d0),
                         _ => None,
                     };
                     let Some(kind) = kind else {
                         t.blas_unread += 1;
+                        if let (Some(_), Some(_)) = header {
+                            t.blas_no_header += 1;
+                            note(&mut defect, &format!("instance {index}: no bottom-level header at {blas:#x}"));
+                        } else {
+                            note(&mut unread, &format!("instance {index}: bottom level {blas:#x} not read"));
+                        }
                         fail(&mut why, format!("instance {index}: bottom level {blas:#x} not read or no header"));
                         continue;
                     };
@@ -1253,12 +1330,16 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
                     });
                     t.finite[k] += u32::from(finite);
                     if kind == Bottom::Rehydrated && !finite {
-                        fail(&mut why, format!("instance {index} on rehydrated {blas:#x}: box {b:?}"));
+                        let w = format!("instance {index} on rehydrated {blas:#x}: box {b:?}");
+                        note(&mut defect, &w);
+                        fail(&mut why, w);
                     }
                 }
                 _ => {
                     t.bad_slots += 1;
-                    fail(&mut why, format!("slot {i} of {p:#x}: pointer {child:#x}"));
+                    let w = format!("slot {i} of {p:#x}: pointer {child:#x}");
+                    note(&mut defect, &w);
+                    fail(&mut why, w);
                 }
             }
         }
@@ -1272,8 +1353,13 @@ pub(crate) fn check_top(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> TopChec
     if why.is_none() && t.never > 0 {
         why = Some(format!("{} of {} instances never reached", t.never, t.instances));
     }
+    if t.twice > 0 {
+        note(&mut defect, &format!("{} instances reached more than once", t.twice));
+    }
     t.valid = why.is_none();
     t.why = why;
+    t.first_defect = defect;
+    t.first_unread = unread;
     t
 }
 
@@ -1475,6 +1561,293 @@ impl V2 {
     }
 }
 
+/// The third validator's verdict on one structure (Fable Aufruf 7 point
+/// 4b): valid, invalid (a defect in what was read), or not judged (part of
+/// it not read: header, box nodes, instances, a bottom level, pages past
+/// the budget; or the header is no plausible top level). Not judged counts
+/// neither as valid nor as invalid.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Verdict {
+    Valid,
+    Invalid(String),
+    NotJudged(String),
+}
+
+impl Verdict {
+    /// Index in a [valid, invalid, not judged] count.
+    fn index(&self) -> usize {
+        match self {
+            Verdict::Valid => 0,
+            Verdict::Invalid(_) => 1,
+            Verdict::NotJudged(_) => 2,
+        }
+    }
+
+    fn why(&self) -> &str {
+        match self {
+            Verdict::Valid => "",
+            Verdict::Invalid(w) | Verdict::NotJudged(w) => w,
+        }
+    }
+}
+
+/// v3 of one bottom level: as [`check_v2`], but the structure ends exactly
+/// at D1 * 64 (senior 98 point 5a: v2's D1 * 64 + 64 lets a child up to 64
+/// bytes past the end pass), and a structure with words or box nodes not
+/// read is not judged instead of valid or invalid.
+pub(crate) fn check_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> Verdict {
+    verdict_of(&check_core(read, base, 0, Some(centre)))
+}
+
+/// [`Verdict`] of a bottom-level [`Check`]: a reason that names something
+/// not read (header, a packed node word) or box nodes skipped as not read
+/// make it not judged; any other reason is a defect in what was read.
+fn verdict_of(c: &Check) -> Verdict {
+    match &c.why {
+        Some(w) if w.ends_with("not read") => Verdict::NotJudged(w.clone()),
+        Some(w) => Verdict::Invalid(w.clone()),
+        None if c.missing > 0 => Verdict::NotJudged(format!("{} box nodes not read", c.missing)),
+        None => Verdict::Valid,
+    }
+}
+
+/// v3 of one bottom level ([`check_bottom`] with [`check_v3`]): without
+/// the bit-30 rule, with it, and whether the centre came from cb (the rule)
+/// or from the header one-sided fallback, which v3 counts apart (senior 98
+/// point 5b).
+#[derive(Debug)]
+pub(crate) struct BottomV3 {
+    pub(crate) without_rule: Verdict,
+    pub(crate) with_rule: Verdict,
+    pub(crate) cb_known: bool,
+}
+
+pub(crate) fn check_bottom_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, kind: Bottom, cb: Option<[u32; 3]>) -> BottomV3 {
+    let without_rule = check_v3(read, base, Centre::Bit30AllAxes);
+    let h: Option<Vec<u32>> = (0..16).map(|i| read(base + 4 * i)).collect();
+    let centre = match cb {
+        Some(cb) => Some(cb.map(f32::from_bits)),
+        None => h.as_deref().map(one_sided_centre),
+    };
+    let with_rule = match centre {
+        Some(c) if kind != Bottom::Packed => check_v3(read, base, Centre::Given(c)),
+        _ => without_rule.clone(),
+    };
+    BottomV3 { without_rule, with_rule, cb_known: cb.is_some() }
+}
+
+/// The most instances a plausible top level holds (v3).
+const MOST_INSTANCES: u64 = 1 << 20;
+
+/// Why the header `h` is no plausible top level (v3, "not judged, no top
+/// level"): no version-6 header without bottom-level marks, a root pointer
+/// of no box-node type (4, 5) or outside the size, an instance list offset
+/// of 0 or no 64-byte multiple (11 such headers in the s7072 harness dump,
+/// senior 100), or an instance count of 0, above
+/// [`MOST_INSTANCES`], or one whose list of 128 bytes per instance could
+/// not lie within D1 * 64 at all (the 3.2e9 / 4.3e9 counts
+/// of runs s94v2-bvh and 3070, Fable Aufruf 7 point 2). A plausible count
+/// whose list does not lie within D1 * 64 is a defect ([`check_top_v3`]).
+pub(crate) fn no_top_level(h: &[u32]) -> Option<String> {
+    if !is_header(h[0], h[1]) || bottom_kind(h[0]).is_some() {
+        return Some(format!("no top level: dword 0/1 {:#x}/{}", h[0], h[1]));
+    }
+    let (n, bytes) = (u64::from(h[3]), u64::from(h[1]) * 64);
+    if n == 0 || n > MOST_INSTANCES || 128 * n > bytes {
+        return Some(format!("no top level: {n} instances for size {bytes:#x}"));
+    }
+    // The root: a box node inside the size (box nodes up to D1 * 64 + 64,
+    // [`check_top_core`]); the list: a 64-byte multiple past the header.
+    let root = u64::from(h[12] & !7) << 3;
+    if !(h[12] & 7 == 4 || h[12] & 7 == 5) || root == 0 || root >= bytes + 64 {
+        return Some(format!("no top level: root pointer {:#x} names no box node inside the size", h[12]));
+    }
+    if h[13] == 0 || h[13] % 64 != 0 {
+        return Some(format!("no top level: instance list offset {:#x}", h[13]));
+    }
+    None
+}
+
+/// v3 of the top level at `base` (Fable Aufruf 7 point 4b): no plausible
+/// top level ([`no_top_level`]) is not judged; else [`check_top`] with the
+/// instance list [dword 13, dword 13 + 128 * dword 3) within D1 * 64 (box
+/// nodes up to D1 * 64 + 64, see [`check_top_core`]). A defect in what was
+/// read (bad slot, box node or instance twice, the list past D1 * 64, a
+/// bottom level read but no header,
+/// a rehydrated instance's open box) makes it invalid; else anything not
+/// read (box node, instance entry, bottom-level header) makes it not judged,
+/// and "never reached" counts only when all was read.
+pub(crate) fn check_top_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> (TopCheck, Verdict) {
+    let Some(h) = (0..16).map(|i| read(base + 4 * i)).collect::<Option<Vec<u32>>>() else {
+        return (TopCheck::default(), Verdict::NotJudged("header not read".into()));
+    };
+    if let Some(w) = no_top_level(&h) {
+        return (TopCheck { instances: h[3], ..Default::default() }, Verdict::NotJudged(w));
+    }
+    let t = check_top_core(read, base, 0);
+    let v = if let Some(d) = &t.first_defect {
+        Verdict::Invalid(d.clone())
+    } else if let Some(u) = &t.first_unread {
+        Verdict::NotJudged(u.clone())
+    } else if t.never > 0 {
+        Verdict::Invalid(format!("{} of {} instances never reached", t.never, t.instances))
+    } else {
+        Verdict::Valid
+    };
+    (t, v)
+}
+
+/// The v3 counts of one submission's headers ([`validate`]), and of the
+/// run. Every count of verdicts is [valid, invalid, not judged].
+#[derive(Default, Debug, Clone)]
+pub(crate) struct V3 {
+    /// By [`bottom_index`]; rehydrated ones without the bit-30 rule.
+    pub(crate) bottom: [[u32; 3]; 4],
+    /// Rehydrated ones with the rule, centre from a 5e687674 dispatch's cb
+    /// (the rule's count), and apart those with the header one-sided
+    /// fallback (no dispatch seen; senior 98 point 5b).
+    pub(crate) rule: [u32; 3],
+    pub(crate) fallback: [u32; 3],
+    /// Top levels with finite header bounds and with +-FLT_MAX in them.
+    pub(crate) tops: [[u32; 3]; 2],
+    /// Of the headers not judged: no plausible top level; top levels with a
+    /// box node or instance entry not read; with a bottom level not read.
+    pub(crate) no_top: u32,
+    pub(crate) top_unread: [u32; 2],
+    /// Summed over the judged top levels only (valid or invalid), so that
+    /// "never" holds no instance merely not read.
+    pub(crate) instances: u64,
+    pub(crate) reached: u64,
+    pub(crate) never: u64,
+    pub(crate) twice: u64,
+    pub(crate) bad_slots: u64,
+    pub(crate) nodes_twice: u64,
+    pub(crate) no_header: u64,
+    pub(crate) on: [u64; 4],
+    pub(crate) finite: [u64; 4],
+    /// The first invalid and the first not judged ones (rehydrated with the
+    /// rule, top levels).
+    pub(crate) first: Vec<String>,
+    pub(crate) first_not_judged: Vec<String>,
+}
+
+impl V3 {
+    fn add(&mut self, o: &V3) {
+        let pairs = self
+            .bottom
+            .iter_mut()
+            .flatten()
+            .zip(o.bottom.iter().flatten())
+            .chain(self.tops.iter_mut().flatten().zip(o.tops.iter().flatten()))
+            .chain(self.rule.iter_mut().zip(&o.rule))
+            .chain(self.fallback.iter_mut().zip(&o.fallback))
+            .chain(self.top_unread.iter_mut().zip(&o.top_unread));
+        for (a, b) in pairs {
+            *a += b;
+        }
+        self.no_top += o.no_top;
+        self.instances += o.instances;
+        self.reached += o.reached;
+        self.never += o.never;
+        self.twice += o.twice;
+        self.bad_slots += o.bad_slots;
+        self.nodes_twice += o.nodes_twice;
+        self.no_header += o.no_header;
+        for k in 0..4 {
+            self.on[k] += o.on[k];
+            self.finite[k] += o.finite[k];
+        }
+    }
+
+    fn add_bottom(&mut self, at: u64, kind: Bottom, c: &BottomV3) {
+        self.bottom[bottom_index(kind)][c.without_rule.index()] += 1;
+        if kind != Bottom::Rehydrated {
+            self.note(format!("{kind:?} {at:#x}"), &c.without_rule);
+            return;
+        }
+        if c.cb_known {
+            self.rule[c.with_rule.index()] += 1;
+        } else {
+            self.fallback[c.with_rule.index()] += 1;
+        }
+        self.note(format!("rehydrated {at:#x}"), &c.with_rule);
+    }
+
+    fn add_top(&mut self, at: u64, t: &TopCheck, v: &Verdict) {
+        let start = usize::from(t.bounds_start);
+        match v {
+            Verdict::NotJudged(w) if w.starts_with("no top level") => self.no_top += 1,
+            Verdict::NotJudged(_) => {
+                self.tops[start][2] += 1;
+                self.top_unread[usize::from(t.first_unread.as_deref().is_some_and(|u| u.contains("bottom level")))] += 1;
+            }
+            _ => {
+                self.tops[start][v.index()] += 1;
+                self.instances += u64::from(t.instances);
+                self.reached += u64::from(t.reached);
+                self.never += u64::from(t.never);
+                self.twice += u64::from(t.twice);
+                self.bad_slots += u64::from(t.bad_slots);
+                self.nodes_twice += u64::from(t.nodes_twice);
+                self.no_header += u64::from(t.blas_no_header);
+                for k in 0..4 {
+                    self.on[k] += u64::from(t.on[k]);
+                    self.finite[k] += u64::from(t.finite[k]);
+                }
+            }
+        }
+        if !matches!(v, Verdict::NotJudged(w) if w.starts_with("no top level")) {
+            self.note(format!("top {at:#x}"), v);
+        }
+    }
+
+    fn note(&mut self, what: String, v: &Verdict) {
+        let list = match v {
+            Verdict::Valid => return,
+            Verdict::Invalid(_) => &mut self.first,
+            Verdict::NotJudged(_) => &mut self.first_not_judged,
+        };
+        if list.len() < 3 {
+            list.push(format!("{what} {}", v.why()));
+        }
+    }
+
+    /// The counts as one log line's text.
+    pub(crate) fn text(&self) -> String {
+        let c = |k: &[u32; 3]| format!("{}/{}/{}", k[0], k[1], k[2]);
+        format!(
+            "valid/invalid/not judged: bottom fresh {}, rehydrated without the bit-30 rule {}, with the rule (centre from cb) {}, header one-sided fallback apart {}, other bottom {}, packed {}; top {}, top with +-FLT_MAX header bounds {}; not judged: no top level {}, top with a box node or instance not read {}, with a bottom level not read {}; judged top levels: instances {}, reached {}, never {}, more than once {}, bad slots {}, box nodes twice {}, bottom level no header {}; on packed {}, on 0x8002 {} (finite {}), on 0x8004 {} (finite {}), on other bottom {}",
+            c(&self.bottom[2]),
+            c(&self.bottom[1]),
+            c(&self.rule),
+            c(&self.fallback),
+            c(&self.bottom[3]),
+            c(&self.bottom[0]),
+            c(&self.tops[0]),
+            c(&self.tops[1]),
+            self.no_top,
+            self.top_unread[0],
+            self.top_unread[1],
+            self.instances,
+            self.reached,
+            self.never,
+            self.twice,
+            self.bad_slots,
+            self.nodes_twice,
+            self.no_header,
+            self.on[0],
+            self.on[1],
+            self.finite[1],
+            self.on[2],
+            self.finite[2],
+            self.on[3],
+        )
+    }
+}
+
+/// v3 totals of the run ([`Gt::take`]).
+static V3_TOTAL: std::sync::Mutex<Option<V3>> = std::sync::Mutex::new(None);
+
 /// v2 totals of the run ([`Gt::take`]).
 static V2_TOTAL: std::sync::Mutex<Option<V2>> = std::sync::Mutex::new(None);
 
@@ -1513,8 +1886,17 @@ fn more_pages(want: &std::collections::BTreeSet<u64>, budget: &mut usize, extra:
 /// their bottom levels' headers not in `pages` are read besides
 /// ([`more_pages`], within [`most_top_pages`]); without it they count as
 /// not read.
+#[cfg(test)]
 pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> V2 {
+    validate(pages, headers, fetch).0
+}
+
+/// The v2 and v3 counts ([`V2`], [`V3`]) of the structures with headers at
+/// `headers` in `pages`, as [`v2_of`] says; v3 sees the same pages,
+/// including those read besides for the top levels.
+pub(crate) fn validate(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> (V2, V3) {
     let mut v = V2::default();
+    let mut v3 = V3::default();
     let read = reader(pages);
     let mut extra_pages: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut budget = if fetch { most_top_pages() } else { 0 };
@@ -1542,6 +1924,7 @@ pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> V
                         v.first.push(format!("rehydrated {at:#x} {}", c.with_rule.why.as_deref().unwrap_or("?")));
                     }
                 }
+                v3.add_bottom(at, kind, &check_bottom_v3(&read, at, kind, cb));
             }
             None => {
                 let mut t = TopCheck::default();
@@ -1572,10 +1955,17 @@ pub(crate) fn v2_of(pages: &[(usize, &[u8])], headers: &[u64], fetch: bool) -> V
                 if !t.valid && v.first.len() < 3 {
                     v.first.push(format!("top {at:#x} {}", t.why.as_deref().unwrap_or("?")));
                 }
+                // v3 on the same bytes: the compared pages and those read
+                // besides; what is still missing (past the budget) leaves the
+                // structure not judged.
+                let more = reader(&extra_pages);
+                let read_all = |a: u64| read(a).or_else(|| more(a));
+                let (t3, verdict) = check_top_v3(&read_all, at);
+                v3.add_top(at, &t3, &verdict);
             }
         }
     }
-    v
+    (v, v3)
 }
 
 /// A small valid bottom-level structure of 64 dwords (256 bytes): header,
@@ -1850,6 +2240,276 @@ mod tests {
 
     fn read_map(m: &std::collections::HashMap<u64, u32>) -> impl Fn(u64) -> Option<u32> + '_ {
         move |at| m.get(&at).copied()
+    }
+
+    // v3 (senior 100, Fable Aufruf 7 point 4b). Each test is red against
+    // the v2 logic (size D1 * 64 + 64, two states, fallback in the rule's
+    // count; red proof in the JOURNAL entry "senior 100").
+
+    /// A child 32 bytes past D1 * 64 is invalid: v2's size D1 * 64 + 64 let
+    /// it pass (senior 98 point 5a). The last byte inside still passes.
+    #[test]
+    fn v3_a_child_32_bytes_past_the_size_is_invalid() {
+        let base = 0x5000;
+        let mut w = mini_bvh();
+        // Child 0 of the root: a triangle at 256 + 32 (the size is 4 * 64).
+        w[16] = (256 + 32) >> 3;
+        let v = check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("past the size")), "{v:?}");
+        // At 256 exactly: past the end too; at 248: inside.
+        w[16] = 256 >> 3;
+        assert!(matches!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Invalid(_)));
+        w[16] = 248 >> 3;
+        assert_eq!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Valid);
+        assert_eq!(check_v3(&read_of(&mini_bvh(), base), base, Centre::Bit30AllAxes), Verdict::Valid);
+    }
+
+    /// A bottom level whose box nodes were not read is not judged, neither
+    /// valid (v2: a node not read was skipped) nor invalid.
+    #[test]
+    fn v3_a_bottom_level_with_nodes_not_read_is_not_judged() {
+        let base = 0x5000;
+        let w = mini_bvh();
+        // Only the header was read.
+        let v = check_v3(&read_of(&w[..16], base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("not read")), "{v:?}");
+        let v = check_v3(&read_of(&w[..8], base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("header not read")), "{v:?}");
+        // A packed one with a node word not read.
+        let p = mini_packed();
+        let v = check_v3(&read_of(&p[..40], base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("not read")), "{v:?}");
+        assert_eq!(check_v3(&read_of(&p, base), base, Centre::Bit30AllAxes), Verdict::Valid);
+    }
+
+    /// One instance no slot names is "never reached" and invalid, when all
+    /// was read; a box node not read leaves the top level not judged and
+    /// its instances out of "never" (v2: invalid, all three never).
+    #[test]
+    fn v3_an_unreachable_instance_is_never_reached() {
+        let base = 0x10000u64;
+        let m = mini_top();
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert_eq!(v, Verdict::Valid, "{t:?}");
+        // Slot 2 empty: instance 2 is in the list but unreachable.
+        let mut m = mini_top();
+        m.insert(base + 64 + 8, u32::MAX);
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("1 of 3 instances never reached")), "{v:?}");
+        assert_eq!((t.reached, t.never), (2, 1));
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!((c.tops[1], c.never), ([0, 1, 0], 1));
+        // The root box node not read: not judged, nothing counts as never.
+        let mut m = mini_top();
+        m.remove(&(base + 64));
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("not read")), "{v:?}");
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!((c.tops[1], c.never, c.instances, c.top_unread), ([0, 0, 1], 0, 0, [1, 0]));
+    }
+
+    /// An instance whose bottom-level page is missing leaves the top level
+    /// not judged (the instance is reached; v2: invalid "not read or no
+    /// header"); a bottom level read but with no header there is a defect.
+    #[test]
+    fn v3_a_missing_bottom_level_page_is_not_judged_not_never_reached() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.remove(&0x20200);
+        m.remove(&0x20204);
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.contains("bottom level") && why.contains("not read")), "{v:?}");
+        assert_eq!((t.reached, t.never, t.blas_unread, t.blas_no_header), (3, 0, 1, 0));
+        let mut c = V3::default();
+        c.add_top(base, &t, &v);
+        assert_eq!((c.tops[1], c.never, c.top_unread), ([0, 0, 1], 0, [0, 1]));
+        // Read, but no bottom-level header there.
+        let mut m = mini_top();
+        m.insert(0x20200, 0x1234_5678);
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("no bottom-level header")), "{v:?}");
+        assert_eq!(t.blas_no_header, 1);
+    }
+
+    /// A header with 3e9 instances is no top level (Fable Aufruf 7 point 2:
+    /// counts up to 4.3e9 in the runs): not judged, apart from invalid.
+    #[test]
+    fn v3_a_header_with_3e9_instances_is_no_top_level() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        m.insert(base + 12, 3_000_000_000);
+        let (_, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::NotJudged(why) if why.starts_with("no top level")), "{v:?}");
+        let mut c = V3::default();
+        c.add_top(base, &check_top_v3(&read_map(&m), base).0, &v);
+        assert_eq!((c.no_top, c.tops, c.instances, c.never), (1, [[0; 3]; 2], 0, 0));
+        assert!(c.first.is_empty() && c.first_not_judged.is_empty());
+        // More instances than D1 * 64 could list (9 * 64 / 128 = 4.5): 5.
+        m.insert(base + 12, 5);
+        assert!(matches!(check_top_v3(&read_map(&m), base).1, Verdict::NotJudged(why) if why.starts_with("no top level")));
+        assert!(no_top_level(&[6, 9, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0x45, 0x40, 0, 0]).is_none());
+        assert!(no_top_level(&[6, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x45, 0x40, 0, 0]).is_some());
+    }
+
+    /// A plausible count whose instance list ends past D1 * 64 is invalid
+    /// (the list must lie within D1 * 64; v2 allowed 64 bytes more).
+    #[test]
+    fn v3_an_instance_list_past_the_size_is_invalid() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        // D1 8: size 512, the list [192, 576) ends 64 bytes past it.
+        m.insert(base + 4, 8);
+        let (_, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("instance list")), "{v:?}");
+    }
+
+    /// A top level's box nodes may lie up to D1 * 64 + 64 (the s89-1
+    /// harness dumps: a box16 root at D1 * 64), not past it.
+    #[test]
+    fn v3_a_top_level_box_node_may_start_at_d1_times_64() {
+        let base = 0x10000u64;
+        let mut m = mini_top();
+        // Slot 3 of the root names a box16 node at 576 = D1 * 64 with no
+        // children.
+        m.insert(base + 64 + 12, (576 >> 3) | 4);
+        for i in 0..16u64 {
+            m.insert(base + 576 + 4 * i, if i < 4 { u32::MAX } else { 0 });
+        }
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert_eq!(v, Verdict::Valid, "{t:?}");
+        // At D1 * 64 + 64: past the size, a bad slot.
+        m.insert(base + 64 + 12, (640 >> 3) | 4);
+        let (t, v) = check_top_v3(&read_map(&m), base);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("slot 3")), "{v:?}");
+        assert_eq!(t.bad_slots, 1);
+        // A plausible count but a root of no box-node type: no top level.
+        let mut m = mini_top();
+        m.insert(base + 48, 0x61);
+        assert!(matches!(check_top_v3(&read_map(&m), base).1, Verdict::NotJudged(why) if why.starts_with("no top level")));
+        // A root far past the size, a list offset of no 64-byte multiple
+        // (s7072: +0x29, root 0x7f1ad): no top level either.
+        for (at, w) in [(base + 48, 0x7f1ad), (base + 48, 5), (base + 52, 0x29), (base + 52, 0)] {
+            let mut m = mini_top();
+            m.insert(at, w);
+            assert!(matches!(check_top_v3(&read_map(&m), base).1, Verdict::NotJudged(why) if why.starts_with("no top level")), "{w:#x}");
+        }
+    }
+
+    /// Counter-check on a capture through the harness path (senior 100;
+    /// needs game data, so ignored): the pages a harness run left after a
+    /// cut (`--dump`, `cut<k>-run0.index/.pages`) with the capture's PRE
+    /// pages where the dump has none (as senior 86 mem86), headers found in
+    /// the dump's pages as the game finds them in G, each checked by v3.
+    /// cb of the 5e687674 dispatches is not read here, so rehydrated ones
+    /// count as fallback. `VICTORY_V3_CAPTURE=<capture dir>`,
+    /// `VICTORY_V3_PAGES=<dump dir>\cut<k>-run0`.
+    #[test]
+    #[ignore]
+    fn v3_on_a_harness_dump() {
+        use crate::bvh_replay::format::Stage;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let (Ok(cap), Ok(prefix)) = (std::env::var("VICTORY_V3_CAPTURE"), std::env::var("VICTORY_V3_PAGES")) else {
+            panic!("VICTORY_V3_CAPTURE and VICTORY_V3_PAGES");
+        };
+        let loaded = RefCell::new(crate::bvh_replay::harness::Loaded::open(std::path::Path::new(&cap)).unwrap());
+        let pre: HashMap<u64, crate::bvh_replay::format::PageRec> =
+            loaded.borrow().capture.pages_of(Stage::Pre).map(|p| (p.address & !0xffff, p.clone())).collect();
+        let data = std::fs::read(format!("{prefix}.pages")).unwrap();
+        let mut dump: Vec<(usize, Vec<u8>)> = Vec::new();
+        for line in std::fs::read_to_string(format!("{prefix}.index")).unwrap().lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let at = u64::from_str_radix(f[0].trim_start_matches("0x"), 16).unwrap();
+            let (o, n): (usize, usize) = (f[1].parse().unwrap(), f[2].parse().unwrap());
+            dump.push((at as usize, data[o..o + n].to_vec()));
+        }
+        let by_page: HashMap<u64, usize> = dump.iter().enumerate().map(|(i, (at, _))| (*at as u64 & !0xffff, i)).collect();
+        let cache: RefCell<HashMap<u64, Option<Vec<u8>>>> = RefCell::new(HashMap::new());
+        let (from_dump, from_pre, absent) = (RefCell::new(0u64), RefCell::new(0u64), RefCell::new(0u64));
+        let read = |a: u64| -> Option<u32> {
+            let page = a & !0xffff;
+            let o = (a - page) as usize;
+            let word = |b: &[u8]| b.get(o..o + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            if let Some(&i) = by_page.get(&page) {
+                *from_dump.borrow_mut() += 1;
+                return word(&dump[i].1);
+            }
+            let mut c = cache.borrow_mut();
+            let b = c.entry(page).or_insert_with(|| pre.get(&page).and_then(|p| loaded.borrow_mut().bytes(p).ok()));
+            match b {
+                Some(b) => {
+                    *from_pre.borrow_mut() += 1;
+                    word(b)
+                }
+                None => {
+                    *absent.borrow_mut() += 1;
+                    None
+                }
+            }
+        };
+        let list: Vec<(usize, &[u8])> = dump.iter().map(|(a, b)| (*a, &b[..])).collect();
+        let headers: Vec<u64> = scan(&list).headers.iter().map(|(at, _)| *at).collect();
+        let mut v3 = V3::default();
+        for &at in &headers {
+            let (Some(d0), Some(d1)) = (read(at), read(at + 4)) else { continue };
+            if !is_header(d0, d1) {
+                continue;
+            }
+            match bottom_kind(d0) {
+                Some(kind) => v3.add_bottom(at, kind, &check_bottom_v3(&read, at, kind, None)),
+                None => {
+                    let (t, v) = check_top_v3(&read, at);
+                    let h: Vec<String> = (0..16).map(|i| read(at + 4 * i).map_or("-".into(), |w| format!("{w:x}"))).collect();
+                    println!(
+                        "top {at:#x}: {v:?}; instances {} reached {} never {} twice {} bad slots {} bottom level not read {} no header {}; header [{}]",
+                        t.instances,
+                        t.reached,
+                        t.never,
+                        t.twice,
+                        t.bad_slots,
+                        t.blas_unread - t.blas_no_header,
+                        t.blas_no_header,
+                        h.join(" ")
+                    );
+                    v3.add_top(at, &t, &v);
+                }
+            }
+        }
+        println!("capture {cap} pages {prefix}: headers {}; v3: {}", headers.len(), v3.text());
+        println!("first invalid: {}; first not judged: {}", v3.first.join(", "), v3.first_not_judged.join(", "));
+        println!("words read from the dump {}, from PRE {}, absent {}", from_dump.borrow(), from_pre.borrow(), absent.borrow());
+    }
+
+    /// Rehydrated ones with the header one-sided fallback (no 5e687674
+    /// dispatch seen) count apart from the rule's (senior 98 point 5b).
+    #[test]
+    fn v3_counts_the_one_sided_fallback_apart_from_the_rule() {
+        let mut page = vec![0u8; 0x1000];
+        let put = |page: &mut Vec<u8>, at: usize, w: &[u32]| {
+            for (i, x) in w.iter().enumerate() {
+                page[at + 4 * i..at + 4 * i + 4].copy_from_slice(&x.to_le_bytes());
+            }
+        };
+        let from = 0x4_1000_0000usize;
+        put(&mut page, 0, &bit30_bvh());
+        put(&mut page, 0x100, &bit30_bvh());
+        let mut garbage = [0u32; 16];
+        garbage[0] = 6;
+        garbage[1] = 9;
+        garbage[3] = 3_212_292_472;
+        put(&mut page, 0x200, &garbage);
+        note_cb(from as u64, [0f32, 3.0, 0.0].map(f32::to_bits));
+        let (v2, v3) = validate(&[(from, &page)], &[from as u64, from as u64 + 0x100, from as u64 + 0x200], false);
+        assert_eq!((v2.cb_known, v2.cb_fallback), (1, 1));
+        assert_eq!(v3.rule, [1, 0, 0], "the rule's count: cb known only");
+        assert_eq!(v3.fallback, [1, 0, 0], "the fallback apart");
+        assert_eq!(v3.bottom[bottom_index(Bottom::Rehydrated)], [0, 2, 0], "without the rule");
+        assert_eq!((v3.no_top, v3.tops[0]), (1, [0, 0, 0]));
+        let text = v3.text();
+        assert!(text.contains("with the rule (centre from cb) 1/0/0, header one-sided fallback apart 1/0/0"), "{text}");
+        assert!(text.contains("no top level 1"), "{text}");
     }
 
     #[test]
