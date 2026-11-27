@@ -15,8 +15,11 @@
 //!   from there (two in a row: a temporal pair for an in-run A-A).
 //! * `VICTORY_READER_CAPTURE_HASH` (`f607780a`): the reader program's
 //!   shader hash prefix.
-//! * `VICTORY_READER_CAPTURE_VIEWS` (`u52,t373,t379`): the table views
-//!   taken, by kind and register.
+//! * `VICTORY_READER_CAPTURE_VIEWS` (`u52,t373,t379,t339`): the table
+//!   views taken, by kind and register. t339 (senior 105): with root
+//!   constant s6 != 16 the program takes its probe ids from t339, not t373
+//!   (disassembly of f607780a at 0x7c-0x134; u52's element is
+//!   N * (id >> 29) + (id & 0x0fffffff) then, N = b3 dword 5).
 //!
 //! Without `VICTORY_READER_CAPTURE` nothing is recorded, allocated or
 //! written. One file per dispatch, `reader-f<frame>-s<submission>-d<k>.bin`
@@ -50,7 +53,7 @@ impl Plan {
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Option<Plan> {
         let folder = var("VICTORY_READER_CAPTURE").filter(|v| !v.trim().is_empty())?;
         let number = |name: &str, default: u64| var(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default);
-        let views = var("VICTORY_READER_CAPTURE_VIEWS").unwrap_or_else(|| "u52,t373,t379".into());
+        let views = var("VICTORY_READER_CAPTURE_VIEWS").unwrap_or_else(|| "u52,t373,t379,t339".into());
         Some(Plan {
             folder: PathBuf::from(folder.trim()),
             at: number("VICTORY_READER_CAPTURE_AT", 0),
@@ -360,6 +363,18 @@ mod game {
         out
     }
 
+    /// FNV-1a of the running exe's bytes (hex), read once; "unread" if the
+    /// file cannot be read.
+    fn exe_fnv() -> String {
+        static H: OnceLock<String> = OnceLock::new();
+        H.get_or_init(|| {
+            std::env::current_exe()
+                .and_then(std::fs::read)
+                .map_or_else(|_| "unread".into(), |b| format!("{:016x}", fnv(&b)))
+        })
+        .clone()
+    }
+
     /// After the fence of submission `submission` (before anything goes
     /// back): the recorded reader dispatches of `runs` written out.
     pub(crate) fn take(records: Vec<Recorded>, submission: u64) {
@@ -387,6 +402,12 @@ mod game {
                 ("indirect".into(), r.indirect.to_string()),
                 ("taken".into(), "after the fence, before copy-back".into()),
                 ("switches".into(), switches.join(" ")),
+                // senior 105: what the offline comparison checks to be equal
+                // in all four runs (exe, event).
+                ("exe_fnv".into(), exe_fnv()),
+                ("capture_at".into(), plan.at.to_string()),
+                ("capture_n".into(), plan.most.to_string()),
+                ("capture_hash".into(), plan.hash.clone()),
             ];
             meta.extend(r.used.iter().map(|u| ("used".to_string(), u.clone())));
             let mut sections: Vec<Section> = r
@@ -507,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = plan(&dir.path().join("cap"));
         assert_eq!((p.at, p.most, p.hash.as_str()), (0, 2, "f607780a"));
-        assert_eq!(p.views, vec![(true, 52), (false, 373), (false, 379)]);
+        assert_eq!(p.views, vec![(true, 52), (false, 373), (false, 379), (false, 339)]);
         assert!(wanted(Some(&p), "F607780A12345678", 0, 1));
         assert!(!wanted(Some(&p), "5552dac612345678", 0, 0));
         assert!(!wanted(Some(&p), "f607780a12345678", 0, 2));
