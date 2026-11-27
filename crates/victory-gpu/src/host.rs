@@ -1577,7 +1577,17 @@ impl Host {
         if marks_sent {
             crate::shadow::marks_fetched(&card_marks);
         }
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        // Of the builder's ranges that stay in large copies, the pages its
+        // lists marked are kept (`crate::memory::keeps_pages`).
+        let builder: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = if crate::memory::keeps_pages(missed.contains(&true)) {
+            let on_card = |(s, a, n): &&(std::sync::Arc<crate::shadow::Shadow>, usize, usize)| {
+                kept_on_card.contains(&(std::sync::Arc::as_ptr(s) as usize, *a, *n))
+            };
+            withheld.iter().filter(on_card).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        crate::shadow::copy_back_marks_keeping(&withheld, &builder, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
