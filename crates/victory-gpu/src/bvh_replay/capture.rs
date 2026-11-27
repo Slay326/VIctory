@@ -539,6 +539,12 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
     let mut touched: BTreeSet<u64> = arena_pages.keys().map(|a| a >> 28).collect();
     let mut views: Vec<u64> = Vec::new();
     for r in &records {
+        // `VICTORY_BVH_CAPTURE_READER`: only the captured program's
+        // dispatches name blocks (the others of its lists are not replayed;
+        // their root views and constants named most of 7.7 GB, onCap2).
+        if reader_prefix().is_some() && !r.builder {
+            continue;
+        }
         for a in &r.args {
             match a {
                 RootArg::View { address, .. } => views.push(*address),
@@ -572,11 +578,14 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
     // blocks, and the block of the BVH descriptor's base address.
     let mut view_pre = HashMap::new();
     let mut titles = BTreeSet::new();
+    // Blocks of views without a host view (the top levels): taken first.
+    let mut priority: BTreeSet<u64> = BTreeSet::new();
     for (i, l) in runs.iter().enumerate().skip(first) {
         for (k, r) in l.bvh_records().iter().enumerate() {
             for a in &r.args {
                 if let RootArg::Table { views, .. } = a {
                     touched.extend(view_blocks(views));
+                    priority.extend(view_blocks(views));
                     titles.extend(views.iter().map(|v| (v.kind, v.register, v.title)));
                 }
             }
@@ -654,7 +663,28 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
         .values()
         .map(|(s, c)| (*s, c.clone()))
         .collect();
-    let arena_list: Vec<u64> = arena_wanted.into_iter().collect();
+    // The top levels' blocks first (arena pages, then copies), then the
+    // rest: the budget cuts the rest, not the structures the reader walks
+    // from (onCap2: its two top-level pages were cut).
+    let first_block = |a: &u64| priority.contains(&(a >> 28));
+    let (arena_first, arena_rest): (Vec<u64>, Vec<u64>) = arena_wanted.into_iter().partition(first_block);
+    let mut copies_first: Vec<(u32, Vec<u64>)> = Vec::new();
+    let mut copies_rest: Vec<(u32, Vec<u64>)> = Vec::new();
+    for (seg, pages) in by_copy {
+        let (a, b): (Vec<u64>, Vec<u64>) = pages.into_iter().partition(first_block);
+        if !a.is_empty() {
+            copies_first.push((seg, a));
+        }
+        if !b.is_empty() {
+            copies_rest.push((seg, b));
+        }
+    }
+    meta(
+        &mut pending.capture,
+        "pages of the top levels' blocks",
+        arena_first.len() + copies_first.iter().map(|(_, p)| p.len()).sum::<usize>(),
+    );
+    for (arena_list, copies) in [(arena_first, copies_first), (arena_rest, copies_rest)] {
     let n = (arena_list.len() as u64).min(budget) as usize;
     pending.left_out += (arena_list.len() - n) as u64;
     budget -= n as u64;
@@ -670,11 +700,10 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
         &mut pending.pre_offset,
     );
     pending.taken.extend(h);
-    for (seg, pages) in by_copy {
+    for (seg, pages) in copies {
         let Some(copy) = seg_of.get(&seg) else {
             continue;
         };
-        let pages: Vec<u64> = pages.into_iter().collect();
         let n = (pages.len() as u64).min(budget) as usize;
         pending.left_out += (pages.len() - n) as u64;
         budget -= n as u64;
@@ -696,6 +725,7 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
             &mut pending.pre_offset,
         );
         pending.taken.extend(h);
+    }
     }
     // The page records name arena pages by their chunk's segment.
     for p in pending.capture.pages.iter_mut() {
