@@ -1646,6 +1646,24 @@ impl State {
         for u in &stage.translated().used {
             let uav = u.kind == ResourceType::Uav;
             used.push(format!("{:?} r{} slot {} dw {}", u.kind, u.lower_bound, u.slot, u.table_offset_dwords));
+            // senior 105: constant buffers by register (b3: N of u52's index).
+            if u.kind == ResourceType::Cbv && plan.cbvs.contains(&u.lower_bound) {
+                if let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot)))
+                    && let Some(crate::descriptor::View::Constant(address, size)) =
+                        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                {
+                    let len = u64::from(size);
+                    ranges.push(reader::Range {
+                        name: format!("b{}", u.lower_bound),
+                        address,
+                        len,
+                        format: 0,
+                        stride: 4,
+                        copy: crate::shadow::find(address, len),
+                    });
+                }
+                continue;
+            }
             if !plan.views.contains(&(uav, u.lower_bound)) || !(uav || u.kind == ResourceType::Srv) {
                 continue;
             }

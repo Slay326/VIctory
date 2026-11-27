@@ -15,7 +15,7 @@
 //!   from there (two in a row: a temporal pair for an in-run A-A).
 //! * `VICTORY_READER_CAPTURE_HASH` (`f607780a`): the reader program's
 //!   shader hash prefix.
-//! * `VICTORY_READER_CAPTURE_VIEWS` (`u52,t373,t379,t339`): the table
+//! * `VICTORY_READER_CAPTURE_VIEWS` (`u52,t373,t379,t339,b3`): the table
 //!   views taken, by kind and register. t339 (senior 105): with root
 //!   constant s6 != 16 the program takes its probe ids from t339, not t373
 //!   (disassembly of f607780a at 0x7c-0x134; u52's element is
@@ -45,6 +45,9 @@ pub struct Plan {
     pub hash: String,
     /// Views taken: (UAV, register).
     pub views: Vec<(bool, u32)>,
+    /// Constant buffers taken, by register (senior 105: b3, whose dword 5
+    /// is N in u52's index with s6 != 16).
+    pub cbvs: Vec<u32>,
 }
 
 impl Plan {
@@ -53,7 +56,7 @@ impl Plan {
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Option<Plan> {
         let folder = var("VICTORY_READER_CAPTURE").filter(|v| !v.trim().is_empty())?;
         let number = |name: &str, default: u64| var(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default);
-        let views = var("VICTORY_READER_CAPTURE_VIEWS").unwrap_or_else(|| "u52,t373,t379,t339".into());
+        let views = var("VICTORY_READER_CAPTURE_VIEWS").unwrap_or_else(|| "u52,t373,t379,t339,b3".into());
         Some(Plan {
             folder: PathBuf::from(folder.trim()),
             at: number("VICTORY_READER_CAPTURE_AT", 0),
@@ -62,6 +65,7 @@ impl Plan {
                 .map(|v| v.trim().to_ascii_lowercase())
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "f607780a".into()),
+            cbvs: views.split(',').filter_map(|v| v.trim().strip_prefix('b')?.parse().ok()).collect(),
             views: views
                 .split(',')
                 .filter_map(|v| {
@@ -235,8 +239,24 @@ pub fn self_check(bytes: &[u8], source_hash: &str, need: &[&str]) -> Result<Capt
         }
     }
     let section = |n: &str| c.sections.iter().find(|s| s.name == n);
+    let word = |s: &Section, i: usize| s.bytes.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    // senior 105: the program's form by root constant s6 (the first one):
+    // probe ids from t373 with s6 == 16, else from t339 (PC 2 s106-off-A:
+    // dispatch 0 with s6 = 15 has no t373 view), and the count t379[s6].
+    let s6 = section("consts").and_then(|k| word(k, 0));
+    if let Some(s6) = s6 {
+        let ids = if s6 == 16 { "t373" } else { "t339" };
+        match section(ids) {
+            Some(s) if s.expected > 0 && s.stride > 0 => {}
+            Some(_) => return Err(format!("{ids}: empty or no element stride (s6 = {s6})")),
+            None => return Err(format!("{ids} missing (s6 = {s6})")),
+        }
+    }
     if let (Some(out), Some(count)) = (section("u52"), section("t379")) {
-        let n = count.bytes.get(..4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let at = s6.unwrap_or(0) as usize;
+        let Some(n) = word(count, at) else {
+            return Err(format!("count t379[{at}] outside t379 ({} bytes)", count.bytes.len()));
+        };
         let elements = out.expected / u64::from(out.stride.max(1));
         if u64::from(n) > elements {
             return Err(format!("count {n} above the output's {elements} elements"));
@@ -244,6 +264,10 @@ pub fn self_check(bytes: &[u8], source_hash: &str, need: &[&str]) -> Result<Capt
     }
     Ok(c)
 }
+
+/// The sections every capture needs; the probe ids (t373 or t339) by the
+/// form ([`self_check`]).
+pub const TAKE_NEED: [&str; 2] = ["u52", "t379"];
 
 /// The file name of a dispatch's capture.
 pub fn file_name(frame: u64, submission: u64, dispatch: usize) -> String {
@@ -440,7 +464,7 @@ mod game {
         for path in &written {
             let verdict = std::fs::read(path)
                 .map_err(|e| e.to_string())
-                .and_then(|b| self_check(&b, victory_shader::SOURCE_HASH, &["u52", "t373", "t379"]).map(|_| ()));
+                .and_then(|b| self_check(&b, victory_shader::SOURCE_HASH, &TAKE_NEED).map(|_| ()));
             tracing::info!(
                 target: "victory_gpu::reader_capture",
                 "reader capture s{submission} frame {frame}: {} self-check {}",
@@ -505,6 +529,42 @@ mod tests {
         assert!(self_check(&encode(&c), "f1cf82997c12266d", &NEED).unwrap_err().contains("count 9"));
     }
 
+    /// senior 105 (PC 2 s106-off-A, dispatch 0: "t373 missing"): with root
+    /// constant s6 != 16 the program reads its ids from t339 and has no
+    /// t373 view; the count is t379[s6]. Red with the old need list.
+    #[test]
+    fn the_self_check_takes_the_ids_view_by_the_form() {
+        let mut c = sample();
+        let ids = c.sections.remove(1);
+        let mut counts = vec![0u8; 4 * 17];
+        counts[4 * 15..4 * 16].copy_from_slice(&3u32.to_le_bytes());
+        c.sections[1].bytes = counts.clone();
+        c.sections[1].expected = counts.len() as u64;
+        let consts = |s6: u32| Section {
+            name: "consts".into(),
+            address: 0,
+            expected: 16,
+            format: 0,
+            stride: 4,
+            bytes: [s6, 0, 100, 0].iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        c.sections.push(consts(15));
+        let e = self_check(&encode(&c), "f1cf82997c12266d", &TAKE_NEED).unwrap_err();
+        assert!(e.contains("t339 missing (s6 = 15)"), "{e}");
+        c.sections.push(Section { name: "t339".into(), ..ids.clone() });
+        assert!(self_check(&encode(&c), "f1cf82997c12266d", &TAKE_NEED).is_ok());
+        // s6 == 16: t373 needed, and the count is t379[16].
+        let last = c.sections.len() - 2;
+        c.sections[last] = consts(16);
+        let e = self_check(&encode(&c), "f1cf82997c12266d", &TAKE_NEED).unwrap_err();
+        assert!(e.contains("t373 missing (s6 = 16)"), "{e}");
+        c.sections.push(ids);
+        assert!(self_check(&encode(&c), "f1cf82997c12266d", &TAKE_NEED).is_ok());
+        // A count above the output's elements at t379[s6].
+        c.sections[1].bytes[4 * 16..4 * 17].copy_from_slice(&9u32.to_le_bytes());
+        assert!(self_check(&encode(&c), "f1cf82997c12266d", &TAKE_NEED).unwrap_err().contains("count 9"));
+    }
+
     #[test]
     fn without_the_switch_nothing_is_recorded_read_or_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -529,6 +589,7 @@ mod tests {
         let p = plan(&dir.path().join("cap"));
         assert_eq!((p.at, p.most, p.hash.as_str()), (0, 2, "f607780a"));
         assert_eq!(p.views, vec![(true, 52), (false, 373), (false, 379), (false, 339)]);
+        assert_eq!(p.cbvs, vec![3]);
         assert!(wanted(Some(&p), "F607780A12345678", 0, 1));
         assert!(!wanted(Some(&p), "5552dac612345678", 0, 0));
         assert!(!wanted(Some(&p), "f607780a12345678", 0, 2));
