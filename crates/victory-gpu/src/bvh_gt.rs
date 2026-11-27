@@ -40,6 +40,9 @@
 //! top level's instance list must lie within D1 * 64 (its box nodes may end
 //! at D1 * 64 + 64, measured on the harness dumps), and rehydrated ones with
 //! the header one-sided fallback are counted apart from the bit-30 rule's.
+//! v3c (senior 109): box nodes of every structure may end by D1 * 64 + 64
+//! (a box32 root in the last 64 bytes); 0x8002 / 0x8004 nodes still start
+//! inside D1 * 64.
 //!
 //! `VICTORY_BVH_GT_PAGES` (64): the most pages a submission compares.
 //! `VICTORY_BVH_GT_MAX` (200): the most submissions compared in a run.
@@ -782,8 +785,14 @@ pub(crate) fn check_v2(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Cen
 }
 
 /// [`check_with`] (`v2` none: as before) or [`check_v2`]; with `node_end`
-/// (v3b, senior 105) a box node must also end inside the size, not only
-/// start there (box16 64 bytes, box32 112).
+/// (v3b, senior 105) a box node must also end by D1 * 64 + 64, not only
+/// start inside the size (box16 64 bytes, box32 112). v3c (senior 109):
+/// the end limit is D1 * 64 + 64 for every kind, also where nodes must
+/// start inside D1 * 64 exactly (0x8002 / 0x8004): fresh bottom levels put
+/// a box32 root at D1 * 64 - 64 that ends 48 bytes past D1 * 64 (run V105
+/// 20261127-164739: 115/115 "ends past the size" there, 5/5 raw 0x8004
+/// headers; same shape as a top level's box32 root, senior 100). Measured,
+/// unverified, for Fable.
 fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Option<Centre>, node_end: bool) -> Check {
     let mut c = Check::default();
     let fail = |c: &mut Check, why: String| {
@@ -801,6 +810,7 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
         return check_packed(read, base, &h);
     }
     let bytes = u64::from(h[1]) * 64 + extra;
+    let node_limit = u64::from(h[1]) * 64 + 64;
     let root = h[12];
     let at = |p: u32| u64::from(p & !7) << 3;
     if root == u32::MAX || root & 7 == 7 || at(root) == 0 || at(root) >= bytes {
@@ -828,9 +838,9 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
             continue;
         }
         let n = if kind == 4 { 16 } else { 28 };
-        if node_end && at(p) + 4 * n > bytes {
+        if node_end && at(p) + 4 * n > node_limit {
             c.outside += 1;
-            fail(&mut c, format!("box node {p:#x} ends past the size {bytes:#x}"));
+            fail(&mut c, format!("box node {p:#x} ends past the size {node_limit:#x} (D1 * 64 + 64)"));
             continue;
         }
         let Some(w) = (0..n).map(|i| read(base + at(p) + 4 * i)).collect::<Option<Vec<u32>>>() else {
@@ -1666,6 +1676,10 @@ impl Verdict {
 /// D1 * 64 (runs s103: root 0x10c at size 0x840, 0x55fc at 0x2afc0, like
 /// runs 164431/171123 in [`check`]): their nodes may end at D1 * 64 + 64,
 /// as a top level's ([`check_top_core`]). Measured, unverified, for Fable.
+///
+/// v3c (senior 109): box nodes of every kind may end by D1 * 64 + 64 (a
+/// fresh bottom level's box32 root at D1 * 64 - 64, see [`check_core`]);
+/// where they start stays as above (0x8002 / 0x8004 inside D1 * 64).
 pub(crate) fn check_v3(read: &dyn Fn(u64) -> Option<u32>, base: u64, centre: Centre) -> Verdict {
     let extra = match read(base).and_then(bottom_kind) {
         Some(Bottom::Other) => 64,
@@ -2585,19 +2599,28 @@ mod tests {
         n
     }
 
-    /// A bottom level's box node must end by D1 * 64 too (0x8004 here): a
-    /// box32 root at 192 of a 256-byte structure ends 48 bytes past; at 64
-    /// it is inside.
+    /// v3c (senior 109): a fresh (0x8004) bottom level's box32 root at
+    /// D1 * 64 - 64 (192 of a 256-byte structure) ends 48 bytes past
+    /// D1 * 64 and is valid: run V105 20261127-164739 had 115/115 fresh
+    /// "ends past the size" at exactly this place and 5/5 raw 0x8004
+    /// headers with the root there (v3b: 0/513 fresh valid). A box32 root
+    /// at D1 * 64 still starts past the size; at 64 it is inside.
     #[test]
-    fn v3b_a_bottom_level_box_node_must_end_inside() {
+    fn v3c_a_fresh_box32_root_at_d1_times_64_minus_64_is_valid() {
         let base = 0x5000;
         let mut w = mini_bvh().to_vec();
         w.resize(96, 0);
         w[0] = 0x8004 << 16 | 6;
         w[48..76].copy_from_slice(&box32_root());
         w[12] = (192 >> 3) | 5;
-        let v = check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes);
-        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("ends past the size")), "{v:?}");
+        assert_eq!(check_v3(&read_of(&w, base), base, Centre::Bit30AllAxes), Verdict::Valid);
+        let mut x = mini_bvh().to_vec();
+        x.resize(100, 0);
+        x[0] = 0x8004 << 16 | 6;
+        x[64..92].copy_from_slice(&box32_root());
+        x[12] = (256 >> 3) | 5;
+        let v = check_v3(&read_of(&x, base), base, Centre::Bit30AllAxes);
+        assert!(matches!(&v, Verdict::Invalid(why) if why.contains("root +48")), "{v:?}");
         let mut w = mini_bvh().to_vec();
         w[0] = 0x8004 << 16 | 6;
         w[16..44].copy_from_slice(&box32_root());
