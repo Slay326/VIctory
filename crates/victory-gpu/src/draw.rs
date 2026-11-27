@@ -880,6 +880,10 @@ impl State {
                             if let Some((at, stage)) = crate::bvh_gt::build_target(&p.name, &values) {
                                 list.note_gt_build(at, stage);
                             }
+                            // Fable Aufruf 13: every unpacking's start.
+                            if let Some(at) = crate::bvh_gt::start_target(&p.name, &values) {
+                                list.note_gt_build(at, crate::bvh_gt::START_STAGE);
+                            }
                         }
                         #[cfg(feature = "diagnostics")]
                         if capturing {

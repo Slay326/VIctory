@@ -1237,6 +1237,22 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // each until the title writes it ([`keeps_pages`]).
         let keeps = arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) && keeps_pages(pages + regions > 0);
         if withheld > 0 {
+            // `VICTORY_BVH_GT` (Fable Aufruf 13): what the title may wait
+            // for in title memory and never gets: the builder's pages in
+            // small title buffers (those that go back when nothing misses).
+            if ran_builder.load(std::sync::atomic::Ordering::Relaxed) && crate::bvh_gt::target().is_some() {
+                let small: Vec<u64> =
+                    writes.iter().filter(|&&(k, _)| copies[k].range().1 <= crate::arena::BACK).map(|&(_, at)| at).collect();
+                if !small.is_empty() {
+                    let first: Vec<String> = small.iter().take(8).map(|a| format!("{a:#x}")).collect();
+                    tracing::info!(
+                        "BVH GT builder list: {} pages of small title buffers withheld from title memory (this list missed {}; first: {})",
+                        small.len(),
+                        pages + regions,
+                        first.join(" "),
+                    );
+                }
+            }
             for (k, at) in writes.drain(..) {
                 release_waited(&copies[k], at, 1 << 16);
                 if !keep && !(keeps && keep_page(&copies[k], at as usize)) {

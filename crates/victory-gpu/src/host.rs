@@ -1555,7 +1555,9 @@ impl Host {
         // v4: what the builder's dispatches of this submission wrote, of
         // every submission (the build map is by submission, the GPU's order).
         if gt_target.is_some() {
-            let builds: Vec<(u64, u8)> = runs.iter().flat_map(|l| l.take_gt_builds()).collect();
+            let mut builds: Vec<(u64, u8)> = runs.iter().flat_map(|l| l.take_gt_builds()).collect();
+            crate::bvh_gt::log_rehydration(*submitted, &builds);
+            builds.retain(|b| b.1 != crate::bvh_gt::START_STAGE);
             crate::bvh_gt::note_builds(*submitted, &builds);
         }
         let mut gt = gt_target.and_then(|hash| {

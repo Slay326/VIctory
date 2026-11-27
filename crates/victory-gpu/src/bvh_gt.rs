@@ -112,6 +112,50 @@ fn most_submissions() -> u64 {
     *N.get_or_init(|| number("VICTORY_BVH_GT_MAX", 200))
 }
 
+/// The first submission compared (`VICTORY_BVH_GT_FROM`, 0): the 200
+/// compared ones ended long before the readers' frames (run 193641:
+/// s3477-s7793, readers at s19740 and s22532).
+fn first_submission() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| number("VICTORY_BVH_GT_FROM", 0))
+}
+
+/// The stage that starts a bottom level's unpacking, 4ddd6f97 (its
+/// address at user data 35 and 36, as the rehydrating stage's: senior 120's
+/// trace lines), and its mark among a list's build targets: logged with the
+/// submission, not part of the build map ([`log_rehydration`]).
+const START: &str = "4ddd6f97";
+pub(crate) const START_STAGE: u8 = 7;
+
+/// The bottom level a 4ddd6f97 bind names, as [`build_target`].
+pub(crate) fn start_target(name: &str, values: &[u32]) -> Option<u64> {
+    if !name.contains(START) {
+        return None;
+    }
+    let at = u64::from(*values.get(35)?) | u64::from(*values.get(36)?) << 32;
+    (at != 0 && at & 0xff == 0).then_some(at)
+}
+
+/// Every unpacking of the run by submission (Fable Aufruf 13): the bottom
+/// levels the 4ddd6f97 binds and the 5e687674 binds of submission
+/// `submission` named, all of them, one line per submission that has any.
+pub(crate) fn log_rehydration(submission: u64, targets: &[(u64, u8)]) {
+    let of = |stage: u8| -> Vec<String> {
+        targets.iter().filter(|t| t.1 == stage).map(|t| format!("{:#x}", t.0)).collect()
+    };
+    let (starts, rehydrated) = (of(START_STAGE), of(2));
+    if starts.is_empty() && rehydrated.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "BVH GT s{submission} rehydration: {} binds of 4ddd6f97 [{}]; {} binds of 5e687674 [{}]",
+        starts.len(),
+        starts.join(" "),
+        rehydrated.len(),
+        rehydrated.join(" "),
+    );
+}
+
 /// `VICTORY_BVH_GT_READER=<shader hash>` (a ray tracing program, such as
 /// f607780a): after each submission with a list that bound it, the headers
 /// the last builder comparison found are checked again in what the GPU
@@ -378,7 +422,7 @@ impl Gt {
     /// the target lists (`lists` of them) marked. None if no list ran the
     /// target or enough submissions were compared.
     pub(crate) fn take(submission: u64, lists: usize, marks: Vec<Marks>) -> Option<Gt> {
-        if lists == 0 || COMPARED.fetch_add(1, Ordering::Relaxed) >= most_submissions() {
+        if lists == 0 || submission < first_submission() || COMPARED.fetch_add(1, Ordering::Relaxed) >= most_submissions() {
             return None;
         }
         let (mut owned, mut missed_pages, mut missed_regions, mut first_missed) = (Vec::new(), 0, 0, Vec::new());
@@ -3904,6 +3948,9 @@ mod tests {
         (values[35], values[36]) = (0x0305_d100, 0x7);
         assert_eq!(build_target("cs 5552dac6aa", &values), Some((0xd_5f20_d300, 0)));
         assert_eq!(build_target("190fbf0e", &values), Some((0xd6_01a6_f000, TOP_STAGE)));
+        assert_eq!(start_target("cs 4ddd6f9702fab2a7", &values), Some(0x7_0305_d100));
+        assert_eq!((start_target("5e687674", &values), start_target("4ddd6f97", &values[..36])), (None, None));
+        assert_eq!(build_target("4ddd6f97", &values), None, "a start is no build of the map");
         assert_eq!(build_target("5e687674", &values), Some((0x7_0305_d100, 2)));
         assert_eq!(build_target("f607780a", &values), None);
         assert_eq!(build_target("5552dac6", &values[..17]), None);
