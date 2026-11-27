@@ -771,6 +771,14 @@ fn run_prefix(
                         RootArg::Constants { param, dwords } => {
                             let mut values = Vec::with_capacity(dwords.len());
                             for (xi, x) in dwords.iter().enumerate() {
+                                // senior 89 diag (red probe): VICTORY_S89_OVERRIDE_PLAIN=1 lets the
+                                // table set plain dwords too (e.g. zero the title values Fix B keeps).
+                                if x.kind == DwordKind::Plain && override_plain() {
+                                    if let Some(v) = cb5.get(&(dk + 1, xi)) {
+                                        values.push(*v);
+                                        continue;
+                                    }
+                                }
                                 values.push(match x.kind {
                                     DwordKind::RootViewSrv | DwordKind::RootViewUav => {
                                         let s = seg_of(x.address)
@@ -1666,6 +1674,10 @@ fn thread_limit_patch(code: &mut Vec<u8>) -> Result<(), ()> {
 /// zeroed as "group x offset" (Fix B emulation), from
 /// `VICTORY_S82_CB5_FILE`: lines `<dispatch number, 1-based> <dword index>
 /// <value hex>`.
+fn override_plain() -> bool {
+    std::env::var("VICTORY_S89_OVERRIDE_PLAIN").is_ok_and(|v| v == "1")
+}
+
 fn cb5_table() -> HashMap<(usize, usize), u32> {
     let Ok(path) = std::env::var("VICTORY_S82_CB5_FILE") else {
         return HashMap::new();
