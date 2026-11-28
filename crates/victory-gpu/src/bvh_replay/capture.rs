@@ -112,11 +112,16 @@ pub fn view_blocks<'a>(views: impl IntoIterator<Item = &'a TableView>) -> BTreeS
         .collect()
 }
 
-/// Whether the program with shader hash `hash` is a captured one: the
-/// reader's with `VICTORY_BVH_CAPTURE_READER`, else the builder's.
+/// Whether the program with shader hash `hash` is a captured one: one of
+/// the reader's with `VICTORY_BVH_CAPTURE_READER` (hash prefixes, commas
+/// between several: the RT reader and the shadow mask program in one run),
+/// else the builder's.
 pub fn is_target(reader: Option<&str>, hash: &str, builder: bool) -> bool {
     match reader {
-        Some(prefix) => hash.to_ascii_lowercase().starts_with(prefix),
+        Some(prefixes) => {
+            let hash = hash.to_ascii_lowercase();
+            prefixes.split(',').map(str::trim).any(|p| !p.is_empty() && hash.starts_with(p))
+        }
         None => builder,
     }
 }
@@ -179,8 +184,15 @@ fn tops_first() -> bool {
 /// first: the whole top level (D1 * 64 + 64 bytes, box nodes may end there)
 /// and the page of each instance's bottom-level header (entry dword 15 << 8,
 /// Fable Aufruf 11 point 3). Sizes past 64 MiB or 65536 instances are not
-/// taken as a header.
-fn top_level_pages(read: &dyn Fn(u64, u64) -> Vec<u8>, candidates: impl Iterator<Item = u64>) -> (Vec<(u64, u32)>, BTreeSet<u64>) {
+/// taken as a header. `whole` (`VICTORY_BVH_CAPTURE_READER_BLAS=1`): every
+/// page of each instance's bottom level instead of its header page alone
+/// (D1 * 64 + 64 bytes from its header, whatever its marks; a header that
+/// is none, or names more than 64 MiB, gives its own page only).
+fn top_level_pages(
+    read: &dyn Fn(u64, u64) -> Vec<u8>,
+    candidates: impl Iterator<Item = u64>,
+    whole: bool,
+) -> (Vec<(u64, u32)>, BTreeSet<u64>) {
     let words = |b: &[u8]| -> Vec<u32> { b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
     let mut tops = Vec::new();
     let mut pages = BTreeSet::new();
@@ -206,13 +218,36 @@ fn top_level_pages(read: &dyn Fn(u64, u64) -> Vec<u8>, candidates: impl Iterator
         let e = words(&read(base + list, u64::from(n) * 128));
         for i in 0..(e.len() / 32) {
             let blas = u64::from(e[32 * i + 15]) << 8;
-            if blas != 0 {
-                pages.insert(blas & !(PAGE - 1));
+            if blas == 0 {
+                continue;
+            }
+            pages.insert(blas & !(PAGE - 1));
+            if !whole || !seen.insert(blas) {
+                continue;
+            }
+            let b = words(&read(blas, 8));
+            if b.len() < 2 || b[0] & 0xffff != 6 || !(1..=1 << 20).contains(&b[1]) {
+                continue;
+            }
+            let mut p = blas & !(PAGE - 1);
+            while p < blas + u64::from(b[1]) * 64 + 64 {
+                pages.insert(p);
+                p += PAGE;
             }
         }
         tops.push((base, n));
     }
     (tops, pages)
+}
+
+/// `VICTORY_BVH_CAPTURE_READER_BLAS=1` (with `VICTORY_BVH_CAPTURE_READER`):
+/// the top levels behind the captured program's table views and every page
+/// of their instances' bottom levels are taken before the rest, so that a
+/// reference can test the program's rays against the triangles (Fable
+/// Aufruf 22 point 14; onCap3 cut all 554 bottom levels).
+fn reader_blas() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_CAPTURE_READER_BLAS").is_ok_and(|v| v.trim() == "1"))
 }
 
 fn most_bytes() -> u64 {
@@ -224,6 +259,33 @@ fn most_bytes() -> u64 {
             .unwrap_or(8192u64)
             << 20
     })
+}
+
+/// The bytes of `[address, address + len)` as the arena holds them; shorter
+/// if a page has no slot.
+fn arena_range(address: u64, len: u64) -> Vec<u8> {
+    let first = address & !(PAGE - 1);
+    let pages: Vec<u64> = (first..address + len).step_by(PAGE as usize).collect();
+    let mut got = crate::arena::fetch(&pages);
+    got.sort_by_key(|(at, _)| *at);
+    let mut out = Vec::with_capacity(len as usize);
+    let mut next = address;
+    for (at, bytes) in got {
+        let end = at + bytes.len() as u64;
+        if end <= next {
+            continue;
+        }
+        if at > next {
+            break;
+        }
+        let to = end.min(address + len);
+        out.extend_from_slice(&bytes[(next - at) as usize..(to - at) as usize]);
+        next = to;
+        if next >= address + len {
+            break;
+        }
+    }
+    out
 }
 
 /// A dispatch as recorded.
@@ -694,8 +756,13 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
     // addresses and their instances' bottom-level header pages, as the
     // copies hold them now (the build before at the same address), are
     // taken before the rest; onCap3 cut all 554 bottom levels.
+    //
+    // `VICTORY_BVH_CAPTURE_READER_BLAS=1` (reader capture only): the top
+    // levels at the captured program's table view addresses, with every
+    // page of their instances' bottom levels, copies and arena pages alike.
     let mut first_pages: BTreeSet<u64> = BTreeSet::new();
-    if reader_prefix().is_none() && tops_first() {
+    let whole = reader_prefix().is_some() && reader_blas();
+    if whole || (reader_prefix().is_none() && tops_first()) {
         let shadows: HashMap<u32, Arc<Shadow>> = copy_segs.values().map(|(s, c)| (*s, c.clone())).collect();
         let read = |at: u64, len: u64| -> Vec<u8> {
             match capture.table.entry_at(at) {
@@ -703,31 +770,47 @@ pub(crate) fn pre(runs: &[&HostList], first: usize, submission: u64) -> Option<P
                     .get(&seg)
                     .map(|c| super::reader::gpu_range(c, at, len))
                     .unwrap_or_default(),
+                Some((_, Entry::Arena { .. })) if whole => arena_range(at, len),
                 _ => Vec::new(),
             }
         };
         let mut candidates: BTreeSet<u64> = BTreeSet::new();
-        for r in records.iter().filter(|r| r.builder) {
-            for a in &r.args {
-                if let RootArg::Constants { dwords, .. } = a {
-                    let values: Vec<u32> = dwords.iter().map(|d| d.value).collect();
-                    candidates.extend(crate::arena::constant_addresses(&values));
+        if whole {
+            candidates.extend(titles.iter().map(|&(_, _, title)| title).filter(|&t| t != 0));
+        } else {
+            for r in records.iter().filter(|r| r.builder) {
+                for a in &r.args {
+                    if let RootArg::Constants { dwords, .. } = a {
+                        let values: Vec<u32> = dwords.iter().map(|d| d.value).collect();
+                        candidates.extend(crate::arena::constant_addresses(&values));
+                    }
                 }
             }
         }
-        let (tops, pages) = top_level_pages(&read, candidates.iter().copied());
+        let (tops, pages) = top_level_pages(&read, candidates.iter().copied(), whole);
         meta(
             &mut capture,
             "tops first",
             tops.iter().map(|(at, n)| format!("{at:#x}:{n}")).collect::<Vec<_>>().join(" "),
         );
         meta(&mut capture, "pages of top levels and bottom-level headers", pages.len());
+        let mut unnamed = 0u64;
         for p in pages {
-            if let Some((_, Entry::Copy { seg })) = capture.table.entry_at(p) {
-                by_copy.entry(seg).or_default().insert(p);
-                first_pages.insert(p);
+            match capture.table.entry_at(p) {
+                Some((_, Entry::Copy { seg })) => {
+                    by_copy.entry(seg).or_default().insert(p);
+                    first_pages.insert(p);
+                }
+                Some((_, Entry::Arena { .. })) if whole => {
+                    arena_wanted.insert(p);
+                    first_pages.insert(p);
+                }
+                _ => unnamed += 1,
             }
         }
+        // Pages of those structures the page table names no copy for: the
+        // program reads zeros there, and so does the reference.
+        meta(&mut capture, "pages of those with no entry in the page table", unnamed);
     }
     let file = std::fs::File::create(dir.join("pre.pages")).ok()?;
     let mut pending = Pending {
@@ -1056,12 +1139,58 @@ mod tests {
         let read = |at: u64, len: u64| -> Vec<u8> {
             (0..len / 4).flat_map(|k| mem.get(&(at + 4 * k)).copied().unwrap_or(0).to_le_bytes()).collect()
         };
-        let (tops, pages) = top_level_pages(&read, [tlas + 0x10, blas_hdr, 0x1234_0000].into_iter());
+        let (tops, pages) = top_level_pages(&read, [tlas + 0x10, blas_hdr, 0x1234_0000].into_iter(), false);
         assert_eq!(tops, vec![(tlas, 2)]);
         let want: Vec<u64> = (0..5).map(|k| 0xd_5f20_0000 + k * 0x1_0000).chain([0x7_03fd_0000, 0xb_1234_0000]).collect();
         let mut want = want;
         want.sort();
         assert_eq!(pages.into_iter().collect::<Vec<_>>(), want);
+    }
+
+    /// Fable (BVH proof): with `whole`, every page of each instance's bottom
+    /// level is taken, packed or not, to the end of D1 * 64 + 64 bytes; an
+    /// instance without a header there gives its header page alone, a bottom
+    /// level two instances share is read once.
+    #[test]
+    fn reader_blas_takes_every_page_of_the_bottom_levels() {
+        let tlas = 0xd_5f20_c400u64;
+        let mut mem = std::collections::BTreeMap::new();
+        let mut put = |at: u64, w: u32| {
+            mem.insert(at, w);
+        };
+        for (i, w) in [6u32, 0x1071, 0, 4, 0, 0, 0, 0, 0, 0, 0x35a80, 0, 0x8385, 0x11580, 0x40, 0].into_iter().enumerate() {
+            put(tlas + 4 * i as u64, w);
+        }
+        // Unpacked over three pages, packed over two, the first again, one
+        // with no header.
+        let (plain, packed, none) = (0x7_03fd_ff00u64, 0xb_1234_5600u64, 0xc_0042_0000u64);
+        for (i, b) in [plain, packed, plain, none].into_iter().enumerate() {
+            put(tlas + 0x11580 + 128 * i as u64 + 60, (b >> 8) as u32);
+        }
+        put(plain, 0x8002_0006);
+        put(plain + 4, 0x800);
+        put(packed, 0x8102_0006);
+        put(packed + 4, 0x3ff);
+        let reads = std::cell::Cell::new(0u32);
+        let read = |at: u64, len: u64| -> Vec<u8> {
+            reads.set(reads.get() + 1);
+            (0..len / 4).flat_map(|k| mem.get(&(at + 4 * k)).copied().unwrap_or(0).to_le_bytes()).collect()
+        };
+        let (tops, pages) = top_level_pages(&read, [tlas].into_iter(), true);
+        assert_eq!(tops, vec![(tlas, 4)]);
+        let mut want: Vec<u64> = (0..5).map(|k| 0xd_5f20_0000 + k * 0x1_0000).collect();
+        // 0x7_03fd_ff00 + 0x800 * 64 + 64 = 0x7_03ff_ff40: pages fd, fe, ff.
+        want.extend([0x7_03fd_0000u64, 0x7_03fe_0000, 0x7_03ff_0000]);
+        // 0xb_1234_5600 + 0x3ff * 64 + 64 = 0xb_1235_5600: two pages.
+        want.extend([0xb_1234_0000u64, 0xb_1235_0000]);
+        want.push(0xc_0042_0000);
+        want.sort();
+        assert_eq!(pages.into_iter().collect::<Vec<_>>(), want);
+        // Header and instance list of the top level, then one read a bottom level.
+        assert_eq!(reads.get(), 2 + 3);
+        // Without `whole`: the header pages alone.
+        let (_, pages) = top_level_pages(&read, [tlas].into_iter(), false);
+        assert_eq!(pages.len(), 5 + 3);
     }
     use crate::bvh_replay::format::{Groups, RootArg, INDIRECT_ARGUMENTS};
     use crate::bvh_replay::format::TableView;
@@ -1074,6 +1203,12 @@ mod tests {
         assert!(!is_target(Some("f607780a"), "5552dac6aaaa", true));
         assert!(is_target(None, "5552dac6aaaa", true));
         assert!(!is_target(None, "f607780aa8e502d0", false));
+        // Several programs in one run (Fable, BVH proof).
+        for hash in ["f607780aa8e502d0", "5CF00DC39042EDAF"] {
+            assert!(is_target(Some("f607780a, 5cf00dc3"), hash, false));
+        }
+        assert!(!is_target(Some("f607780a,5cf00dc3"), "559d9f0184e15fe3", true));
+        assert!(!is_target(Some("f607780a,"), "559d9f0184e15fe3", false));
     }
 
     /// senior 115: every table view's title address and host range give
