@@ -96,29 +96,16 @@ pub(crate) fn pair(name: &str, values: &[u32]) -> Option<(u64, u64)> {
 }
 
 /// The 64 KiB pages of a structure of `units` 64-byte units at `at` past
-/// its header's page (none for one that is no bottom level's size).
+/// its header's page (none for one that is no bottom level's size): what
+/// must be held, by a copy or the arena, before its stages run. (Asking the
+/// arena for them at the bind with `want_around` did not give them: run
+/// 20261128-113540, five structures of 4.8-5.8 MB still ended in memory
+/// nothing held; the arena gives one window a committed run.)
+#[cfg(test)]
 fn pages_past_header(at: u64, units: u32) -> impl Iterator<Item = u64> {
     let end = if (1..=MOST).contains(&units) { at + u64::from(units) * 64 } else { at };
     let first = (at | 0xffff) + 1;
     (first..end.max(first)).step_by(0x1_0000)
-}
-
-/// A bind names the structure at `destination` to unpack in place: the
-/// pages past its header's that no copy holds get arena pages before the
-/// list runs (`crate::arena::want_around`), filled from title memory. Run
-/// 20261128-111102: two bottom levels of 5.5 MB began in a 4 MiB title
-/// buffer's copy and ended in memory nothing held; the stages wrote their
-/// ends into nothing, the pages got arena pages only after those misses,
-/// and the structures stayed packed for the rest of the run (the title asks
-/// once).
-pub(crate) fn want_whole(destination: u64) {
-    let Some(head) = title_head(destination) else { return };
-    if head[0] & 0xffff != 6 {
-        return;
-    }
-    for page in pages_past_header(destination, head[1]) {
-        crate::arena::want_around(page);
-    }
 }
 
 /// Header dword 0, bit 24: the structure is still packed.
