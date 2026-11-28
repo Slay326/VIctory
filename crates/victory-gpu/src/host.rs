@@ -240,6 +240,9 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // Before any root signature with static samplers (the presenter's
+        // included): the listed ones first, in the list's order.
+        crate::pipeline::sampler_order::prime(&device);
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -3155,6 +3158,9 @@ impl Compositor {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
                 ..Default::default()
             };
+            // Its place in the driver's table comes from the list too
+            // (`pipeline::sampler_order`); this pipeline is never kept.
+            crate::pipeline::sampler_order::admit(device, &[sampler]);
             let desc = D3D12_ROOT_SIGNATURE_DESC {
                 NumParameters: 1,
                 pParameters: &parameter,

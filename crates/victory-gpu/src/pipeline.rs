@@ -751,6 +751,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod sampler_order;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 

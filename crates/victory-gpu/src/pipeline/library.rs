@@ -6,7 +6,10 @@
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    an entry whose description differs, so neither is ever used. A
+//!    pipeline with static samplers is named by their places in the
+//!    driver's table too (`sampler_order`), or, where those cannot be
+//!    vouched for, made every run on NVIDIA ([`keeps_static_samplers`]).
 //! 2. The title pipelines a run drew or dispatched with (made in time or
 //!    not) are listed by a key known when the title creates them (their
 //!    shader containers and graphics state); the next run hands those to
@@ -65,6 +68,11 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+}
+
+/// The cache folder, once one is given.
+pub(super) fn dir() -> Option<&'static PathBuf> {
+    DIR.get()
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -383,11 +391,12 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 
 /// What the pre-build's list holds for: the library's bytes, and what
 /// names its pipelines (the translation, as the shader cache keys it; the
-/// host descriptions).
+/// host descriptions; the static samplers' list).
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
     let views = [victory_shader::emit::heap_views(), victory_shader::emit::title_views()].map(u32::to_le_bytes).concat();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
+    let samplers = super::sampler_order::listed();
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
@@ -397,6 +406,8 @@ fn tag(blob: &[u8]) -> String {
         &views,
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
+        include_bytes!("sampler_order.rs"),
+        samplers.as_bytes(),
     ] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
@@ -444,19 +455,73 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+const NVIDIA: u32 = 0x10DE;
+
+/// Whether a pipeline with static samplers whose places in the driver's
+/// table are not in its name (`sampler_order`: the order is off, or not
+/// vouched for) can be kept in the library: not on NVIDIA, nor where the
+/// adapter cannot be told.
+///
+/// NVIDIA's driver puts each distinct static sampler in a table of its
+/// own, in the order a process first creates them, and a compiled
+/// pipeline names its samplers by their places in that table. The
+/// library keeps those places, so a pipeline loaded in a run that made
+/// its static samplers in another order (the workers translate in no
+/// fixed order) samples through other samplers, and the load still
+/// succeeds: a linear sampler read as a point one, every result a
+/// texel (RTX 3070, driver 616.56; the colour-grading tables of the
+/// title's composite pass, 4070 SUPER). Made again in the run, such a
+/// pipeline names this run's places: the cost is a compile each run,
+/// which the driver's own shader cache on disk may serve.
+fn keeps_static_samplers() -> bool {
+    static KEEPS: OnceLock<bool> = OnceLock::new();
+    *KEEPS.get_or_init(|| {
+        let vendor = crate::host::host().and_then(|h| adapter_vendor(&h.device));
+        let keeps = vendor.is_some_and(|v| v != NVIDIA);
+        if !keeps {
+            tracing::info!(
+                vendor = ?vendor.map(|v| format!("{v:#x}")),
+                "host pipelines with static samplers are made every run, not kept"
+            );
+        }
+        keeps
+    })
+}
+
+/// The PCI vendor of the adapter `device` runs on.
+fn adapter_vendor(device: &ID3D12Device) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
+    // SAFETY: plain device and DXGI queries.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        Some(adapter.GetDesc1().ok()?.VendorId)
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
 /// (the others then find it in the library); different names overlap.
+/// `unguarded`: its root signature has static samplers whose places are not
+/// in `name`, and such a pipeline is only made, neither loaded nor stored,
+/// where the library cannot keep them ([`keeps_static_samplers`]).
 pub(crate) fn pipeline(
     name: &str,
+    unguarded: bool,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
-    let Some(library) = library() else {
+    let library = library().filter(|_| !unguarded || keeps_static_samplers());
+    let Some(library) = library else {
+        #[cfg(feature = "diagnostics")]
+        LAST.set(Some((name.to_owned(), false)));
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
@@ -649,7 +714,7 @@ fn ended(pid: u32) -> bool {
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = staging(path);
     let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
@@ -1125,6 +1190,7 @@ mod tests {
                 };
                 pipeline(
                     "test: a pipeline loads while a save holds the library",
+                    false,
                     // SAFETY: the description points at live data.
                     |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                     || match made {
@@ -1146,6 +1212,488 @@ mod tests {
             drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
         });
+    }
+
+    /// A pipeline with static samplers kept in the library by one run
+    /// samples through its own samplers in a later run that made other
+    /// static samplers first: the later run created the listed ones first,
+    /// in the list's order, so it loads the pipeline. (Without that, the
+    /// RTX 3070 loaded it reading its linear samplers as point ones, 0 for
+    /// 0.25.) The runs are child processes: the driver's sampler table is a
+    /// process's own.
+    #[test]
+    fn a_kept_pipeline_samples_through_its_own_static_samplers() {
+        static_samplers::runs(
+            "a_kept_pipeline_samples_through_its_own_static_samplers",
+            &["store", "load"],
+        );
+    }
+
+    /// A sampler first met in a later run is appended to the list, and a
+    /// pipeline with it, stored then, loads in the run after that, which
+    /// met yet other samplers first.
+    #[test]
+    fn a_static_sampler_met_in_a_later_run_is_appended() {
+        static_samplers::runs(
+            "a_static_sampler_met_in_a_later_run_is_appended",
+            &["store", "append", "load appended"],
+        );
+    }
+
+    /// With the list lost, the pipeline's name misses (its samplers have
+    /// other places now): it is made again and samples right.
+    #[test]
+    fn a_lost_static_sampler_list_gives_a_miss() {
+        static_samplers::runs("a_lost_static_sampler_list_gives_a_miss", &["store", "load lost"]);
+    }
+
+    /// The control (NVIDIA only, so not run by default): the list read but
+    /// its samplers not created first, the name still found, the loaded
+    /// pipeline samples through the other samplers.
+    #[test]
+    #[ignore = "a control for NVIDIA's sampler table: it asserts wrong samples"]
+    fn unprimed_static_samplers_load_wrong() {
+        static_samplers::runs("unprimed_static_samplers_load_wrong", &["store", "load unprimed"]);
+    }
+
+    /// The runs of the tests above.
+    mod static_samplers {
+        use super::super::super::host::root_signature;
+        use super::super::super::sampler_order;
+        use super::*;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::PCSTR;
+
+        pub(super) const ROLE: &str = "VICTORY_TEST_STATIC_SAMPLERS";
+        pub(super) const DIR_VAR: &str = "VICTORY_TEST_STATIC_SAMPLERS_DIR";
+
+        /// A 2x1 texture of 0 and 1, then the probe's three samples of it
+        /// at u = 0.375 through its point, linear and trilinear sampler.
+        const SOURCE: &str = "
+            RWTexture2D<float> lut : register(u0);
+            Texture2D<float> tex : register(t0);
+            RWByteAddressBuffer result : register(u1);
+            SamplerState point_ : register(s0);
+            SamplerState linear_ : register(s1);
+            SamplerState trilinear : register(s2);
+            [numthreads(2, 1, 1)] void fill(uint3 id : SV_DispatchThreadID) { lut[id.xy] = id.x; }
+            [numthreads(1, 1, 1)] void probe() {
+                float2 uv = float2(0.375, 0.5);
+                result.Store3(0, asuint(float3(tex.SampleLevel(point_, uv, 0),
+                    tex.SampleLevel(linear_, uv, 0), tex.SampleLevel(trilinear, uv, 0))));
+            }";
+        /// What the three samples are: the texel left of 0.375, and a
+        /// quarter of the way to the right one.
+        const EXPECTED: [f32; 3] = [0.0, 0.25, 0.25];
+        /// Other static samplers the later run makes first.
+        const OTHERS: u32 = 10;
+        /// The probe samplers' greatest LOD: another one makes other
+        /// samplers that sample the same (the texture has one level).
+        const FIRST: f32 = 12.0;
+        const APPENDED: f32 = 13.0;
+
+        /// Runs `steps` of `test` in child processes, in order, on one
+        /// cache folder; in a child, its step.
+        pub(super) fn runs(test: &str, steps: &[&str]) {
+            if let Ok(step) = std::env::var(ROLE) {
+                return run(&step);
+            }
+            if crate::host::host().is_none() {
+                return; // no host GPU here
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = module_path!().split_once("::").map_or(module_path!(), |(_, p)| p);
+            let test = format!("{}::{test}", path.trim_end_matches("::static_samplers"));
+            for step in steps {
+                let run = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1", "--include-ignored"])
+                    .env(ROLE, step)
+                    .env(DIR_VAR, dir.path())
+                    .output()
+                    .unwrap();
+                let out = String::from_utf8_lossy(&run.stdout);
+                let err = String::from_utf8_lossy(&run.stderr);
+                println!("{step}: {}", out.lines().filter(|l| l.contains("sampled")).collect::<Vec<_>>().join("; "));
+                assert!(run.status.success(), "the {step} run failed:\n{out}\n{err}");
+                assert!(out.contains("1 passed"), "the {step} run ran no test:\n{out}\n{err}");
+            }
+        }
+
+        fn run(step: &str) {
+            let dir = PathBuf::from(std::env::var_os(DIR_VAR).expect("the library's folder"));
+            let list = dir.join(sampler_order::FILE);
+            if step == "load lost" {
+                let lost = std::fs::remove_file(&list);
+                assert!(lost.is_ok() || !sampler_order::on(), "no list to lose");
+            }
+            if step == "load unprimed" {
+                sampler_order::UNPRIMED.store(true, Ordering::Relaxed);
+            }
+            // Before the device: it creates the listed samplers.
+            use_pipeline_cache(dir.clone());
+            let device = device();
+            let ordered = sampler_order::on();
+            match step {
+                "store" => {
+                    let (made, values) = probe(&device, FIRST, &[]);
+                    check(values);
+                    assert!(made, "a first run loaded the probe");
+                    store_and_save(&dir);
+                    if ordered {
+                        assert_eq!(lines(&list), 3, "the probe's samplers listed");
+                    }
+                }
+                "load" | "load lost" | "load unprimed" => {
+                    let (made, values) = probe(&device, FIRST, &others(0..OTHERS));
+                    match (step, ordered) {
+                        ("load", true) => {
+                            check(values);
+                            assert!(!made, "the probe was made again, not loaded");
+                            assert_eq!(lines(&list), 3 + OTHERS as usize, "the others appended");
+                        }
+                        ("load lost", true) => {
+                            check(values);
+                            assert!(made, "the probe loaded with its samplers in other places");
+                        }
+                        ("load unprimed", true) => {
+                            assert!(!made, "the control did not load the probe");
+                            println!("sampled (point, linear, trilinear), control: {values:?}");
+                            assert_ne!(values, EXPECTED, "the control sampled right without priming");
+                        }
+                        // Without the order: such a pipeline is made on NVIDIA.
+                        (_, false) => {
+                            check(values);
+                            assert!(keeps_static_samplers() || made, "a pipeline with static samplers was loaded");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                "append" => {
+                    let (made, values) = probe(&device, APPENDED, &others(0..OTHERS));
+                    check(values);
+                    assert!(made, "a probe with new samplers was loaded");
+                    store_and_save(&dir);
+                    if ordered {
+                        assert_eq!(lines(&list), 3 + OTHERS as usize + 3, "the new samplers appended");
+                    }
+                }
+                "load appended" => {
+                    // Yet others first, new to the list too.
+                    let (made, values) = probe(&device, APPENDED, &others(OTHERS..OTHERS + 5));
+                    check(values);
+                    assert!(!ordered || !made, "the probe with appended samplers was made again, not loaded");
+                }
+                _ => panic!("no step {step}"),
+            }
+        }
+
+        /// Lines in the list of static samplers.
+        fn lines(list: &std::path::Path) -> usize {
+            std::fs::read_to_string(list).map_or(0, |l| l.lines().count())
+        }
+
+        /// Root signatures with one other static sampler each, created
+        /// through the host's path and kept while they are returned.
+        fn others(range: std::ops::Range<u32>) -> Vec<ID3D12RootSignature> {
+            let device = device();
+            range
+                .map(|i| {
+                    let other = sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, (i + 1) as f32 / 64.0, FIRST);
+                    root_signature(&device, &[], &[other], true).expect("another root signature").0
+                })
+                .collect()
+        }
+
+        /// The probe with its samplers' greatest LOD `max_lod`, after
+        /// `_others`: whether it was made (else loaded), and its samples.
+        fn probe(device: &ID3D12Device, max_lod: f32, _others: &[ID3D12RootSignature]) -> (bool, [f32; 3]) {
+            let (root, blob, unguarded) = root(device, max_lod);
+            let code = fxc(windows::core::s!("probe"));
+            let loaded = LOADED.load(Ordering::Relaxed);
+            let (name, pso) = pipeline_of(device, &root, &blob, &code, unguarded);
+            let made = LOADED.load(Ordering::Relaxed) == loaded;
+            println!("sampled with the probe {}", if made { "made" } else { "loaded" });
+            if unguarded && !keeps_static_samplers() {
+                // As earlier builds did: kept regardless, for a later run's
+                // check that it is not loaded.
+                let library = library().expect("a pipeline library");
+                let mut l = library.state.lock().unwrap();
+                assert_eq!(l.added, 0, "a pipeline with static samplers was stored");
+                let wide = HSTRING::from(name.as_str());
+                // SAFETY: a live pipeline; one already stored is refused.
+                if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+                    l.added += 1;
+                }
+            }
+            (made, sample(device, &root, &pso))
+        }
+
+        fn store_and_save(dir: &std::path::Path) {
+            save(true);
+            assert!(dir.join(LIBRARY_FILE).exists());
+        }
+
+        fn fxc(entry: PCSTR) -> Vec<u8> {
+            let (mut blob, mut errors) = (None, None);
+            // SAFETY: the source outlives the call; the blobs are read within it.
+            unsafe {
+                let compiled = D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    None,
+                    None,
+                    None,
+                    entry,
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    Some(&mut errors),
+                );
+                if let (Err(e), Some(errors)) = (&compiled, &errors) {
+                    let errors: &windows::Win32::Graphics::Direct3D::ID3DBlob = errors;
+                    let text = std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize());
+                    panic!("the probe does not compile: {e}: {}", String::from_utf8_lossy(text));
+                }
+                compiled.expect("the probe compiles");
+                let blob: windows::Win32::Graphics::Direct3D::ID3DBlob = blob.unwrap();
+                std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                    .to_vec()
+            }
+        }
+
+        fn sampler(register: u32, filter: D3D12_FILTER, bias: f32, max_lod: f32) -> D3D12_STATIC_SAMPLER_DESC {
+            D3D12_STATIC_SAMPLER_DESC {
+                Filter: filter,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MipLODBias: bias,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                MaxLOD: max_lod,
+                ShaderRegister: register,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                ..Default::default()
+            }
+        }
+
+        /// The probe's root signature as the host makes one (`host`): a
+        /// table of the texture's two views, the output, three samplers.
+        fn root(device: &ID3D12Device, max_lod: f32) -> (ID3D12RootSignature, Vec<u8>, bool) {
+            let range = |kind, offset| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: kind,
+                NumDescriptors: 1,
+                OffsetInDescriptorsFromTableStart: offset,
+                ..Default::default()
+            };
+            let ranges = [
+                range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0),
+                range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1),
+            ];
+            let params = [
+                D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: ranges.len() as u32,
+                            pDescriptorRanges: ranges.as_ptr(),
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 { ShaderRegister: 1, ..Default::default() },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
+            let samplers = [
+                sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, 0.0, max_lod),
+                sampler(1, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT, 0.0, max_lod),
+                sampler(2, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 0.0, max_lod),
+            ];
+            let (root, mut blob, order) =
+                root_signature(device, &params, &samplers, true).expect("the probe's root signature");
+            // Named as the host names its pipelines (`host`).
+            let unguarded = order.is_none();
+            blob.extend_from_slice(order.unwrap_or_default().as_bytes());
+            (root, blob, unguarded)
+        }
+
+        /// The probe pipeline through the library, as the host gets one.
+        fn pipeline_of(device: &ID3D12Device, root: &ID3D12RootSignature, blob: &[u8], code: &[u8], unguarded: bool) -> (String, ID3D12PipelineState) {
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: a borrowed pointer the description never releases.
+                pRootSignature: unsafe { std::mem::transmute_copy(root) },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            };
+            let name = name("compute", blob, &[code], "test: static samplers");
+            let pso = pipeline(
+                &name,
+                unguarded,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { device.CreateComputePipelineState(&desc) },
+            )
+            .expect("the probe pipeline");
+            (name, pso)
+        }
+
+        /// The three samples `pso` takes.
+        fn sample(device: &ID3D12Device, root: &ID3D12RootSignature, pso: &ID3D12PipelineState) -> [f32; 3] {
+            let fill_code = fxc(windows::core::s!("fill"));
+            // SAFETY: plain D3D12 object creation and one list's commands on
+            // live objects, read back once the fence says the GPU is done.
+            unsafe {
+                let fill: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: fill_code.as_ptr().cast(),
+                            BytecodeLength: fill_code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let resource = |desc: &D3D12_RESOURCE_DESC, kind, state| {
+                    let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+                    let mut made: Option<ID3D12Resource> = None;
+                    device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut made).unwrap();
+                    made.unwrap()
+                };
+                let samples = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+                let texture = resource(
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 2,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R32_FLOAT,
+                        SampleDesc: samples,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                let buffer = |flags| D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: samples,
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let out = resource(
+                    &buffer(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                );
+                let readback = resource(
+                    &buffer(D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_HEAP_TYPE_READBACK,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                let heap: ID3D12DescriptorHeap = device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 2,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+                let cpu = heap.GetCPUDescriptorHandleForHeapStart();
+                device.CreateUnorderedAccessView(
+                    &texture,
+                    None,
+                    Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_FLOAT,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    }),
+                    cpu,
+                );
+                device.CreateShaderResourceView(
+                    &texture,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_FLOAT,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                        },
+                    }),
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + step },
+                );
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let allocator: ID3D12CommandAllocator =
+                    device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &allocator, &fill)
+                    .unwrap();
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.SetComputeRootSignature(root);
+                list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[crate::host::transition(
+                    &texture,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+                list.SetPipelineState(pso);
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(&readback, 0, &out, 0, 16);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                let event = CreateEventW(None, false, false, None).unwrap();
+                fence.SetEventOnCompletion(1, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+                CloseHandle(event).unwrap();
+                device.GetDeviceRemovedReason().expect("the device is not removed");
+                let mut mapped = std::ptr::null_mut();
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 12 }), Some(&mut mapped)).unwrap();
+                let values = mapped.cast::<[f32; 3]>().read();
+                readback.Unmap(0, Some(&D3D12_RANGE::default()));
+                values
+            }
+        }
+
+        fn check(values: [f32; 3]) {
+            println!("sampled (point, linear, trilinear): {values:?}, expected {EXPECTED:?}");
+            for (got, want) in values.into_iter().zip(EXPECTED) {
+                assert!((got - want).abs() < 1e-3, "sampled {values:?}, not {EXPECTED:?}");
+            }
+        }
+
+        fn device() -> ID3D12Device {
+            crate::host::host().expect("a host GPU, as the parent had").device.clone()
+        }
     }
 
     #[test]

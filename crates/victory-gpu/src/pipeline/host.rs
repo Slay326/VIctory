@@ -585,13 +585,19 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let (root, mut root_blob, order) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
         };
+        // The static samplers' places in the driver's table name the
+        // pipeline too (`sampler_order`): a lost or cut list gives a miss,
+        // not a load through other samplers. Without them, such a pipeline
+        // is not kept in the library on every host (`library::pipeline`).
+        let unguarded = order.is_none();
+        root_blob.extend_from_slice(order.unwrap_or_default().as_bytes());
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -611,6 +617,7 @@ impl HostPipeline {
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
+                unguarded,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -656,12 +663,12 @@ impl HostPipeline {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                    &name,
+                    &name, unguarded,
                 ),
                 None => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-                    &name,
+                    &name, unguarded,
                 ),
             };
             let pso = match made {
@@ -746,11 +753,12 @@ impl HostPipeline {
             stream_pipeline(
                 &host.device, &root, vertex, desc.PS, g,
                 Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                &name,
+                &name, unguarded,
             )
         } else {
             super::library::pipeline(
                 &name,
+                unguarded,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
                 // SAFETY: as above.
@@ -815,6 +823,7 @@ struct VertexStream {
 }
 
 /// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
+#[allow(clippy::too_many_arguments)] // the stream's parts, and its name and samplers for the library
 fn stream_pipeline<S, D>(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -823,6 +832,7 @@ fn stream_pipeline<S, D>(
     g: &GraphicsState,
     depth: Sub<D>,
     name: &str,
+    unguarded: bool,
 ) -> windows::core::Result<ID3D12PipelineState> {
     #[repr(C)]
     struct Stream<S, D> {
@@ -862,6 +872,7 @@ fn stream_pipeline<S, D>(
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
+        unguarded,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
@@ -878,12 +889,15 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
+pub(super) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>, Option<String>)> {
+    // First: static samplers not met yet are created ahead of it, in the
+    // list's order; the answer goes into its pipelines' names.
+    let order = super::sampler_order::admit(device, samplers);
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -921,7 +935,7 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec(), order))
     }
 }
 
