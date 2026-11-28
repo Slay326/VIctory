@@ -884,6 +884,9 @@ impl State {
                             && let Some((source, destination)) = crate::unpacked::pair(&p.name, &values)
                         {
                             list.note_unpacked(source, destination);
+                            if source == destination {
+                                crate::unpacked::want_whole(destination);
+                            }
                         }
                         // `VICTORY_BVH_GT` (diagnostics, off by default): the
                         // rehydrating stage's centre values per bottom level.

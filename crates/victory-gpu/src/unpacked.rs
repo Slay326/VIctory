@@ -95,6 +95,32 @@ pub(crate) fn pair(name: &str, values: &[u32]) -> Option<(u64, u64)> {
     (header(source) && header(destination)).then_some((source, destination))
 }
 
+/// The 64 KiB pages of a structure of `units` 64-byte units at `at` past
+/// its header's page (none for one that is no bottom level's size).
+fn pages_past_header(at: u64, units: u32) -> impl Iterator<Item = u64> {
+    let end = if (1..=MOST).contains(&units) { at + u64::from(units) * 64 } else { at };
+    let first = (at | 0xffff) + 1;
+    (first..end.max(first)).step_by(0x1_0000)
+}
+
+/// A bind names the structure at `destination` to unpack in place: the
+/// pages past its header's that no copy holds get arena pages before the
+/// list runs (`crate::arena::want_around`), filled from title memory. Run
+/// 20261128-111102: two bottom levels of 5.5 MB began in a 4 MiB title
+/// buffer's copy and ended in memory nothing held; the stages wrote their
+/// ends into nothing, the pages got arena pages only after those misses,
+/// and the structures stayed packed for the rest of the run (the title asks
+/// once).
+pub(crate) fn want_whole(destination: u64) {
+    let Some(head) = title_head(destination) else { return };
+    if head[0] & 0xffff != 6 {
+        return;
+    }
+    for page in pages_past_header(destination, head[1]) {
+        crate::arena::want_around(page);
+    }
+}
+
 /// Header dword 0, bit 24: the structure is still packed.
 const PACKED: u32 = 1 << 24;
 /// The most 64-byte units a structure put back has (64 MiB).
@@ -229,6 +255,15 @@ pub(crate) fn back(submission: u64, pairs: &[(u64, u64, bool)]) {
     s.again_other += t.again_other;
     s.past += t.past;
     s.tail += t.tail;
+}
+
+/// Logs why the structure at `at` counts as "no header" (the first 64 of a
+/// run: three structures of capture C1 stayed packed this way).
+fn why(at: u64, text: impl Fn() -> String) {
+    static LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+    if LEFT.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_sub(1)).is_ok() {
+        tracing::info!("unpacked bottom level at {at:#x} not put: {}", text());
+    }
 }
 
 /// The 16 header dwords title memory holds at `at`, if readable.
@@ -399,6 +434,7 @@ fn back_with(
                 Some(p) => chosen.push((p, at, len, title, heads[k + i].map_or(0, |gpu| gpu[12]))),
                 // A part of it in no copy and not in the arena.
                 None => {
+                    why(at, || format!("unpacked in its copy, {len} bytes, but a part of it is in no copy and in no arena page"));
                     s.unknown += 1;
                     not.push(at);
                 }
@@ -407,7 +443,10 @@ fn back_with(
                 match judged[0] {
                     Head::Packed => s.packed += 1,
                     Head::Other => s.other += 1,
-                    _ => s.unknown += 1,
+                    _ => {
+                        why(at, || format!("no bottom level's header in {n} copies: dwords 0 and 1 {:x?}", heads[k].map(|h| [h[0], h[1]])));
+                        s.unknown += 1;
+                    }
                 }
                 not.push(at);
             }
@@ -876,6 +915,22 @@ mod tests {
         assert_eq!(title_byte(p + half + 0x200), 0x11, "nothing past the structure");
         PUT.lock().unwrap().remove(&(at as u64));
         unregister(p, p as u64);
+    }
+
+    /// The pages asked of the arena before a structure is unpacked: all
+    /// past its header's page to its end, none for a small one or a size
+    /// that is none.
+    #[test]
+    fn the_pages_past_a_structures_header() {
+        let pages = |at: u64, units: u32| pages_past_header(at, units).collect::<Vec<_>>();
+        // Run 111102: 0x772000100, 0x1568c units: to 0x77255a400.
+        let big = pages(0x7_7200_0100, 0x1_568c);
+        assert_eq!((big.len(), big[0], big[big.len() - 1]), (0x55, 0x7_7201_0000, 0x7_7255_0000));
+        assert_eq!(pages(0x7_7200_0100, 3), Vec::<u64>::new(), "within its header's page");
+        assert_eq!(pages(0x7_7200_ff80, 3), vec![0x7_7201_0000], "64 bytes over the page's end");
+        assert_eq!(pages(0x7_7200_ff80, 2), Vec::<u64>::new(), "ends with the page");
+        assert_eq!(pages(0x7_7200_0100, 0), Vec::<u64>::new());
+        assert_eq!(pages(0x7_7200_0100, MOST + 1), Vec::<u64>::new());
     }
 
     /// The copy the page table names for a page: the smallest one holding
