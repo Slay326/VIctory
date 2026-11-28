@@ -1160,6 +1160,9 @@ struct Deferred {
     /// With `VICTORY_BVH_GT`: what the list's bitmap marked, asked once the
     /// list has run, before anything goes back (`crate::bvh_gt`).
     gt: Vec<Box<dyn Fn() -> crate::bvh_gt::Marks + Send>>,
+    /// With `VICTORY_BVH_UNPACK_BACK`: the bottom levels the list's
+    /// unpacking binds name (source, destination: `crate::unpacked::pair`).
+    unpacked: Vec<(u64, u64)>,
     /// With `VICTORY_BVH_ARENA`: ranges (copy, address, bytes) the BVH
     /// builder wrote through views of title buffers larger than
     /// [`crate::arena::BACK`]: they stay out of title memory.
@@ -1577,7 +1580,17 @@ impl Host {
         if marks_sent {
             crate::shadow::marks_fetched(&card_marks);
         }
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        // Of the builder's ranges that stay in large copies, the pages its
+        // lists marked are kept (`crate::memory::keeps_pages`).
+        let builder: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = if crate::memory::keeps_pages(missed.contains(&true)) {
+            let on_card = |(s, a, n): &&(std::sync::Arc<crate::shadow::Shadow>, usize, usize)| {
+                kept_on_card.contains(&(std::sync::Arc::as_ptr(s) as usize, *a, *n))
+            };
+            withheld.iter().filter(on_card).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        crate::shadow::copy_back_marks_keeping(&withheld, &builder, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -1605,6 +1618,17 @@ impl Host {
             for work in &list.deferred().after {
                 work();
             }
+        }
+        // `VICTORY_BVH_UNPACK_BACK`: the bottom levels the submission's
+        // lists unpacked in place go into title memory, after everything
+        // else that goes back and before the title hears the GPU is done.
+        if crate::unpacked::level() != 0 {
+            let pairs: Vec<(u64, u64, bool)> = runs
+                .iter()
+                .zip(&missed)
+                .flat_map(|(l, &m)| l.take_unpacked().into_iter().map(move |(s, d)| (s, d, m)))
+                .collect();
+            crate::unpacked::back(*submitted, &pairs);
         }
         if let Some(gt) = &mut gt {
             gt.read_title(0);
@@ -2345,6 +2369,17 @@ impl HostList {
     /// once the list has run, before the copy-backs clear it.
     pub(crate) fn defer_gt(&self, marks: impl Fn() -> crate::bvh_gt::Marks + Send + 'static) {
         self.deferred().gt.push(Box::new(marks));
+    }
+
+    /// With `VICTORY_BVH_UNPACK_BACK`: a bind of the list unpacks the bottom
+    /// level at `source` to `destination` (`crate::unpacked`).
+    pub(crate) fn note_unpacked(&self, source: u64, destination: u64) {
+        self.deferred().unpacked.push((source, destination));
+    }
+
+    /// What [`HostList::note_unpacked`] kept, taken out.
+    pub(crate) fn take_unpacked(&self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.deferred().unpacked)
     }
 
     /// Whether the list bound a pipeline whose name holds `part` (a shader

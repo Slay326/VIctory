@@ -1068,7 +1068,34 @@ fn mark_beside(g: &mut Guards, first: usize, last: usize, ours: &Arc<Changed>, s
     }
 }
 
+/// A host buffer copy's tracker, by which [`Keeper::retake_others`] tells
+/// it from the others holding a page.
+#[derive(Clone)]
+pub(crate) struct Keeper(Arc<Changed>);
+
+impl Keeper {
+    /// [`retake`] of page `page` (a page number) for every host buffer copy
+    /// holding it but this tracker's (aliases too): what shaders wrote into
+    /// this one's copy of the page stays (`crate::memory::keeps_pages`).
+    pub(crate) fn retake_others(&self, page: usize) {
+        let g = guards();
+        let pages = std::iter::once(page).chain(g.alias_of.get(&page).into_iter().flatten().copied());
+        for page in pages {
+            for c in g.holders.get(&page).into_iter().flatten().filter(|c| c.3 && !Arc::ptr_eq(c, &self.0)) {
+                let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+                set_dirty(c.2, true);
+                set.insert(page);
+            }
+        }
+    }
+}
+
 impl Tracked {
+    /// This tracker, for [`Keeper::retake_others`].
+    pub(crate) fn keeper(&self) -> Keeper {
+        Keeper(self.changed.clone())
+    }
+
     /// A copy-back's write of title memory `[at, at + len)` (one page at
     /// most) through our own view of its section, by `put`, given what to
     /// add to a title address for ours: `None` (nothing done) if the

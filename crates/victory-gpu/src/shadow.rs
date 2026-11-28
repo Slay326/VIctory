@@ -590,6 +590,12 @@ impl Shadow {
         self.tracked.as_ref().map(|t| t.changed(page / PAGE))
     }
 
+    /// The copy's tracker, to retake a page in the other copies holding it
+    /// (`crate::memory::keeps_pages`); None for memory not tracked.
+    pub(crate) fn keeper(&self) -> Option<crate::watch::Keeper> {
+        self.tracked.as_ref().map(crate::watch::Tracked::keeper)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base
@@ -614,6 +620,10 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return 0;
+        }
+        // A kept page's bytes stay in the copy (`crate::memory::keeps_pages`).
+        if crate::memory::kept_from_title(self, page) {
             return 0;
         }
         // A title write from here on saves the page's bytes from before it:
@@ -647,6 +657,48 @@ impl Shadow {
             self.take_and_read(t, page, from, to);
         }
         to - from
+    }
+
+    /// The copy's bytes of title memory `[at, at + len)` (cut to the copy)
+    /// go into title memory where they differ from it, and nothing else of
+    /// their pages does (`crate::unpacked`: a structure the GPU rewrote in
+    /// place, after its submission; of a copy in the GPU's memory the
+    /// caller fetched the range first). By 32-byte lines, each 64 KiB page's
+    /// part on its own. Through our own view of the memory where there is
+    /// one, the copy's tracker is left as it was: the page's other bytes in
+    /// the copy stay (what shaders wrote beside the structure and nothing
+    /// put back). Else the page counts as changed, as after any write of
+    /// ours, and the copy takes it from title memory at its next refresh,
+    /// the structure as it is now there.
+    ///
+    /// Returns the bytes of the lines written, and whether every part could
+    /// be read and written (title memory unmapped meanwhile is left alone).
+    pub(crate) fn put_range(&self, at: usize, len: usize) -> (usize, bool) {
+        let (from, to) = self.inside(at, len);
+        let start = self.start as usize;
+        let (mut written, mut all) = (0, true);
+        TITLE.with(|title| {
+            let mut title = title.borrow_mut();
+            let mut o = from;
+            while o < to {
+                let a = start + o;
+                let n = (PAGE - a % PAGE).min(to - o);
+                // SAFETY: inside the mapping; only the submitting thread
+                // writes it, and the GPU is done with the submission.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(o), n) };
+                let title = &mut title[..n];
+                o += n;
+                if !crate::host::read_into(a as *const u8, title) {
+                    all = false;
+                    continue;
+                }
+                let runs = differing_rows(host, title);
+                if write_runs_by(a, host, &runs, self.tracked.as_ref()) != Put::Nothing {
+                    written += runs.iter().map(|r| r.1 - r.0).sum::<usize>();
+                }
+            }
+        });
+        (written, all)
     }
 
     /// After a copy-back: the page at `page` is taken, then the copy's bytes
@@ -1020,6 +1072,12 @@ impl Shadow {
                     at += n;
                     continue;
                 };
+                // A kept page's bytes stay in the copy, and the copy does not
+                // take title memory's there (`crate::memory::keeps_pages`).
+                if host != old && crate::memory::kept_from_title(self, start + at) {
+                    at += n;
+                    continue;
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -1084,6 +1142,11 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return 0;
+        }
+        // A kept page's bytes stay in the copy (`crate::memory::keeps_pages`).
+        if crate::memory::kept_from_title(self, page) {
+            t.unarm(page / PAGE);
             return 0;
         }
         let saved = t.saved(page / PAGE);
@@ -1213,11 +1276,20 @@ impl Shadow {
             }
         };
         let mut copied = 0;
+        // What a large copy takes from title memory is kept no longer
+        // (`crate::memory::keeps_pages`).
+        let large = self.len > crate::arena::BACK;
         for (a, b) in runs {
             copied += self.copy(a, b);
             sync_before(a, b);
+            if large {
+                crate::memory::kept_taken(self, a, b);
+            }
         }
         for (a, b) in unmapped {
+            if large {
+                crate::memory::kept_taken(self, a, b);
+            }
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
             self.card_changed(a - start, b - start);
@@ -1601,7 +1673,19 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+#[cfg(test)]
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    copy_back_marks_keeping(withheld, &[], memory_withheld);
+}
+
+/// [`copy_back_marks`]; the marked pages in `builder` (the ranges among
+/// `withheld` that the BVH builder's lists declared in large copies) are
+/// kept (`crate::memory::keeps_pages`; empty without it).
+pub(crate) fn copy_back_marks_keeping(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    builder: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
+) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -1640,6 +1724,15 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
+    // Kept first: the drops below pass kept pages by.
+    if !builder.is_empty() {
+        let m = marks();
+        for (copy, page) in held.iter().chain(&marked).filter_map(|&n| page_of(&m, n)) {
+            if builder.iter().any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n) {
+                crate::memory::keep_page(&copy, page);
+            }
+        }
+    }
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
         let m = marks();
@@ -2081,6 +2174,32 @@ impl Arena {
         }
         free.insert(at, n);
     }
+}
+
+/// The 64 bytes at each title address as shaders left them in the copy
+/// beside it (`crate::unpacked`, after a submission): of copies in the
+/// GPU's memory fetched from there, all in one fetch, their CPU sides left
+/// as they were. None where the copy does not hold all 64 bytes.
+pub(crate) fn gpu_heads(at: &[(Arc<Shadow>, u64)]) -> Vec<Option<[u32; 16]>> {
+    let inside: Vec<Option<usize>> = at
+        .iter()
+        .map(|(c, a)| a.checked_sub(c.start).map(|o| o as usize).filter(|o| o + 64 <= c.len as usize))
+        .collect();
+    // SAFETY: inside the mapping (checked); only the submitting thread
+    // writes it, and the GPU is done with the submission.
+    let read = |c: &Shadow, o: usize| unsafe { c.data.add(o).cast::<[u32; 16]>().read_unaligned() };
+    let carded = |k: usize| inside[k].filter(|_| at[k].0.card.is_some());
+    let before: Vec<Option<[u32; 16]>> = (0..at.len()).map(|k| carded(k).map(|o| read(&at[k].0, o))).collect();
+    let fetch: Vec<(&Shadow, usize, usize)> = (0..at.len()).filter_map(|k| carded(k).map(|o| (&*at[k].0, o, o + 64))).collect();
+    crate::host::card_fetch(&fetch);
+    let out = (0..at.len()).map(|k| inside[k].map(|o| read(&at[k].0, o))).collect();
+    for (k, cpu) in before.iter().enumerate() {
+        if let (Some(cpu), Some(o)) = (cpu, inside[k]) {
+            // SAFETY: as above; the fetch is done.
+            unsafe { at[k].0.data.add(o).cast::<[u32; 16]>().write_unaligned(*cpu) };
+        }
+    }
+    out
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
@@ -2678,6 +2797,143 @@ pub(crate) mod tests {
         assert_eq!((byte(&outer), byte(&inner)), (0x11, 0x11), "frame N+1: title memory's bytes");
         // SAFETY: as above.
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
+        unregister(p + 1, p as u64);
+        unregister(p, p as u64);
+    }
+
+    /// A kept page (`crate::memory::keeps_pages`: a page of a large copy the
+    /// BVH builder wrote, whose bytes do not go into title memory) keeps the
+    /// GPU's bytes over the frame's end and the refreshes after it, while a
+    /// page beside it that the same frame withheld takes title memory's;
+    /// nothing of it goes into title memory by a later copy-back of the
+    /// page; and a title write ends it: the copy takes the title's page.
+    /// (Run 203823's shape: a bottom level's header unpacked in the copy,
+    /// 0x8002, was 0x8102 again some frames later, as in title memory.)
+    #[test]
+    fn a_kept_page_keeps_the_gpus_bytes_until_the_title_writes_it() {
+        let pages = 6;
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        assert!(len as u64 > crate::arena::BACK, "a large copy");
+        let (kept, plain) = (p + PAGE + 16, p + 16);
+        // SAFETY: bytes of our pool.
+        let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        for at in [kept, plain] {
+            // SAFETY: a byte of our pool.
+            unsafe { (at as *mut u8).write_volatile(0x11) };
+        }
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let byte = |at: usize| copy.read_host(at as u64, 1)[0] & 0xff;
+        // Frame N: shaders write both pages, the frame withholds the range.
+        copy.update(p, len);
+        copy.writing(p, len, false);
+        copy.write_host(kept as u64, &[0x22]);
+        copy.write_host(plain as u64, &[0x22]);
+        copy.keep_writes(p, len);
+        assert!(crate::memory::keep_page(&copy, p + PAGE), "an untouched page of a large copy is kept");
+        crate::memory::drop_withheld(p, len);
+        // Frames N+1 and N+2, each dropping the whole range again as the
+        // builder's declared ranges do.
+        for frame in 1..3 {
+            crate::memory::log_frame();
+            copy.update(p, len);
+            assert_eq!((byte(kept), byte(plain)), (0x22, 0x11), "frame N+{frame}: the kept page holds the GPU's bytes, the other title memory's");
+            crate::memory::drop_withheld(p, len);
+        }
+        // A copy-back of the page by comparing it with title memory.
+        assert_eq!(copy.copy_back_page(p + PAGE), 0, "a kept page does not go back");
+        assert_eq!((title(kept), byte(kept)), (0x11, 0x22), "title memory untouched, the copy as the GPU left it");
+        // The title writes the page: its bytes win, whole.
+        // SAFETY: a byte of our pool (guarded: faults into the handler).
+        unsafe { ((p + PAGE + 32) as *mut u8).write_volatile(0x33) };
+        copy.update(p, len);
+        assert_eq!((byte(p + PAGE + 32), byte(kept)), (0x33, 0x11), "the copy took the page the title wrote");
+        assert!(!crate::memory::kept_page(p + PAGE), "kept no longer");
+        // From here on it is retaken as any page.
+        copy.writing(p, len, false);
+        copy.write_host(kept as u64, &[0x44]);
+        copy.keep_writes(p, len);
+        crate::memory::drop_withheld(p, len);
+        crate::memory::log_frame();
+        copy.update(p, len);
+        assert_eq!(byte(kept), 0x11, "withheld and dropped as before");
+        unregister(p, p as u64);
+    }
+
+    /// A kept page is kept in the copy the builder wrote only. Another copy
+    /// holding the page (a small buffer inside the large one) drops what a
+    /// frame withheld of it as ever: left in it, the bytes went into title
+    /// memory with the small copy's next copy-back of the page (results
+    /// computed while memory was missed), since only the keeper refuses
+    /// that.
+    #[test]
+    fn a_kept_page_is_retaken_in_the_other_copies_holding_it() {
+        let pages = 6;
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, len as u64);
+        register(p + 1, p as u64, PAGE as u64);
+        let (Some(copy), Some(small)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+            unregister(p + 1, p as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&copy, &small));
+        let byte = |c: &Shadow| c.read_host(p as u64 + 16, 1)[0] & 0xff;
+        // Shaders write the page in both copies, the frame withholds both.
+        copy.update(p, len);
+        small.update(p, PAGE);
+        for c in [&copy, &small] {
+            c.writing(p, PAGE, false);
+            c.write_host(p as u64 + 16, &[0x22]);
+            c.keep_writes(p, PAGE);
+        }
+        assert!(crate::memory::keep_page(&copy, p), "kept in the large copy");
+        crate::memory::drop_withheld(p, PAGE);
+        crate::memory::log_frame();
+        copy.update(p, len);
+        small.update(p, PAGE);
+        assert_eq!((byte(&copy), byte(&small)), (0x22, 0x11), "the keeper holds the GPU's byte, the other copy title memory's");
+        assert!(crate::memory::kept_page(p), "still kept");
+        // The title writes the page: kept no longer, in the keeper either.
+        // SAFETY: a byte of our pool (guarded: faults into the handler).
+        unsafe { ((p + 32) as *mut u8).write_volatile(0x33) };
+        copy.update(p, len);
+        assert_eq!(byte(&copy), 0x11, "the keeper took the page the title wrote");
+        assert!(!crate::memory::kept_page(p), "kept no longer");
+        unregister(p, p as u64);
+        unregister(p + 1, p as u64);
+    }
+
+    /// A page the title wrote since the copy took it is not kept: the copy
+    /// takes the title's bytes at its next refresh, and so do small copies'
+    /// pages (their writes go back, `crate::arena::BACK`).
+    #[test]
+    fn a_page_the_title_wrote_or_of_a_small_copy_is_not_kept() {
+        let pages = 6;
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        register(p, p as u64, len as u64);
+        register(p + 1, p as u64, PAGE as u64);
+        let (Some(copy), Some(small)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+            unregister(p + 1, p as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&copy, &small));
+        copy.update(p, len);
+        small.update(p, PAGE);
+        // SAFETY: a byte of our pool (guarded: faults into the handler).
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(0x55) };
+        assert!(!crate::memory::keep_page(&copy, p + 2 * PAGE), "the title wrote the page");
+        assert!(!crate::memory::keep_page(&small, p), "a small copy");
+        assert!(!crate::memory::kept_page(p + 2 * PAGE) && !crate::memory::kept_page(p));
         unregister(p + 1, p as u64);
         unregister(p, p as u64);
     }

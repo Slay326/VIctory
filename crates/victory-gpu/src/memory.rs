@@ -377,7 +377,7 @@ static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// frame's end ([`retake_dropped`]).
 pub(crate) fn drop_withheld(address: usize, len: usize) {
     if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) && !retake_late() {
-        crate::watch::retake(address, len);
+        retake_unkept(address, len);
     } else {
         DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
     }
@@ -428,7 +428,203 @@ pub(crate) fn release_waited(copy: &Shadow, from: u64, len: u64) {
 fn retake_dropped() {
     let dropped = std::mem::take(&mut *DROPPED.lock().unwrap_or_else(|e| e.into_inner()));
     for (address, len) in dropped {
-        crate::watch::retake(address, len);
+        retake_unkept(address, len);
+    }
+}
+
+/// Whether pages of large title buffers that the BVH builder's lists wrote
+/// keep the GPU's bytes in their copies until the title writes the page
+/// (`VICTORY_BVH_KEEP_PAGES=1`, with the arena; off by default, local test;
+/// `=2`: not what a submission wrote of which a list using title memory
+/// `missed` memory itself, which stays withheld and dropped as before).
+/// Such writes never go into title memory (`crate::arena::BACK`), and
+/// dropped from the copies at the frame's end they were gone for good: the
+/// title has a bottom level unpacked in place once and builds top levels
+/// over it from then on, while title memory, which the copies took again,
+/// still held the packed one (runs 193641, 203823, 164739: headers back from
+/// 0x8002 to 0x8102 at the same address, no page copied back; 76 % of the
+/// unpacking dispatches ran in frames that missed some page, so keeping
+/// only what frames without a miss wrote would keep little).
+///
+/// A kept page is the GPU's alone until the title writes it, in the copy
+/// the builder wrote (its keeper):
+/// * no retake reaches it there ([`drop_withheld`], whole declared ranges
+///   too); the other copies holding the page are retaken as ever (what was
+///   withheld of them and stayed would go into title memory with their next
+///   copy-back of the page);
+/// * nothing of it goes into title memory by comparing the keeper with
+///   title memory (a later copy-back of the page would carry the kept bytes
+///   along: run 162252 with `VICTORY_BVH_ARENA_KEEP`), so later writes to
+///   it stay in the copy as well;
+/// * a title write ends it: the copy takes the page from title memory at
+///   its next refresh, as any page the title wrote.
+// shortcut: the copy takes a page the title wrote whole, over what shaders
+// wrote elsewhere in it (a bottom level beside one the title just loaded is
+// packed again); counted as "taken from title memory again", as are the
+// pages of a copy made anew.
+// shortcut: pages the builder writes through views that do not mark their
+// writes are not known and stay as before (retaken with their range).
+pub(crate) fn keeps_pages(missed: bool) -> bool {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let level = || *LEVEL.get_or_init(|| std::env::var("VICTORY_BVH_KEEP_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    crate::arena::enabled() && keeps_at(level(), missed)
+}
+
+fn keeps_at(level: u8, missed: bool) -> bool {
+    match level {
+        1 => true,
+        2 => !missed,
+        _ => false,
+    }
+}
+
+/// The kept pages ([`keeps_pages`]; page numbers) with the copy each is
+/// kept in (never made alive from here: a copy's last holder is not us) and
+/// its tracker, and since the last frame line: pages that became kept, kept
+/// pages their copy took from title memory again (the title wrote them) or
+/// whose copy is gone, copy-backs not made, retakes not made.
+#[derive(Default)]
+struct Kept {
+    pages: std::collections::BTreeMap<usize, (std::sync::Weak<Shadow>, crate::watch::Keeper)>,
+    entered: u64,
+    ended: u64,
+    refused: u64,
+    spared: u64,
+}
+
+static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
+/// Whether any page was ever kept (the paths below cost one load until then).
+static KEPT_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn kept<R>(f: impl FnOnce(&mut Kept) -> R) -> R {
+    f(KEPT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
+/// The builder's list wrote the 64 KiB page at `address` in `copy`, and the
+/// write does not go into title memory: the page is kept in that copy, if
+/// it is a large one of tracked memory and the title has not written the
+/// page since the copy took it (then the copy takes the title's bytes at
+/// its next refresh anyway; a copy of memory not tracked takes them at
+/// every use). True if the page is kept now.
+pub(crate) fn keep_page(copy: &Arc<Shadow>, address: usize) -> bool {
+    if copy.range().1 <= crate::arena::BACK || copy.title_changed(address) != Some(false) {
+        return false;
+    }
+    let Some(keeper) = copy.keeper() else {
+        return false;
+    };
+    kept(|k| {
+        let before = k.pages.insert(address / crate::watch::PAGE, (Arc::downgrade(copy), keeper));
+        if !before.is_some_and(|(c, _)| std::ptr::eq(c.as_ptr(), Arc::as_ptr(copy))) {
+            k.entered += 1;
+        }
+    });
+    KEPT_ANY.store(true, std::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Whether the 64 KiB page at `address` is kept.
+#[cfg(test)]
+pub(crate) fn kept_page(address: usize) -> bool {
+    KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) && kept(|k| k.pages.contains_key(&(address / crate::watch::PAGE)))
+}
+
+/// Whether the page at `address` is kept in `copy`: a copy-back of the page
+/// out of it is not made then (counted). Small copies hold no kept writes.
+pub(crate) fn kept_from_title(copy: &Shadow, address: usize) -> bool {
+    if copy.range().1 <= crate::arena::BACK || !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    kept(|k| {
+        let held = k.pages.get(&(address / crate::watch::PAGE)).is_some_and(|(c, _)| std::ptr::eq(c.as_ptr(), copy));
+        k.refused += u64::from(held);
+        held
+    })
+}
+
+/// The large copy `copy` took `[from, to)` from title memory (the title
+/// wrote there): the pages kept in it are kept no longer, nor those whose
+/// copy is gone.
+pub(crate) fn kept_taken(copy: &Shadow, from: usize, to: usize) {
+    if !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) || from >= to {
+        return;
+    }
+    let page = crate::watch::PAGE;
+    kept(|k| {
+        let gone: Vec<usize> = k
+            .pages
+            .range(from / page..to.div_ceil(page))
+            .filter(|(_, (c, _))| std::ptr::eq(c.as_ptr(), copy) || c.strong_count() == 0)
+            .map(|(&p, _)| p)
+            .collect();
+        for p in &gone {
+            k.pages.remove(p);
+        }
+        k.ended += gone.len() as u64;
+    });
+}
+
+/// `[address, address + len)` without the pages `kept` (page numbers, in
+/// order): the ranges between them.
+fn around_pages(address: usize, len: usize, kept: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {
+    let page = crate::watch::PAGE;
+    let end = address.saturating_add(len);
+    let (mut at, mut out) = (address, Vec::new());
+    for p in kept {
+        let (from, to) = ((p * page).min(end), (p + 1) * page);
+        if at < from {
+            out.push((at, from - at));
+        }
+        at = at.max(to);
+    }
+    if at < end {
+        out.push((at, end - at));
+    }
+    out
+}
+
+/// [`crate::watch::retake`] of the range, but of its kept pages only for
+/// the copies they are not kept in. A page whose copy is gone is kept no
+/// longer.
+fn retake_unkept(address: usize, len: usize) {
+    if !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return crate::watch::retake(address, len);
+    }
+    let page = crate::watch::PAGE;
+    let (ranges, keepers) = kept(|k| {
+        let range = address / page..address.saturating_add(len).div_ceil(page);
+        let gone: Vec<usize> = k.pages.range(range.clone()).filter(|(_, (c, _))| c.strong_count() == 0).map(|(&p, _)| p).collect();
+        for p in &gone {
+            k.pages.remove(p);
+        }
+        k.ended += gone.len() as u64;
+        let keepers: Vec<(usize, crate::watch::Keeper)> = k.pages.range(range).map(|(&p, (_, t))| (p, t.clone())).collect();
+        k.spared += keepers.len() as u64;
+        (around_pages(address, len, keepers.iter().map(|k| k.0)), keepers)
+    });
+    for (a, n) in ranges {
+        crate::watch::retake(a, n);
+    }
+    for (p, keeper) in keepers {
+        keeper.retake_others(p);
+    }
+}
+
+/// A line per frame in which the kept pages did something.
+fn log_kept() {
+    if !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let (held, entered, ended, refused, spared) = kept(|k| {
+        let line = (k.pages.len(), k.entered, k.ended, k.refused, k.spared);
+        (k.entered, k.ended, k.refused, k.spared) = (0, 0, 0, 0);
+        line
+    });
+    if entered + ended + refused + spared > 0 {
+        tracing::info!(
+            "kept pages this frame: {held} held, {entered} new, {ended} taken from title memory again, \
+             {refused} copy-backs not made, {spared} retakes not made"
+        );
     }
 }
 
@@ -437,6 +633,8 @@ fn retake_dropped() {
 pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
+    log_kept();
+    crate::unpacked::log_frame();
     crate::arena::log_frame();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
@@ -960,10 +1158,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
         let mut withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        // The builder's pages in large copies that do not go back: kept,
+        // each until the title writes it ([`keeps_pages`]).
+        let keeps = arena && ran_builder.load(std::sync::atomic::Ordering::Relaxed) && keeps_pages(pages + regions > 0);
         if withheld > 0 {
             for (k, at) in writes.drain(..) {
                 release_waited(&copies[k], at, 1 << 16);
-                if !keep {
+                if !keep && !(keeps && keep_page(&copies[k], at as usize)) {
                     drop_withheld(at as usize, 1 << 16);
                 }
             }
@@ -976,7 +1177,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 if !small {
                     withheld += 1;
                     release_waited(&copies[k], at, 1 << 16);
-                    if !keep {
+                    if !keep && !(keeps && keep_page(&copies[k], at as usize)) {
                         drop_withheld(at as usize, 1 << 16);
                     }
                 }
@@ -1016,6 +1217,18 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dropped range is retaken around its kept pages, cut to the range.
+    #[test]
+    fn a_range_is_retaken_around_its_kept_pages() {
+        let p = crate::watch::PAGE;
+        assert_eq!(around_pages(p + 16, 4 * p, [2, 3].into_iter()), [(p + 16, p - 16), (4 * p, p + 16)]);
+        assert_eq!(around_pages(0, 3 * p, std::iter::empty()), [(0, 3 * p)]);
+        assert!(around_pages(2 * p, p, [2].into_iter()).is_empty());
+        assert!(around_pages(2 * p + 8, 16, [2].into_iter()).is_empty());
+        assert_eq!(around_pages(p, 4 * p, [1, 4].into_iter()), [(2 * p, 2 * p)]);
+        assert!(!keeps_at(0, false) && keeps_at(1, true) && keeps_at(2, false) && !keeps_at(2, true) && !keeps_at(3, false));
+    }
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.
