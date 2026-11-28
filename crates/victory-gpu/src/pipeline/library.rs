@@ -6,9 +6,10 @@
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used. On
-//!    NVIDIA, a pipeline whose root signature has static samplers is made
-//!    every run instead ([`keeps_static_samplers`]).
+//!    an entry whose description differs, so neither is ever used. A
+//!    pipeline with static samplers is named by their places in the
+//!    driver's table too (`sampler_order`), or, where those cannot be
+//!    vouched for, made every run on NVIDIA ([`keeps_static_samplers`]).
 //! 2. The title pipelines a run drew or dispatched with (made in time or
 //!    not) are listed by a key known when the title creates them (their
 //!    shader containers and graphics state); the next run hands those to
@@ -67,6 +68,11 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+}
+
+/// The cache folder, once one is given.
+pub(super) fn dir() -> Option<&'static PathBuf> {
+    DIR.get()
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -385,11 +391,12 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 
 /// What the pre-build's list holds for: the library's bytes, and what
 /// names its pipelines (the translation, as the shader cache keys it; the
-/// host descriptions).
+/// host descriptions; the static samplers' list).
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
     let views = [victory_shader::emit::heap_views(), victory_shader::emit::title_views()].map(u32::to_le_bytes).concat();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
+    let samplers = super::sampler_order::listed();
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
@@ -399,6 +406,8 @@ fn tag(blob: &[u8]) -> String {
         &views,
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
+        include_bytes!("sampler_order.rs"),
+        samplers.as_bytes(),
     ] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
@@ -448,9 +457,10 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 
 const NVIDIA: u32 = 0x10DE;
 
-/// Whether a pipeline whose root signature has static samplers can be
-/// kept in the library: not on NVIDIA, nor where the adapter cannot be
-/// told.
+/// Whether a pipeline with static samplers whose places in the driver's
+/// table are not in its name (`sampler_order`: the order is off, or not
+/// vouched for) can be kept in the library: not on NVIDIA, nor where the
+/// adapter cannot be told.
 ///
 /// NVIDIA's driver puts each distinct static sampler in a table of its
 /// own, in the order a process first creates them, and a compiled
@@ -496,19 +506,19 @@ fn adapter_vendor(device: &ID3D12Device) -> Option<u32> {
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
 /// (the others then find it in the library); different names overlap.
-/// `static_samplers`: its root signature has static samplers, and such a
-/// pipeline is only made, neither loaded nor stored, where the library
-/// cannot keep them ([`keeps_static_samplers`]).
+/// `unguarded`: its root signature has static samplers whose places are not
+/// in `name`, and such a pipeline is only made, neither loaded nor stored,
+/// where the library cannot keep them ([`keeps_static_samplers`]).
 pub(crate) fn pipeline(
     name: &str,
-    static_samplers: bool,
+    unguarded: bool,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
-    let library = library().filter(|_| !static_samplers || keeps_static_samplers());
+    let library = library().filter(|_| !unguarded || keeps_static_samplers());
     let Some(library) = library else {
         #[cfg(feature = "diagnostics")]
         LAST.set(Some((name.to_owned(), false)));
@@ -704,7 +714,7 @@ fn ended(pid: u32) -> bool {
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = staging(path);
     let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
@@ -1204,45 +1214,52 @@ mod tests {
         });
     }
 
-    /// A pipeline with static samplers kept in the library by one run (as
-    /// every earlier build kept them) samples through its own samplers in
-    /// a later run that made other static samplers first. On NVIDIA the
-    /// loaded one read its linear samplers as point ones (0 for 0.25), so
-    /// such a pipeline is made there, never loaded or stored. The two runs
-    /// are child processes of this test: the driver's sampler table is a
+    /// A pipeline with static samplers kept in the library by one run
+    /// samples through its own samplers in a later run that made other
+    /// static samplers first: the later run created the listed ones first,
+    /// in the list's order, so it loads the pipeline. (Without that, the
+    /// RTX 3070 loaded it reading its linear samplers as point ones, 0 for
+    /// 0.25.) The runs are child processes: the driver's sampler table is a
     /// process's own.
     #[test]
     fn a_kept_pipeline_samples_through_its_own_static_samplers() {
-        use static_samplers::{DIR_VAR, ROLE};
-        match std::env::var(ROLE).as_deref() {
-            Ok("store") => return static_samplers::store(),
-            Ok("load") => return static_samplers::load(),
-            _ => {}
-        }
-        if crate::host::host().is_none() {
-            return; // no host GPU here
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = module_path!().split_once("::").map_or(module_path!(), |(_, p)| p);
-        let test = format!("{path}::a_kept_pipeline_samples_through_its_own_static_samplers");
-        for role in ["store", "load"] {
-            let run = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-                .env(ROLE, role)
-                .env(DIR_VAR, dir.path())
-                .output()
-                .unwrap();
-            let out = String::from_utf8_lossy(&run.stdout);
-            let err = String::from_utf8_lossy(&run.stderr);
-            println!("{role}: {}", out.lines().filter(|l| l.contains("sampled")).collect::<Vec<_>>().join("; "));
-            assert!(run.status.success(), "the {role} run failed:\n{out}\n{err}");
-            assert!(out.contains("1 passed"), "the {role} run ran no test:\n{out}\n{err}");
-        }
+        static_samplers::runs(
+            "a_kept_pipeline_samples_through_its_own_static_samplers",
+            &["store", "load"],
+        );
     }
 
-    /// The two runs of `a_kept_pipeline_samples_through_its_own_static_samplers`.
+    /// A sampler first met in a later run is appended to the list, and a
+    /// pipeline with it, stored then, loads in the run after that, which
+    /// met yet other samplers first.
+    #[test]
+    fn a_static_sampler_met_in_a_later_run_is_appended() {
+        static_samplers::runs(
+            "a_static_sampler_met_in_a_later_run_is_appended",
+            &["store", "append", "load appended"],
+        );
+    }
+
+    /// With the list lost, the pipeline's name misses (its samplers have
+    /// other places now): it is made again and samples right.
+    #[test]
+    fn a_lost_static_sampler_list_gives_a_miss() {
+        static_samplers::runs("a_lost_static_sampler_list_gives_a_miss", &["store", "load lost"]);
+    }
+
+    /// The control (NVIDIA only, so not run by default): the list read but
+    /// its samplers not created first, the name still found, the loaded
+    /// pipeline samples through the other samplers.
+    #[test]
+    #[ignore = "a control for NVIDIA's sampler table: it asserts wrong samples"]
+    fn unprimed_static_samplers_load_wrong() {
+        static_samplers::runs("unprimed_static_samplers_load_wrong", &["store", "load unprimed"]);
+    }
+
+    /// The runs of the tests above.
     mod static_samplers {
         use super::super::super::host::root_signature;
+        use super::super::super::sampler_order;
         use super::*;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -1273,6 +1290,151 @@ mod tests {
         const EXPECTED: [f32; 3] = [0.0, 0.25, 0.25];
         /// Other static samplers the later run makes first.
         const OTHERS: u32 = 10;
+        /// The probe samplers' greatest LOD: another one makes other
+        /// samplers that sample the same (the texture has one level).
+        const FIRST: f32 = 12.0;
+        const APPENDED: f32 = 13.0;
+
+        /// Runs `steps` of `test` in child processes, in order, on one
+        /// cache folder; in a child, its step.
+        pub(super) fn runs(test: &str, steps: &[&str]) {
+            if let Ok(step) = std::env::var(ROLE) {
+                return run(&step);
+            }
+            if crate::host::host().is_none() {
+                return; // no host GPU here
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = module_path!().split_once("::").map_or(module_path!(), |(_, p)| p);
+            let test = format!("{}::{test}", path.trim_end_matches("::static_samplers"));
+            for step in steps {
+                let run = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1", "--include-ignored"])
+                    .env(ROLE, step)
+                    .env(DIR_VAR, dir.path())
+                    .output()
+                    .unwrap();
+                let out = String::from_utf8_lossy(&run.stdout);
+                let err = String::from_utf8_lossy(&run.stderr);
+                println!("{step}: {}", out.lines().filter(|l| l.contains("sampled")).collect::<Vec<_>>().join("; "));
+                assert!(run.status.success(), "the {step} run failed:\n{out}\n{err}");
+                assert!(out.contains("1 passed"), "the {step} run ran no test:\n{out}\n{err}");
+            }
+        }
+
+        fn run(step: &str) {
+            let dir = PathBuf::from(std::env::var_os(DIR_VAR).expect("the library's folder"));
+            let list = dir.join(sampler_order::FILE);
+            if step == "load lost" {
+                let lost = std::fs::remove_file(&list);
+                assert!(lost.is_ok() || !sampler_order::on(), "no list to lose");
+            }
+            if step == "load unprimed" {
+                sampler_order::UNPRIMED.store(true, Ordering::Relaxed);
+            }
+            // Before the device: it creates the listed samplers.
+            use_pipeline_cache(dir.clone());
+            let device = device();
+            let ordered = sampler_order::on();
+            match step {
+                "store" => {
+                    let (made, values) = probe(&device, FIRST, &[]);
+                    check(values);
+                    assert!(made, "a first run loaded the probe");
+                    store_and_save(&dir);
+                    if ordered {
+                        assert_eq!(lines(&list), 3, "the probe's samplers listed");
+                    }
+                }
+                "load" | "load lost" | "load unprimed" => {
+                    let (made, values) = probe(&device, FIRST, &others(0..OTHERS));
+                    match (step, ordered) {
+                        ("load", true) => {
+                            check(values);
+                            assert!(!made, "the probe was made again, not loaded");
+                            assert_eq!(lines(&list), 3 + OTHERS as usize, "the others appended");
+                        }
+                        ("load lost", true) => {
+                            check(values);
+                            assert!(made, "the probe loaded with its samplers in other places");
+                        }
+                        ("load unprimed", true) => {
+                            assert!(!made, "the control did not load the probe");
+                            println!("sampled (point, linear, trilinear), control: {values:?}");
+                            assert_ne!(values, EXPECTED, "the control sampled right without priming");
+                        }
+                        // Without the order: such a pipeline is made on NVIDIA.
+                        (_, false) => {
+                            check(values);
+                            assert!(keeps_static_samplers() || made, "a pipeline with static samplers was loaded");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                "append" => {
+                    let (made, values) = probe(&device, APPENDED, &others(0..OTHERS));
+                    check(values);
+                    assert!(made, "a probe with new samplers was loaded");
+                    store_and_save(&dir);
+                    if ordered {
+                        assert_eq!(lines(&list), 3 + OTHERS as usize + 3, "the new samplers appended");
+                    }
+                }
+                "load appended" => {
+                    // Yet others first, new to the list too.
+                    let (made, values) = probe(&device, APPENDED, &others(OTHERS..OTHERS + 5));
+                    check(values);
+                    assert!(!ordered || !made, "the probe with appended samplers was made again, not loaded");
+                }
+                _ => panic!("no step {step}"),
+            }
+        }
+
+        /// Lines in the list of static samplers.
+        fn lines(list: &std::path::Path) -> usize {
+            std::fs::read_to_string(list).map_or(0, |l| l.lines().count())
+        }
+
+        /// Root signatures with one other static sampler each, created
+        /// through the host's path and kept while they are returned.
+        fn others(range: std::ops::Range<u32>) -> Vec<ID3D12RootSignature> {
+            let device = device();
+            range
+                .map(|i| {
+                    let other = sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, (i + 1) as f32 / 64.0, FIRST);
+                    root_signature(&device, &[], &[other], true).expect("another root signature").0
+                })
+                .collect()
+        }
+
+        /// The probe with its samplers' greatest LOD `max_lod`, after
+        /// `_others`: whether it was made (else loaded), and its samples.
+        fn probe(device: &ID3D12Device, max_lod: f32, _others: &[ID3D12RootSignature]) -> (bool, [f32; 3]) {
+            let (root, blob, unguarded) = root(device, max_lod);
+            let code = fxc(windows::core::s!("probe"));
+            let loaded = LOADED.load(Ordering::Relaxed);
+            let (name, pso) = pipeline_of(device, &root, &blob, &code, unguarded);
+            let made = LOADED.load(Ordering::Relaxed) == loaded;
+            println!("sampled with the probe {}", if made { "made" } else { "loaded" });
+            if unguarded && !keeps_static_samplers() {
+                // As earlier builds did: kept regardless, for a later run's
+                // check that it is not loaded.
+                let library = library().expect("a pipeline library");
+                let mut l = library.state.lock().unwrap();
+                assert_eq!(l.added, 0, "a pipeline with static samplers was stored");
+                let wide = HSTRING::from(name.as_str());
+                // SAFETY: a live pipeline; one already stored is refused.
+                if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+                    l.added += 1;
+                }
+            }
+            (made, sample(device, &root, &pso))
+        }
+
+        fn store_and_save(dir: &std::path::Path) {
+            save(true);
+            assert!(dir.join(LIBRARY_FILE).exists());
+        }
 
         fn fxc(entry: PCSTR) -> Vec<u8> {
             let (mut blob, mut errors) = (None, None);
@@ -1303,7 +1465,7 @@ mod tests {
             }
         }
 
-        fn sampler(register: u32, filter: D3D12_FILTER, bias: f32) -> D3D12_STATIC_SAMPLER_DESC {
+        fn sampler(register: u32, filter: D3D12_FILTER, bias: f32, max_lod: f32) -> D3D12_STATIC_SAMPLER_DESC {
             D3D12_STATIC_SAMPLER_DESC {
                 Filter: filter,
                 AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1312,7 +1474,7 @@ mod tests {
                 MipLODBias: bias,
                 MaxAnisotropy: 1,
                 ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-                MaxLOD: 12.0,
+                MaxLOD: max_lod,
                 ShaderRegister: register,
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 ..Default::default()
@@ -1321,7 +1483,7 @@ mod tests {
 
         /// The probe's root signature as the host makes one (`host`): a
         /// table of the texture's two views, the output, three samplers.
-        fn root(device: &ID3D12Device) -> (ID3D12RootSignature, Vec<u8>) {
+        fn root(device: &ID3D12Device, max_lod: f32) -> (ID3D12RootSignature, Vec<u8>, bool) {
             let range = |kind, offset| D3D12_DESCRIPTOR_RANGE1 {
                 RangeType: kind,
                 NumDescriptors: 1,
@@ -1352,15 +1514,20 @@ mod tests {
                 },
             ];
             let samplers = [
-                sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, 0.0),
-                sampler(1, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT, 0.0),
-                sampler(2, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 0.0),
+                sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, 0.0, max_lod),
+                sampler(1, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT, 0.0, max_lod),
+                sampler(2, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 0.0, max_lod),
             ];
-            root_signature(device, &params, &samplers, true).expect("the probe's root signature")
+            let (root, mut blob, order) =
+                root_signature(device, &params, &samplers, true).expect("the probe's root signature");
+            // Named as the host names its pipelines (`host`).
+            let unguarded = order.is_none();
+            blob.extend_from_slice(order.unwrap_or_default().as_bytes());
+            (root, blob, unguarded)
         }
 
         /// The probe pipeline through the library, as the host gets one.
-        fn probe(device: &ID3D12Device, root: &ID3D12RootSignature, blob: &[u8], code: &[u8]) -> (String, ID3D12PipelineState) {
+        fn pipeline_of(device: &ID3D12Device, root: &ID3D12RootSignature, blob: &[u8], code: &[u8], unguarded: bool) -> (String, ID3D12PipelineState) {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(root) },
@@ -1370,7 +1537,7 @@ mod tests {
             let name = name("compute", blob, &[code], "test: static samplers");
             let pso = pipeline(
                 &name,
-                true,
+                unguarded,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -1526,53 +1693,6 @@ mod tests {
 
         fn device() -> ID3D12Device {
             crate::host::host().expect("a host GPU, as the parent had").device.clone()
-        }
-
-        /// The first run: the probe made with its samplers first in the
-        /// table, and in the library (stored here if `pipeline` did not, as
-        /// earlier builds did), saved.
-        pub(super) fn store() {
-            use_pipeline_cache(std::env::var_os(DIR_VAR).expect("the library's folder").into());
-            let device = device();
-            let (root, blob) = root(&device);
-            let code = fxc(windows::core::s!("probe"));
-            let (name, pso) = probe(&device, &root, &blob, &code);
-            check(sample(&device, &root, &pso));
-            let library = library().expect("a pipeline library");
-            let mut l = library.state.lock().unwrap();
-            if !keeps_static_samplers() {
-                assert_eq!(l.added, 0, "a pipeline with static samplers was stored");
-            }
-            let wide = HSTRING::from(name.as_str());
-            // SAFETY: a live pipeline; one already stored is refused.
-            if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-                l.added += 1;
-            }
-            drop(l);
-            save(true);
-            assert!(std::path::Path::new(&std::env::var_os(DIR_VAR).unwrap()).join(LIBRARY_FILE).exists());
-        }
-
-        /// The later run: other static samplers made first, then the probe.
-        pub(super) fn load() {
-            let device = device();
-            let _others: Vec<_> = (0..OTHERS)
-                .map(|i| {
-                    let other = sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, (i + 1) as f32 / 64.0);
-                    root_signature(&device, &[], &[other], true).expect("another root signature")
-                })
-                .collect();
-            use_pipeline_cache(std::env::var_os(DIR_VAR).expect("the library's folder").into());
-            let (root, blob) = root(&device);
-            let code = fxc(windows::core::s!("probe"));
-            let loaded = LOADED.load(Ordering::Relaxed);
-            let (_, pso) = probe(&device, &root, &blob, &code);
-            let loaded = LOADED.load(Ordering::Relaxed) > loaded;
-            println!("sampled with the probe {}", if loaded { "loaded" } else { "made" });
-            if !keeps_static_samplers() {
-                assert!(!loaded, "a pipeline with static samplers was loaded");
-            }
-            check(sample(&device, &root, &pso));
         }
     }
 

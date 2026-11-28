@@ -10,8 +10,13 @@ use windows::Win32::Graphics::Direct3D12::{
 use crate::object::Object;
 
 /// The host D3D12 device, created on first use; `None` without a host GPU.
+/// The library may create static samplers of its own, so those this crate
+/// first meets from now on are not kept in order
+/// (`pipeline::sampler_order::outside`).
 pub fn host_device() -> Option<ID3D12Device> {
-    crate::host::host().map(|h| h.device.clone())
+    let device = crate::host::host().map(|h| h.device.clone())?;
+    crate::pipeline::sampler_order::outside();
+    Some(device)
 }
 
 /// A title texture's host copy, moved to the host resource `state` in the
