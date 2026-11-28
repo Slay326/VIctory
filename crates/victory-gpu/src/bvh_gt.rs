@@ -716,7 +716,10 @@ pub(crate) struct Check {
     pub(crate) origin: u32,
     /// Nodes not in what was read.
     pub(crate) missing: u32,
-    /// Parent table: entries checked, matching as `table[node]` (forward)
+    /// Parent table ([`parent_entry`]): box node children checked, entries
+    /// that name their parent, entries that do not (or were not read).
+    /// The log's "checked", "fwd" and "bwd", which until the index took in
+    /// dword 13 were: entries checked, matching as `table[node]` (forward)
     /// and as `table[-1 - node]` (backward); its form is not known.
     pub(crate) parents: (u32, u32, u32),
 }
@@ -759,7 +762,9 @@ fn empty(b: &Aabb) -> bool {
 /// +-FLT_MAX start values), and from the root down every box node: child
 /// boxes in the parent's box, children inside the size, no empty box with
 /// a child, the root not empty while the header counts elements; the
-/// parent table (dword 14) is checked both ways and only counted.
+/// parent table is only counted: of each child that is a box node, the
+/// entry the title's reader goes back over ([`parent_entry`]) against the
+/// node that holds it.
 pub(crate) fn check(read: &dyn Fn(u64) -> Option<u32>, base: u64) -> Check {
     // Built bottom levels put the root at exactly dword 1 x 64 with a box
     // node there that fits the header's bounds (runs 164431, 171123: e.g.
@@ -823,7 +828,6 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
     } else if (4..10).any(|i| !f(i).is_finite()) || empty(&bounds) {
         fail(&mut c, format!("bounds {bounds:?}"));
     }
-    let parents = h[14] as i32 as i64;
     // v2: node boxes of a structure with a scale word (rehydrated ones) are
     // in stored units, the header's bounds in object units.
     let start = match v2 {
@@ -885,11 +889,18 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
                 }
                 fail(&mut c, format!("child box of {child:#x} outside {p:#x}'s"));
             }
-            let index = i64::from(child & !7) >> 3;
-            let entry = |k: i64| read((base as i64 + parents + 4 * k) as u64);
-            c.parents.0 += 1;
-            c.parents.1 += u32::from(entry(index) == Some(p));
-            c.parents.2 += u32::from(entry(-1 - index) == Some(p));
+            // The table has an entry per box node (a top level's also per
+            // instance, which the reader takes from the instance's dword 29).
+            if child & 6 == 4 {
+                const POINTER: u32 = 0x1fff_ffff;
+                let entry = read(base + u64::from(parent_entry(child >> 3 & 0x03ff_ffff, h[13], h[14])));
+                c.parents.0 += 1;
+                if entry.is_some_and(|e| e & POINTER == p & POINTER) {
+                    c.parents.1 += 1;
+                } else {
+                    c.parents.2 += 1;
+                }
+            }
             queue.push((child, b, false));
         }
         if is_root && children == 0 && h[3] > 0 {
@@ -898,6 +909,17 @@ fn check_core(read: &dyn Fn(u64) -> Option<u32>, base: u64, extra: u64, v2: Opti
     }
     c.valid = c.why.is_none();
     c
+}
+
+/// The byte offset in a structure of the parent table's entry for the box
+/// node at `slot` (its offset / 64), with the header's dwords 13 and 14: as
+/// the title's reader computes it in 32 bits, `D14 + 4 (slot - D13 / 64)`
+/// (`crate::bvh_replay::reference`, there against 228,894 bottom-level
+/// nodes of a capture; unpacked bottom levels hold a negative dword 14).
+/// Until senior 142's finding the entry was read at `D14 + 4 slot`, without
+/// dword 13: every log's "fwd 0 bwd 0".
+fn parent_entry(slot: u32, d13: u32, d14: u32) -> u32 {
+    slot.wrapping_sub(d13 >> 6).wrapping_add(d14 >> 2) << 2
 }
 
 /// Header dword 0 mark (high half): the structure is still packed.
@@ -2228,13 +2250,57 @@ mod tests {
         assert_eq!(why_class(None), "");
     }
 
+    /// The parent table as the title's reader reads it: the entry of the
+    /// box node at slot `s` at `D14 + 4 (s - D13 / 64)`, in 32 bits (here
+    /// D13 past the node, as in bottom levels: the difference is negative).
+    /// A root box16 at +0x80 holds a box16 at +0xc0 (slot 3), that a
+    /// triangle; D13 = 0x180 (slot 6), D14 = 0x4c: slot 3's entry at +0x40.
+    #[test]
+    fn the_parent_table_is_indexed_from_dword_13() {
+        let base = 0x1000;
+        let one = 1f32.to_bits();
+        let mut w = [0u32; 128];
+        w[0] = 0x8000 << 16 | 6;
+        w[1] = 7;
+        w[3] = 1;
+        w[4..10].copy_from_slice(&[0, 0, 0, one, one, one]);
+        w[10] = 0x80;
+        let (root, inner) = ((0x80 >> 3) | 4, (0xc0 >> 3) | 4);
+        w[12] = root;
+        w[13] = 0x180;
+        w[14] = 0x4c;
+        for (node, child) in [(0x80 / 4, inner), (0xc0 / 4, 0x100 >> 3)] {
+            w[node..node + 4].copy_from_slice(&[child, u32::MAX, u32::MAX, u32::MAX]);
+            w[node + 4..node + 7].copy_from_slice(&[0x0000_0000, 0x3c00_0000, 0x3c00_3c00]);
+            for i in 1..4 {
+                w[node + 4 + 3 * i..node + 7 + 3 * i].copy_from_slice(&[0x7c00_7c00, 0xfc00_7c00, 0xfc00_fc00]);
+            }
+        }
+        w[0x100 / 4..0x100 / 4 + 9].copy_from_slice(&[0, 0, 0, one, 0, 0, 0, one, 0]);
+        assert_eq!(parent_entry(3, 0x180, 0x4c), 0x40);
+        // An unpacked bottom level's of capture C1: D14 = -0x140.
+        assert_eq!(parent_entry(0x66, 0x180, 0xffff_fec0), 0x40);
+        w[0x40 / 4] = root;
+        let c = check(&read_of(&w, base), base);
+        assert!(c.valid, "{c:?}");
+        assert_eq!((c.boxes, c.parents), (2, (1, 1, 0)), "the inner node's entry names the root");
+        // The entry names another node: counted as wrong.
+        w[0x40 / 4] = inner;
+        assert_eq!(check(&read_of(&w, base), base).parents, (1, 0, 1));
+        // The entry where the index without dword 13 looked (D14 + 4 * 3)
+        // is not the one read.
+        w[(0x4c + 12) / 4] = root;
+        assert_eq!(check(&read_of(&w, base), base).parents, (1, 0, 1));
+    }
+
     #[test]
     fn the_mini_structure_passes_and_broken_ones_do_not() {
         let base = 0x1000;
         let good = mini_bvh();
         let c = check(&read_of(&good, base), base);
         assert!(c.valid, "{c:?}");
-        assert_eq!((c.boxes, c.outside, c.parents), (1, 0, (1, 1, 0)));
+        // Its one child is a triangle: no parent table entry to check.
+        assert_eq!((c.boxes, c.outside, c.parents), (1, 0, (0, 0, 0)));
         // Zeros (inputs from pages with no copy).
         assert!(!check(&read_of(&[0; 64], base), base).valid);
         // Root pointer 0 at +48.
