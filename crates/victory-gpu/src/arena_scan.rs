@@ -4,16 +4,26 @@
 //! counter of missed changes for the check mode.
 //!
 //! - `0` (default): as before, [`crate::arena`]'s `scan_inputs` reads the
-//!   input lists it is due to read.
-//! - `1`: only what counts as changed ([`Dirty`]).
-//! - `2`: check mode, as `1` plus the full scan and [`Missed`], which counts
-//!   the 4 KiB pieces whose bytes changed but which `1` would not have read.
-//!   Not a performance mode. Its full scan has to read every input list
-//!   each frame: mode 0 reads a list again only every 32nd scan (and never
-//!   one over 128 MiB), so changes in between are not compared there.
+//!   input lists it is due to read before every builder submission.
+//! - `1`: not while the scan has nothing to gain ([`idle`]): the arena has
+//!   stopped growing, so every page the scan finds is refused.
+//! - `2`: check mode: scans as `0` and counts, for the scans `1` leaves
+//!   out, the pages they prepared and how many of those got a slot (what
+//!   `1` would miss). Not a performance mode.
 //!
-//! Scanning only what changed is safe only under four conditions (each a
-//! test below, [`conditions`]):
+//! What the scan is for decides this: it reads the builder's input lists
+//! only to find structure pages to give slots before the builder runs. No
+//! byte of a list reaches the GPU through it (the lists are host copies of
+//! their own), so a scan left out can cost a slot given early, never stale
+//! bytes; and a stopped arena gives no slots. A scan driven by what the
+//! title wrote ([`Dirty`], below) would read fewer bytes for the same
+//! nothing while the arena is stopped, and while it grows the full scan is
+//! what fills it: the dirty-driven scan is not written (Fable, call 17).
+//! Its interface, model and tests stay as the frame for one, should the
+//! scan ever feed bytes to the GPU.
+//!
+//! Scanning only what changed would be safe only under four conditions
+//! (each a test below, [`conditions`]):
 //! 1. the write watch is read and reset before the pages are read, so a
 //!    write while they are read is seen in the next frame;
 //! 2. writers the write watch does not see (the GPU, copy-back) mark what
@@ -24,12 +34,11 @@
 //!    ([`Dirty::forget`]), the first frames.
 //!
 //! Nothing here decides what changed: that is [`Dirty`]'s implementation
-//! (not written yet). The tests run against [`FullScan`] (keeps all four,
+//! (not written). The tests run against [`FullScan`] (keeps all four,
 //! reads everything) and a deliberately naive dirty-only scan that breaks
 //! each of them.
 
-// Hooked into `arena::scan_inputs` with the dirty-driven scan; until then
-// only the tests use it.
+// Only [`mode`], [`idle`] and [`scans`] are used outside the tests.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -39,12 +48,26 @@ use std::sync::OnceLock;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mode {
     Full,
-    Dirty,
+    Useful,
     Check,
 }
 
-/// `VICTORY_ARENA_SCAN`: 0 (or unset or anything else) full, 1 dirty,
-/// 2 check.
+/// Whether a scan before a builder submission has nothing to gain: the
+/// arena has stopped growing (it stays stopped; each page found is
+/// refused), and what the lists point at is not kept for
+/// `VICTORY_BVH_ARENA_REFRESH_READS` (`pointers_kept`).
+pub(crate) fn idle(stopped: bool, pointers_kept: bool) -> bool {
+    stopped && !pointers_kept
+}
+
+/// Whether the scan is made: always, but for [`Mode::Useful`] when it has
+/// nothing to gain (`idle`).
+pub(crate) fn scans(mode: Mode, idle: bool) -> bool {
+    !(mode == Mode::Useful && idle)
+}
+
+/// `VICTORY_ARENA_SCAN`: 0 (or unset or anything else) full, 1 only when
+/// useful, 2 check.
 pub(crate) fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| parse_mode(std::env::var("VICTORY_ARENA_SCAN").ok().as_deref()))
@@ -52,7 +75,7 @@ pub(crate) fn mode() -> Mode {
 
 fn parse_mode(value: Option<&str>) -> Mode {
     match value.map(str::trim) {
-        Some("1") => Mode::Dirty,
+        Some("1") => Mode::Useful,
         Some("2") => Mode::Check,
         _ => Mode::Full,
     }
@@ -490,10 +513,11 @@ pub(crate) mod tests {
         assert_eq!(broken.len(), 6, "{}", report(&results));
     }
 
-    /// The dirty-driven scan (Fable) must keep every condition. Until it is
-    /// written this runs the naive scan and is red: `--ignored` shows it.
+    /// A dirty-driven scan must keep every condition. None is written
+    /// (module text): this runs the naive scan and is red, `--ignored`
+    /// shows it.
     #[test]
-    #[ignore = "red until the dirty-driven scan replaces the naive one here"]
+    #[ignore = "red: no dirty-driven scan is written (see the module text)"]
     fn the_dirty_scan_keeps_every_condition() {
         let results = conditions(&|| Box::new(Naive::default()));
         assert!(results.iter().all(|(_, r)| r.is_ok()), "{}", report(&results));
@@ -503,9 +527,24 @@ pub(crate) mod tests {
     fn the_mode_comes_from_the_switch() {
         assert_eq!(parse_mode(None), Mode::Full);
         assert_eq!(parse_mode(Some("0")), Mode::Full);
-        assert_eq!(parse_mode(Some("1")), Mode::Dirty);
+        assert_eq!(parse_mode(Some("1")), Mode::Useful);
         assert_eq!(parse_mode(Some(" 2 ")), Mode::Check);
         assert_eq!(parse_mode(Some("x")), Mode::Full);
+    }
+
+    /// The scan is left out only with the switch at 1, only once the arena
+    /// has stopped, and never while the lists' pointers are kept for the
+    /// refresh of what builders read.
+    #[test]
+    fn the_scan_is_left_out_only_when_it_has_nothing_to_gain() {
+        for mode in [Mode::Full, Mode::Useful, Mode::Check] {
+            for stopped in [false, true] {
+                for kept in [false, true] {
+                    let left_out = !scans(mode, idle(stopped, kept));
+                    assert_eq!(left_out, mode == Mode::Useful && stopped && !kept, "{mode:?} stopped {stopped} kept {kept}");
+                }
+            }
+        }
     }
 
     /// The counter: a piece seen the first time is not compared; a changed

@@ -330,6 +330,24 @@ struct Stats {
     /// found in them (pages).
     scanned: u64,
     found: u64,
+    /// Input scans due (builder submissions), and of them with nothing to
+    /// gain ([`crate::arena_scan::idle`]): left out with
+    /// `VICTORY_ARENA_SCAN=1`.
+    scans_due: u64,
+    scans_idle: u64,
+    /// Check mode (`VICTORY_ARENA_SCAN=2`), of the scans with nothing to
+    /// gain: pages they prepared, of those given a slot (what leaving the
+    /// scan out would miss: none, a stopped arena refuses them), pages they
+    /// learnt hold nothing or no title memory, and prepared pages that
+    /// would have taken a slot back had the scan not taken them out of the
+    /// pages asked for.
+    idle_prepared: u64,
+    idle_given: u64,
+    idle_learnt: u64,
+    idle_held_back: u64,
+    /// Sorts of found pages, and those that reused the last one.
+    sorts: u64,
+    sorts_reused: u64,
 }
 
 struct Arena {
@@ -904,13 +922,31 @@ pub(crate) fn provide() {
     // where committed title memory no copy holds lies. Its first run read
     // zeros there and its stages looped for seconds (runs 131349-133206).
     let builder = std::mem::take(&mut a.builder_now);
+    // Check mode: where in `first` the pages of a scan with nothing to gain
+    // start.
+    let mut idle_from: Option<usize> = None;
+    let scan_mode = crate::arena_scan::mode();
+    let idle = builder && crate::arena_scan::idle(a.stopped.is_some(), reads_most() > 0);
     if builder {
+        a.stats.scans_due += 1;
+        a.stats.scans_idle += u64::from(idle);
+    }
+    // The scan only asks for slots (and keeps what the lists point at for
+    // `VICTORY_BVH_ARENA_REFRESH_READS`): no byte of an input list reaches
+    // the GPU through it. A stopped arena refuses every page it finds
+    // (run s132-B2: 351,122 refused, none given, in 1,161 frames after the
+    // stop, at 74-112 ms a frame), so `VICTORY_ARENA_SCAN=1` leaves it out
+    // then. Pages the builder misses still come through `want_pages`.
+    if builder && crate::arena_scan::scans(scan_mode, idle) {
         let found = scan_inputs(a);
+        let known = a.nothing.len() + a.not_title.len();
         // While the arena is stopped, the same structure pages as last time
         // with nothing given or learnt since sort as they did then (each
         // goes on to be refused): not asked about one by one again.
         let key = (a.generation, a.nothing.len(), a.not_title.len());
         let cached = found_cached(&a.found_cache, a.stopped.is_some(), key, &found).cloned();
+        a.stats.sorts += 1;
+        a.stats.sorts_reused += u64::from(cached.is_some());
         let prepared = cached.unwrap_or_else(|| {
             let dir = &a.dir;
             let prepared = prepare_found(
@@ -924,8 +960,16 @@ pub(crate) fn provide() {
             a.found_cache = a.stopped.is_some().then(|| (found, (a.generation, a.nothing.len(), a.not_title.len()), prepared.clone()));
             prepared
         });
+        let check = idle && scan_mode == crate::arena_scan::Mode::Check;
         for &(p, _) in &prepared {
-            wanted.remove(&p);
+            if wanted.remove(&p) && check && evict_on() && a.misses.get(&p).is_some_and(|e| e.0 >= persist_frames()) {
+                a.stats.idle_held_back += 1;
+            }
+        }
+        if check {
+            a.stats.idle_prepared += prepared.len() as u64;
+            a.stats.idle_learnt += (a.nothing.len() + a.not_title.len() - known) as u64;
+            idle_from = Some(first.len());
         }
         first.extend(prepared);
     }
@@ -1008,6 +1052,7 @@ pub(crate) fn provide() {
             Ok((slot, _)) => {
                 if k < around_pages {
                     a.stats.around += 1;
+                    a.stats.idle_given += u64::from(idle_from.is_some_and(|from| k >= from));
                 } else {
                     given += 1;
                     a.faults += 1;
@@ -1201,8 +1246,10 @@ fn evict_for_persistent(a: &mut Arena, wanted: Vec<(u64, Memory)>, fills: &mut V
         a.watched.remove(&old);
         a.unwatched.remove(&old);
         a.sent.remove(&old);
-        let Ok((slot, _)) = a.dir.add(page) else { continue };
+        // With the removal: the page tables and the sort kept of found
+        // pages ([`found_cached`]) go by it, also if the add fails.
         a.generation += 1;
+        let Ok((slot, _)) = a.dir.add(page) else { continue };
         a.stats.evicted += 1;
         if let Memory::Committed(base, watched) = memory {
             if watched {
@@ -1595,6 +1642,26 @@ pub(crate) fn log_frame() {
     let s = std::mem::take(&mut a.stats);
     a.faults = 0;
     let no_room = a.no_room.take();
+    let scan_mode = crate::arena_scan::mode();
+    if scan_mode != crate::arena_scan::Mode::Full && s.scans_due > 0 {
+        let check = scan_mode == crate::arena_scan::Mode::Check;
+        tracing::info!(
+            target: "victory_gpu::arena",
+            "BVH arena input scan this frame (VICTORY_ARENA_SCAN={}): due {}, with nothing to gain (arena stopped) {} ({}); \
+             check: those prepared {} pages -> given a slot {} (missed by leaving them out), learnt as no memory or no title memory {}, kept from taking a slot back {}; \
+             sorts of found pages {} (reused {})",
+            if check { 2 } else { 1 },
+            s.scans_due,
+            s.scans_idle,
+            if check { "made, check mode" } else { "left out" },
+            s.idle_prepared,
+            s.idle_given,
+            s.idle_learnt,
+            s.idle_held_back,
+            s.sorts,
+            s.sorts_reused,
+        );
+    }
     if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs + s.scanned == 0 {
         return;
     }
