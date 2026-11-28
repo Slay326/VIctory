@@ -131,7 +131,11 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 fn mirror(handle: u64) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
+    // `VICTORY_GPU_PROFILE`: title threads waiting for the lock heap syncs
+    // hold.
+    let waiting = crate::gpuprof::armed().then(std::time::Instant::now);
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::gpuprof::since(crate::gpuprof::Part::MirrorWait, waiting);
     #[cfg(feature = "diagnostics")]
     drop(waited);
     let Some(&(_, _, at)) = heaps
@@ -168,7 +172,9 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
+    let waiting = crate::gpuprof::now();
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::gpuprof::since(crate::gpuprof::Part::SyncHeapsLockWait, waiting);
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };

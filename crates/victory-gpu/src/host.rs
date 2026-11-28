@@ -1058,6 +1058,10 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// `VICTORY_GPU_PROFILE`: where the work changes to another pipeline or
+    /// command, and the timestamp heap and read-back buffer for it.
+    prof: Mutex<crate::gpuprof::Segments>,
+    prof_stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -1094,6 +1098,72 @@ unsafe impl Sync for HostList {}
 pub(crate) fn warn_depth_bounds() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
+
+/// `VICTORY_GPU_PROFILE`: the lists writing a timestamp before and after a
+/// submission, where they are read back, and the ticks per second (GPU and
+/// QPC).
+struct ProfStamps {
+    begin: ID3D12CommandList,
+    end: ID3D12CommandList,
+    back: ID3D12Resource,
+    frequency: u64,
+    qpc_frequency: u64,
+    _keep: (ID3D12QueryHeap, ID3D12CommandAllocator),
+}
+
+// SAFETY: D3D12 objects are free-threaded; the lists only run under the
+// submission lock, one submission at a time.
+unsafe impl Send for ProfStamps {}
+// SAFETY: as above.
+unsafe impl Sync for ProfStamps {}
+
+/// A timestamp query heap of `count` and a read-back buffer for it.
+fn timestamp_heap(device: &ID3D12Device, count: u32) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: count, NodeMask: 0 }, &mut heap)
+            .ok()?;
+        device
+            .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
+/// `count` timestamps a finished list resolved into `back`.
+fn read_stamps(back: &ID3D12Resource, count: usize) -> Option<Vec<u64>> {
+    let mut data = std::ptr::null_mut();
+    let range = D3D12_RANGE { Begin: 0, End: count * 8 };
+    // SAFETY: a read-back buffer a finished list resolved into.
+    unsafe {
+        back.Map(0, Some(&range), Some(&mut data)).ok()?;
+        let s = std::slice::from_raw_parts(data.cast::<u64>(), count).to_vec();
+        back.Unmap(0, None);
+        Some(s)
+    }
+}
+
+/// The performance counter now, in its ticks.
+fn qpc() -> u64 {
+    let mut count = 0i64;
+    // SAFETY: a valid out pointer.
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut count) };
+    count as u64
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -1384,6 +1454,8 @@ impl Host {
                 memory_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                prof: Mutex::default(),
+                prof_stamps: OnceLock::new(),
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
@@ -1398,11 +1470,92 @@ impl Host {
         }
     }
 
+    /// `VICTORY_GPU_PROFILE`: the two lists writing a timestamp before and
+    /// after a submission's lists (made once; each runs again only after its
+    /// last run finished, every submission being waited for).
+    fn prof_stamps(&self) -> Option<&'static ProfStamps> {
+        static STAMPS: OnceLock<Option<ProfStamps>> = OnceLock::new();
+        STAMPS
+            .get_or_init(|| {
+                let (heap, back) = timestamp_heap(&self.device, 2)?;
+                // SAFETY: plain object creation and recording into our new
+                // lists.
+                unsafe {
+                    let frequency = self.queue.GetTimestampFrequency().ok()?;
+                    let mut qpc_frequency = 0i64;
+                    windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut qpc_frequency);
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                    let begin: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+                    begin.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    begin.Close().ok()?;
+                    let end: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+                    end.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    end.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                    end.Close().ok()?;
+                    Some(ProfStamps {
+                        begin: begin.cast().ok()?,
+                        end: end.cast().ok()?,
+                        back,
+                        frequency,
+                        qpc_frequency: qpc_frequency as u64,
+                        _keep: (heap, allocator),
+                    })
+                }
+            })
+            .as_ref()
+    }
+
+    /// `VICTORY_GPU_PROFILE`: a submission ran: its GPU busy time between
+    /// the timestamps, placed on the CPU's clock (QPC ticks when the lists
+    /// were queued and the wait began and ended), and its lists' GPU time
+    /// per pipeline.
+    fn prof_ran(&self, runs: &[&HostList], queued: u64, wait_from: u64, wait_to: u64) {
+        use crate::gpuprof::{Part, add};
+        let Some(stamps) = self.prof_stamps() else {
+            return;
+        };
+        if let Some(pair) = read_stamps(&stamps.back, 2)
+            && pair[1] >= pair[0]
+        {
+            add(Part::GpuBusy, crate::gpuprof::ticks_us(pair[1] - pair[0], stamps.frequency));
+            add(Part::Stamped, 1);
+            let (mut gpu, mut cpu) = (0u64, 0u64);
+            // SAFETY: valid out pointers.
+            if unsafe { self.queue.GetClockCalibration(&mut gpu, &mut cpu) }.is_ok() {
+                let us = |q: u64| q as f64 * 1e6 / stamps.qpc_frequency.max(1) as f64;
+                let on_cpu = |t: u64| crate::gpuprof::gpu_to_cpu_us(t, (gpu, cpu), stamps.frequency, stamps.qpc_frequency);
+                crate::gpuprof::placed(&crate::gpuprof::Placed {
+                    queued: us(queued),
+                    wait_from: us(wait_from),
+                    wait_to: us(wait_to),
+                    gpu_from: on_cpu(pair[0]),
+                    gpu_to: on_cpu(pair[1]),
+                });
+            }
+        }
+        // A submission may name a list twice: its time counts once.
+        let mut seen = std::collections::HashSet::new();
+        for list in runs {
+            if seen.insert(*list as *const HostList as usize) {
+                list.prof_attribute(stamps.frequency);
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // `VICTORY_GPU_PROFILE`: the submitting thread's time by part.
+        use crate::gpuprof::{Part as P, now as pnow, since as psince};
+        let waiting = pnow();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submission();
+        psince(P::LockWait, waiting);
+        let held_from = pnow();
+        crate::gpuprof::add(P::Submissions, 1);
         // Stage 1 classification: the submission's points in its stream.
         let _memclass = crate::memclass::submission(runs.len());
         let started = std::time::Instant::now();
@@ -1412,12 +1565,16 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        let part = pnow();
         crate::resource::evict_unused();
+        psince(P::Evict, part);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
+        let part = pnow();
         crate::descriptor::sync_heaps();
+        psince(P::SyncHeaps, part);
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
@@ -1451,9 +1608,11 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let part = pnow();
         let uploads = (!heaps.is_empty() || !textures.is_empty() || crate::resource::moves_pending())
             .then(|| crate::bindless::uploads(&heaps, &textures))
             .flatten();
+        psince(P::Uploads, part);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -1504,6 +1663,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let part = pnow();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1515,12 +1675,20 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        psince(P::Deferred, part);
         // Copies in the GPU's own memory: what changed goes up, ahead of
         // the lists on the queue; the bitmaps there come down behind them.
+        let part = pnow();
         let card_marks = crate::shadow::card_marks();
         let _carded = self.card_before(&card_marks);
         let card_marks_list = self.card_marks(&card_marks);
+        psince(P::Card, part);
         let prepared = std::time::Instant::now();
+        psince(P::Prep, held_from);
+        // `VICTORY_GPU_PROFILE`: timestamps before and after the lists, and
+        // when they were queued and waited for on the CPU's clock.
+        let prof = crate::gpuprof::enabled().then(|| self.prof_stamps()).flatten();
+        let (mut queued, mut wait_from, mut wait_to) = (0u64, 0u64, 0u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -1546,8 +1714,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             crate::memclass::point(crate::memclass::Point::Executed);
+            let part = pnow();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                if i == 0
+                    && let Some(stamps) = prof
+                {
+                    queued = qpc();
+                    self.queue.ExecuteCommandLists(&[Some(stamps.begin.clone())]);
+                }
                 self.queue.ExecuteCommandLists(group);
                 // Behind the last of the lists: the bitmaps come down from
                 // the GPU's memory.
@@ -1557,13 +1732,27 @@ impl Host {
                     self.queue.ExecuteCommandLists(&[Some(marks.clone())]);
                     marks_sent = true;
                 }
+                if i + 1 == groups.len()
+                    && let Some(stamps) = prof
+                {
+                    self.queue.ExecuteCommandLists(&[Some(stamps.end.clone())]);
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                psince(P::Queue, part);
                 match waited {
                     Ok(()) => {
+                        let part = pnow();
+                        if prof.is_some() && wait_from == 0 {
+                            wait_from = qpc();
+                        }
                         WaitForSingleObject(self.event, INFINITE);
+                        if prof.is_some() {
+                            wait_to = qpc();
+                        }
+                        psince(P::FenceWait, part);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -1596,6 +1785,9 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        if prof.is_some() && queued != 0 && wait_to != 0 {
+            self.prof_ran(runs, queued, wait_from, wait_to);
+        }
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -1619,6 +1811,8 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let back_from = pnow();
+        let part = pnow();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
@@ -1676,6 +1870,8 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        psince(P::BackChecks, part);
+        let part = pnow();
         // Of copies in the GPU's memory, what shaders wrote without marks
         // comes down first, for the snapshots' compares below.
         self.card_declared(runs);
@@ -1684,6 +1880,8 @@ impl Host {
         }
         crate::memclass::point(crate::memclass::Point::GpuDone);
         crate::shadow::copy_back_marks(&withheld, withholding);
+        psince(P::BackMarks, part);
+        let part = pnow();
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -1700,6 +1898,8 @@ impl Host {
                 crate::memory::drop_withheld(address, len);
             }
         }
+        psince(P::BackCopy, part);
+        let part = pnow();
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -1713,11 +1913,14 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        psince(P::BackAfter, part);
+        psince(P::Back, back_from);
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
+        psince(P::Execute, held_from);
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
@@ -2052,6 +2255,17 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         crate::indirect::end_window(self);
+        // `VICTORY_GPU_PROFILE`: the last segment ends here.
+        if crate::gpuprof::enabled()
+            && let Some((heap, back)) = self.prof_stamps()
+            && let Some(last) = self.prof.lock().unwrap_or_else(|e| e.into_inner()).close()
+        {
+            // SAFETY: an open list, our heap and read-back buffer.
+            unsafe {
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, last);
+                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, last + 1, back, 0);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -2077,6 +2291,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.prof.lock().unwrap_or_else(|e| e.into_inner()) = crate::gpuprof::Segments::default();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -2326,6 +2541,56 @@ impl HostList {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         if !targets.iter().any(|t| t.0 == resource) {
             targets.push((resource, by.to_owned()));
+        }
+    }
+
+    /// `VICTORY_GPU_PROFILE`: the host pipeline object `pso` named `name`
+    /// does the list's work from now on; a timestamp where the work changes.
+    pub(crate) fn prof_pipeline(&self, pso: usize, name: &str) {
+        if !crate::gpuprof::enabled() {
+            return;
+        }
+        let Some((heap, _)) = self.prof_stamps() else {
+            return;
+        };
+        if let Some(slot) = self.prof.lock().unwrap_or_else(|e| e.into_inner()).pipeline(pso, name) {
+            // SAFETY: an open list and our heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+        }
+    }
+
+    /// `VICTORY_GPU_PROFILE`: a command of the title's binding no pipeline
+    /// (`key`: one of `crate::gpuprof`'s specials) from now on; a timestamp
+    /// where the work changes.
+    pub(crate) fn prof_other(&self, key: u32) {
+        if !crate::gpuprof::enabled() {
+            return;
+        }
+        let Some((heap, _)) = self.prof_stamps() else {
+            return;
+        };
+        if let Some(slot) = self.prof.lock().unwrap_or_else(|e| e.into_inner()).other(key) {
+            // SAFETY: an open list and our heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+        }
+    }
+
+    /// `VICTORY_GPU_PROFILE`: the timestamp heap and read-back buffer for
+    /// the list's segments.
+    fn prof_stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        self.prof_stamps
+            .get_or_init(|| timestamp_heap(&host()?.device, crate::gpuprof::SLOTS))
+            .as_ref()
+    }
+
+    /// `VICTORY_GPU_PROFILE`: after the list ran, its GPU time per pipeline.
+    fn prof_attribute(&self, frequency: u64) {
+        let prof = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some(n), Some((_, back))) = (prof.resolved(), self.prof_stamps.get().and_then(Option::as_ref)) else {
+            return;
+        };
+        if let Some(stamps) = read_stamps(back, n) {
+            prof.attribute(&stamps, frequency);
         }
     }
 
@@ -3391,6 +3656,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         crate::memclass::frame_done();
+        crate::gpuprof::frame_done(video_memory);
         self.report_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
@@ -3415,6 +3681,7 @@ impl Meter {
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::gpuprof::summary();
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;

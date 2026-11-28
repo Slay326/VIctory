@@ -561,6 +561,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        list.prof_other(crate::gpuprof::BARRIER);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
         let mut host: Vec<Barrier> = barriers
@@ -648,6 +649,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        list.prof_other(crate::gpuprof::COPY);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -713,11 +715,13 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
+            // A texture read back into a buffer: timed as one in there.
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
+        list.prof_other(crate::gpuprof::COPY);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -814,6 +818,7 @@ static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex
 /// after its fence).
 #[cfg(windows)]
 fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src: &CopyLocation, source_box: *const [u32; 6]) {
+    list.prof_other(crate::gpuprof::READ_BACK);
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
     };
@@ -949,6 +954,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        list.prof_other(crate::gpuprof::RESOLVE);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_writes(list, dst);
@@ -1008,6 +1014,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        list.prof_other(crate::gpuprof::CLEAR);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1059,6 +1066,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        list.prof_other(crate::gpuprof::CLEAR);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1693,6 +1701,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
             list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
         }
+        list.prof_other(crate::gpuprof::BARRIER);
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.

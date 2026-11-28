@@ -228,7 +228,11 @@ fn this_thread() -> u32 {
 
 #[cfg(not(feature = "diagnostics"))]
 fn guards() -> Held {
+    // `VICTORY_GPU_PROFILE`: the wait (no allocation: the fault handler
+    // takes the lock).
+    let waiting = crate::gpuprof::armed().then(std::time::Instant::now);
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::gpuprof::guard_waited(waiting);
     GUARD_OWNER.store(this_thread(), Ordering::Relaxed);
     Held(guard)
 }
@@ -266,7 +270,11 @@ impl Drop for Held {
 #[track_caller]
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
+    // `VICTORY_GPU_PROFILE`: the wait (no allocation: the fault handler
+    // takes the lock).
+    let waiting = crate::gpuprof::armed().then(std::time::Instant::now);
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::gpuprof::guard_waited(waiting);
     GUARD_OWNER.store(this_thread(), Ordering::Relaxed);
     Held(Some(guard), std::time::Instant::now(), line)
 }

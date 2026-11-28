@@ -36,6 +36,8 @@ mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod gpuprof;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 #[cfg(windows)]
