@@ -385,9 +385,9 @@ impl Aabb {
     pub const EMPTY: Aabb = Aabb { lo: [f64::INFINITY; 3], hi: [f64::NEG_INFINITY; 3] };
 
     pub fn add(&mut self, p: V3) {
-        for a in 0..3 {
-            self.lo[a] = self.lo[a].min(p[a]);
-            self.hi[a] = self.hi[a].max(p[a]);
+        for (a, x) in p.into_iter().enumerate() {
+            self.lo[a] = self.lo[a].min(x);
+            self.hi[a] = self.hi[a].max(x);
         }
     }
     pub fn join(&mut self, o: &Aabb) {
@@ -772,7 +772,7 @@ impl<'m, M: Memory> Scene<'m, M> {
             let ty = p & 7;
             if ty == 6 {
                 let off = node(base, p).wrapping_sub(base + list);
-                if off % 128 == 0 && off / 128 < u64::from(count) {
+                if off.is_multiple_of(128) && off / 128 < u64::from(count) {
                     s.reached[(off / 128) as usize] += 1;
                 }
                 continue;
@@ -880,7 +880,7 @@ impl<'m, M: Memory> Scene<'m, M> {
                 6 if level.is_none() => {
                     let off = node(base, p).wrapping_sub(self.base + u64::from(self.header[13]));
                     let index = (off / 128) as usize;
-                    if off % 128 == 0 && index < self.instances.len() && self.instances[index].enter {
+                    if off.is_multiple_of(128) && index < self.instances.len() && self.instances[index].enter {
                         stack.push((self.instances[index].root, Some(index)));
                         deepest = deepest.max(stack.len());
                     }
@@ -1028,7 +1028,7 @@ impl<'m, M: Memory> Scene<'m, M> {
                 all.join(&b[k]);
                 if child & 7 == 6 {
                     let off = node(self.base, child).wrapping_sub(self.base + u64::from(self.header[13]));
-                    let Some(i) = self.instances.get((off / 128) as usize).filter(|_| off % 128 == 0) else {
+                    let Some(i) = self.instances.get((off / 128) as usize).filter(|_| off.is_multiple_of(128)) else {
                         c.top_outside += 1;
                         continue;
                     };

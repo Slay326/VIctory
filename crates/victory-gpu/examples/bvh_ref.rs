@@ -151,12 +151,7 @@ fn main() -> anyhow::Result<()> {
         let rows = compare(&near, &far, &list_rays, &u52.post);
         let sum = Summary::of(&rows);
         println!(" dispatch {k} rays:\n{sum}");
-        let mut shown = 0;
-        for r in rows.iter().filter(|r| r.class.is_some()) {
-            if shown == list {
-                break;
-            }
-            shown += 1;
+        for r in rows.iter().filter(|r| r.class.is_some()).take(list) {
             println!(
                 "   thread {} cascade {} probe {} origin ({:.2}, {:.2}, {:.2}): triangles {:?}, tree {:?}, game {:?}, {:?}, met {:?}",
                 r.ray.thread, r.ray.cascade, r.ray.probe, r.ray.origin[0], r.ray.origin[1], r.ray.origin[2], r.triangles, r.tree, r.game, r.class, r.met
