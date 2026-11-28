@@ -584,6 +584,46 @@ impl Shadow {
         Some((from, fetched))
     }
 
+    /// The BVH builder capture (`crate::bvh_replay`): of each 64 KiB page
+    /// at `pages` (title addresses), the copy's bytes the GPU sees (cut to
+    /// the copy), where they start, and for a copy in the GPU's memory a
+    /// hash of its CPU side (else 0). One fetch for all pages; the CPU side
+    /// is left as it was. Only while no submission is on the GPU.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn capture_pages(&self, pages: &[usize]) -> Vec<(usize, Vec<u8>, u64)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let cut: Vec<(usize, usize)> = pages
+            .iter()
+            .map(|&p| (p.max(start), (p + PAGE).min(end)))
+            .filter(|(a, b)| a < b)
+            .collect();
+        let read = |a: usize, b: usize| -> Vec<u8> {
+            // SAFETY: inside the mapping; only the submitting thread writes
+            // it, and the GPU is done.
+            unsafe { std::slice::from_raw_parts(self.data.add(a - start), b - a) }.to_vec()
+        };
+        if self.card.is_none() {
+            return cut.iter().map(|&(a, b)| (a, read(a, b), 0)).collect();
+        }
+        let before: Vec<Vec<u8>> = cut.iter().map(|&(a, b)| read(a, b)).collect();
+        let ranges: Vec<(&Shadow, usize, usize)> = cut.iter().map(|&(a, b)| (self, a - start, b - start)).collect();
+        crate::host::card_fetch(&ranges);
+        let out = cut
+            .iter()
+            .zip(&before)
+            .map(|(&(a, b), cpu)| {
+                let gpu = read(a, b);
+                let hash = u64::from_le_bytes(blake3::hash(cpu).as_bytes()[..8].try_into().unwrap_or([0; 8]));
+                (a, gpu, hash)
+            })
+            .collect();
+        for (&(a, _), cpu) in cut.iter().zip(&before) {
+            // SAFETY: as above; the fetch is done.
+            unsafe { std::ptr::copy_nonoverlapping(cpu.as_ptr(), self.data.add(a - start), cpu.len()) };
+        }
+        out
+    }
+
     /// Whether the title wrote the page at `page` since the copy took it
     /// (or it is to be taken again); None for memory not tracked.
     pub(crate) fn title_changed(&self, page: usize) -> Option<bool> {
@@ -2174,6 +2214,36 @@ impl Arena {
         }
         free.insert(at, n);
     }
+}
+
+/// `bytes` go into title memory at `at` where they differ from what is
+/// there, by 32-byte lines, each 64 KiB page's part on its own
+/// (`crate::unpacked`: the part of a structure the GPU rewrote in place
+/// that no copy holds, the arena's bytes). Written at the title's address:
+/// a guard there opens as for any write of ours. Returns the bytes of the
+/// lines written, and whether every part could be read and written.
+pub(crate) fn put_bytes(at: usize, bytes: &[u8]) -> (usize, bool) {
+    let (mut written, mut all) = (0, true);
+    TITLE.with(|title| {
+        let mut title = title.borrow_mut();
+        let mut o = 0;
+        while o < bytes.len() {
+            let a = at + o;
+            let n = (PAGE - a % PAGE).min(bytes.len() - o);
+            let host = &bytes[o..o + n];
+            let title = &mut title[..n];
+            o += n;
+            if !crate::host::read_into(a as *const u8, title) {
+                all = false;
+                continue;
+            }
+            let runs = differing_rows(host, title);
+            if write_runs_by(a, host, &runs, None) != Put::Nothing {
+                written += runs.iter().map(|r| r.1 - r.0).sum::<usize>();
+            }
+        }
+    });
+    (written, all)
 }
 
 /// The 64 bytes at each title address as shaders left them in the copy

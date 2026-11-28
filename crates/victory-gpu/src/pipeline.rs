@@ -201,6 +201,13 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The container as the title passed it (senior 115: the reader capture
+    /// saves it, for the harness to translate afresh with diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -450,6 +457,23 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
+}
+
+/// Diagnostics (senior 82, DispatchX log): the thread-group size of the
+/// pipeline's compute program, read from its container.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn compute_threads(this: This) -> Option<[u32; 3]> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).shaders.iter().find_map(|s| {
+        let c = victory_shader::Container::parse(&s.container).ok()?;
+        let part = c.part(victory_shader::FourCC::DXIL).or(c.part(victory_shader::FourCC::ACCC))?;
+        victory_shader::native_programs(part.data).ok()?.into_iter().find_map(|p| match p.io {
+            victory_shader::native::StageIo::Cs(io) => Some(io.threads),
+            _ => None,
+        })
+    })
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).

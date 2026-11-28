@@ -54,6 +54,14 @@ pub(crate) struct IndexView {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// With `VICTORY_BVH_CAPTURE`: the root arguments the last compute
+    /// bind set (`crate::bvh_replay`).
+    #[cfg(feature = "diagnostics")]
+    bvh_args: Vec<crate::bvh_replay::format::RootArg>,
+    /// With `VICTORY_BVH_CAPTURE_READER`: where the table views of
+    /// `bvh_args` are (senior 115).
+    #[cfg(feature = "diagnostics")]
+    bvh_views: Vec<crate::bvh_replay::capture::ViewSource>,
     pipeline: usize,
     /// The threads in x the dispatch being bound runs, for a program
     /// translated to take a thread limit ([`State::dispatch_x`]); none for
@@ -247,6 +255,12 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// The title pipeline set last (diagnostics: the DispatchX log).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bound_pipeline(&self) -> usize {
+        self.pipeline
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -317,6 +331,12 @@ impl State {
     /// title list's own), texture states and twins (each segment has its
     /// own, made from the real states at its submission). Clears and copies
     /// are commands, recorded once in the segment they belong to.
+    /// The bound pipeline (the title's object).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pipeline(&self) -> usize {
+        self.pipeline
+    }
+
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
@@ -624,6 +644,15 @@ impl State {
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
         let _builder = list.writer_is_builder(crate::arena::enabled() && crate::pipeline::is_builder(self.pipeline as This));
         let l = &list.list;
+        // `VICTORY_BVH_CAPTURE`: what each root parameter gets, by meaning.
+        #[cfg(feature = "diagnostics")]
+        use crate::bvh_replay::format::{Dword, DwordKind, RootArg, Special};
+        #[cfg(feature = "diagnostics")]
+        let capturing = compute && crate::bvh_replay::capture::enabled();
+        #[cfg(feature = "diagnostics")]
+        let mut cap: Vec<RootArg> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut cap_views: Vec<crate::bvh_replay::capture::ViewSource> = Vec::new();
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
         if list.take_rebind() {
@@ -687,6 +716,11 @@ impl State {
                 if compute {
                     l.SetComputeRootShaderResourceView(table_param, table);
                     l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
+                    #[cfg(feature = "diagnostics")]
+                    if capturing {
+                        cap.push(RootArg::Special { param: table_param, what: Special::MarksTable });
+                        cap.push(RootArg::Special { param: bitmap_param, what: Special::MarksBitmap });
+                    }
                 } else {
                     l.SetGraphicsRootShaderResourceView(table_param, table);
                     l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
@@ -755,6 +789,8 @@ impl State {
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
+                #[cfg(feature = "diagnostics")]
+                let mut kinds = vec![(DwordKind::Plain, 0u64); dwords as usize];
                 // `VICTORY_BVH_ARENA`: the builder's root descriptors into
                 // memory no copy holds (its pools) get arena pages before
                 // this submission runs.
@@ -787,6 +823,25 @@ impl State {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    #[cfg(feature = "diagnostics")]
+                    if capturing {
+                        let address = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(&Root::View(a)) => a,
+                            _ => 0,
+                        };
+                        kinds[u.index as usize] = if fresh.is_some() || u.root == RootType::Table {
+                            (DwordKind::TableOffset, 0)
+                        } else if takes_group_offset(t.group_x_offset, u) {
+                            (DwordKind::GroupXOffset, 0)
+                        } else if is_root_view_offset(u) {
+                            (DwordKind::RootViewOffset, address)
+                        } else if is_root_view(u) {
+                            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
+                            (if uav { DwordKind::RootViewUav } else { DwordKind::RootViewSrv }, address)
+                        } else {
+                            (DwordKind::Plain, 0)
+                        };
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         // Set by the split dispatch's signature (`execute_indirect`).
@@ -830,6 +885,25 @@ impl State {
                         {
                             list.note_unpacked(source, destination);
                         }
+                        // `VICTORY_BVH_GT` (diagnostics, off by default): the
+                        // rehydrating stage's centre values per bottom level.
+                        if crate::bvh_gt::target().is_some() {
+                            crate::bvh_gt::note_bind(&p.name, &values);
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        if capturing {
+                            let dwords = values
+                                .iter()
+                                .zip(&kinds)
+                                .map(|(&value, &(kind, address))| Dword { kind, value, address })
+                                .collect();
+                            cap.push(RootArg::Constants { param, dwords });
+                            // `VICTORY_BVH_CAPTURE_READER` (senior 115): the
+                            // captured program's tables with their views.
+                            if crate::bvh_replay::capture::wants_tables(p) {
+                                self.capture_tables(t, compute, param, &values, &mut cap, &mut cap_views);
+                            }
+                        }
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
@@ -855,6 +929,10 @@ impl State {
                             let gpu = table.GetGPUVirtualAddress();
                             if compute {
                                 l.SetComputeRootShaderResourceView(param, gpu);
+                                #[cfg(feature = "diagnostics")]
+                                if capturing {
+                                    cap.push(RootArg::Special { param, what: Special::ViewStrides });
+                                }
                             } else {
                                 l.SetGraphicsRootShaderResourceView(param, gpu);
                             }
@@ -869,6 +947,10 @@ impl State {
                     let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
                         continue;
                     };
+                    #[cfg(feature = "diagnostics")]
+                    if capturing {
+                        cap.push(RootArg::View { param, kind, address: *address });
+                    }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
                         match (compute, kind) {
@@ -892,6 +974,10 @@ impl State {
                     not_run("view addresses without a view heap");
                     return false;
                 };
+                #[cfg(feature = "diagnostics")]
+                if capturing {
+                    cap.push(RootArg::Special { param, what: Special::ViewAddresses });
+                }
                 // SAFETY: an open list; the heap's buffer lives with the heap.
                 unsafe {
                     if compute {
@@ -908,6 +994,13 @@ impl State {
                     return false;
                 };
                 crate::memory::note_use(&p.name);
+                #[cfg(feature = "diagnostics")]
+                if capturing {
+                    cap.push(RootArg::Special { param, what: Special::MemoryTable });
+                    if let Some(dirty_param) = stage.memory_dirty {
+                        cap.push(RootArg::Special { param: dirty_param, what: Special::MemoryDirty });
+                    }
+                }
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {
@@ -937,7 +1030,100 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
+        #[cfg(feature = "diagnostics")]
+        if capturing {
+            self.bvh_args = cap;
+            self.bvh_views = cap_views;
+        }
         true
+    }
+
+    /// `VICTORY_BVH_CAPTURE_READER` (diagnostics, senior 115): one
+    /// [`RootArg::Table`] per table slot of the stage `t` (its root-constant
+    /// dword in parameter `param` held `values`), with the buffer views the
+    /// program uses there as the host makes them
+    /// ([`crate::descriptor::host::buffer_plan`]); where their bytes are
+    /// goes to `sources`. A view the plan cannot describe is kept with no
+    /// elements, so that the replay refuses the capture.
+    #[cfg(feature = "diagnostics")]
+    fn capture_tables(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        param: u32,
+        values: &[u32],
+        cap: &mut Vec<crate::bvh_replay::format::RootArg>,
+        sources: &mut Vec<crate::bvh_replay::capture::ViewSource>,
+    ) {
+        use crate::bvh_replay::format::{RootArg, TableView};
+        let mut slots: Vec<u8> = Vec::new();
+        for u in t.host.user_data.iter().filter(|u| u.root == RootType::Table) {
+            if slots.contains(&u.slot) {
+                continue;
+            }
+            slots.push(u.slot);
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let arg = cap.len();
+            let mut views = Vec::new();
+            for r in t.used.iter().filter(|r| r.root == RootType::Table && r.slot == u.slot) {
+                let kind = match r.kind {
+                    ResourceType::Cbv => 0,
+                    ResourceType::Srv => 1,
+                    ResourceType::Uav => 2,
+                    _ => continue,
+                };
+                let mut tv = TableView { kind, register: r.lower_bound, dw: r.table_offset_dwords, ..TableView::default() };
+                let view = crate::descriptor::view(table + u64::from(r.table_offset_dwords) * 4);
+                // The address the view-address table holds for it, also for
+                // a view the plan cannot describe (f607780a's t355: only its
+                // address is read, the top level's).
+                tv.title = view
+                    .as_ref()
+                    .and_then(crate::descriptor::host::buffer_range)
+                    .map_or(0, |(a, _)| a);
+                // An acceleration structure view (dimension 11, no resource):
+                // its location, as the view addresses hold it since
+                // fix/as-srv-address (unless VICTORY_AS_SRV_ADDRESS=0).
+                let words: Option<&[u32]> = match view.as_ref() {
+                    Some(View::Shader(_, Some(d))) => Some(&d[..]),
+                    Some(View::Placed(false, _, d)) => Some(&d[..]),
+                    _ => None,
+                };
+                if let Some(d) = words
+                    && d.get(1) == Some(&11)
+                    && std::env::var_os("VICTORY_AS_SRV_ADDRESS").is_none_or(|v| v != "0")
+                {
+                    tv.title = u64::from(d[4]) | u64::from(d[5]) << 32;
+                }
+                if let Some(plan) = view.as_ref().and_then(crate::descriptor::host::buffer_plan) {
+                    tv.title = plan.title;
+                    tv.address = plan.address();
+                    tv.format = plan.format;
+                    tv.count = plan.count;
+                    tv.stride = plan.stride;
+                    tv.raw = plan.raw;
+                    tv.stride_word = plan.stride_word;
+                    sources.push(crate::bvh_replay::capture::ViewSource {
+                        arg,
+                        view: views.len(),
+                        copy: plan.copy.clone(),
+                        address: tv.address,
+                        len: tv.len(),
+                        unordered: kind == 2,
+                    });
+                }
+                views.push(tv);
+            }
+            cap.push(RootArg::Table {
+                param,
+                index: u.index,
+                slot: u32::from(u.slot),
+                value: values.get(u.index as usize).copied().unwrap_or(0),
+                views,
+            });
+        }
     }
 
     /// The heap index of a raw view (`uav`: unordered access) of the host
@@ -1211,6 +1397,23 @@ impl State {
             && let Some((_, map)) = &self.memory
         {
             map.note_builder();
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::reader::plan().is_some() {
+            self.note_reader(list, p, None);
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::bvh_replay::capture::enabled() {
+            let builder = crate::pipeline::is_builder(self.pipeline as This);
+            crate::bvh_replay::capture::record(
+                list,
+                p,
+                builder,
+                builder && crate::bvh_gt::uav_barrier(),
+                crate::bvh_replay::format::Groups::Direct([x, y, z]),
+                std::mem::take(&mut self.bvh_args),
+                std::mem::take(&mut self.bvh_views),
+            );
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
@@ -1532,6 +1735,98 @@ impl State {
                 list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len)));
             }
         }
+    }
+
+    /// With `VICTORY_READER_CAPTURE` and the bound program the reader's
+    /// (`crate::bvh_replay::reader`): its table views u52, t373 and t379
+    /// (by kind and register), the indirect arguments at `arguments`
+    /// (`stride` bytes, none for a direct dispatch) and the root constants,
+    /// noted on the list for after its fence.
+    #[cfg(feature = "diagnostics")]
+    fn note_reader(&self, list: &HostList, p: &HostPipeline, arguments: Option<(u64, u32)>) {
+        use crate::bvh_replay::reader;
+        let Some(stage) = p.stages.first() else { return };
+        if !reader::wanted_now(&stage.shader.hash) {
+            return;
+        }
+        let Some(plan) = reader::plan() else { return };
+        let mut ranges = Vec::new();
+        let mut used = Vec::new();
+        for u in &stage.translated().used {
+            let uav = u.kind == ResourceType::Uav;
+            used.push(format!("{:?} r{} slot {} dw {}", u.kind, u.lower_bound, u.slot, u.table_offset_dwords));
+            // senior 105: constant buffers by register (b3: N of u52's index).
+            if u.kind == ResourceType::Cbv && plan.cbvs.contains(&u.lower_bound) {
+                if let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot)))
+                    && let Some(crate::descriptor::View::Constant(address, size)) =
+                        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                {
+                    let len = u64::from(size);
+                    ranges.push(reader::Range {
+                        name: format!("b{}", u.lower_bound),
+                        address,
+                        len,
+                        format: 0,
+                        stride: 4,
+                        copy: crate::shadow::find(address, len),
+                    });
+                }
+                continue;
+            }
+            if !plan.views.contains(&(uav, u.lower_bound)) || !(uav || u.kind == ResourceType::Srv) {
+                continue;
+            }
+            let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot))) else {
+                continue;
+            };
+            let name = format!("{}{}", if uav { 'u' } else { 't' }, u.lower_bound);
+            let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                continue;
+            };
+            let (format, stride) = crate::descriptor::host::buffer_format(&view);
+            let Some((copy, address, len)) = crate::descriptor::host::view_copy(&view) else {
+                // A range with no copy: noted, so that the self-check fails.
+                if let Some((address, len)) = crate::descriptor::host::buffer_range(&view) {
+                    ranges.push(reader::Range { name, address, len, format, stride, copy: None });
+                }
+                continue;
+            };
+            // The view's own copy (off its copy's elements) is not the one
+            // title memory goes back from: that one too, apart.
+            if let Some(main) = crate::shadow::find(address, len).filter(|m| !std::sync::Arc::ptr_eq(m, &copy)) {
+                let name = format!("{name}m");
+                ranges.push(reader::Range { name, address, len, format, stride, copy: Some(main) });
+            }
+            ranges.push(reader::Range { name, address, len, format, stride, copy: Some(copy) });
+        }
+        if let Some((address, stride)) = arguments {
+            let len = u64::from(stride.max(12));
+            ranges.push(reader::Range {
+                name: "args".into(),
+                address,
+                len,
+                format: 0,
+                stride: 4,
+                copy: crate::shadow::find(address, len),
+            });
+        }
+        let constants = self
+            .roots_ref(true)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Root::Constants(v) => Some((i as u32, v.clone())),
+                _ => None,
+            })
+            .collect();
+        list.push_reader(reader::Recorded {
+            shader: stage.shader.hash.clone(),
+            pipeline: p.name.clone(),
+            indirect: arguments.is_some(),
+            ranges,
+            constants,
+            used,
+        });
     }
 
     /// With `VICTORY_DUMP_AFTER` naming one of the bound pipeline's shader
@@ -1997,6 +2292,34 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH
+            && crate::bvh_replay::capture::enabled()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            crate::bvh_replay::capture::record(
+                list,
+                p,
+                crate::pipeline::is_builder(self.pipeline as This),
+                false,
+                crate::bvh_replay::format::Groups::Indirect {
+                    stride,
+                    arguments: vec![[kind, u32::from(split.is_some()), 0, 0]],
+                    args: arguments,
+                    count: count.unwrap_or(0),
+                    most: max,
+                },
+                std::mem::take(&mut self.bvh_args),
+                std::mem::take(&mut self.bvh_views),
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH
+            && crate::bvh_replay::reader::plan().is_some()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            self.note_reader(list, p, Some((arguments, stride)));
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -2078,14 +2401,14 @@ fn group_offset(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 /// whose x is groups; PC 2 flag log, 27.11.).
 // shortcut: the bit's meaning is read off the title's dispatches, not a
 // header; the other bits (0x20 in all of them) are not looked at.
-const X_IN_GROUPS: u32 = 0x8000;
+pub(crate) const X_IN_GROUPS: u32 = 0x8000;
 
 /// What a `DispatchX` of `x` with `flags` runs on the host: the groups in
 /// x, and the thread limit its program takes (none: every thread of them).
 /// `group` is the program's group size in x where it is translated to take
 /// a thread limit; other programs, and dispatches whose x counts groups,
 /// run x groups as they are.
-fn x_groups(flags: u32, x: u32, group: Option<u32>) -> (u32, Option<u32>) {
+pub(crate) fn x_groups(flags: u32, x: u32, group: Option<u32>) -> (u32, Option<u32>) {
     match group {
         Some(group) if flags & X_IN_GROUPS == 0 && group != 0 => (x.div_ceil(group), Some(x)),
         _ => (x, None),
