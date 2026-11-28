@@ -1270,8 +1270,9 @@ mod tests {
         pub(super) const ROLE: &str = "VICTORY_TEST_STATIC_SAMPLERS";
         pub(super) const DIR_VAR: &str = "VICTORY_TEST_STATIC_SAMPLERS_DIR";
 
-        /// A 2x1 texture of 0 and 1, then the probe's three samples of it
-        /// at u = 0.375 through its point, linear and trilinear sampler.
+        /// A 2x1 texture of 0 and 1, then the probe's four samples of it
+        /// at u = 0.375 through its point, linear and trilinear sampler, and
+        /// a bilinear LEQUAL comparison against 0.5 (as a shadow map is read).
         const SOURCE: &str = "
             RWTexture2D<float> lut : register(u0);
             Texture2D<float> tex : register(t0);
@@ -1279,15 +1280,20 @@ mod tests {
             SamplerState point_ : register(s0);
             SamplerState linear_ : register(s1);
             SamplerState trilinear : register(s2);
+            SamplerComparisonState less_equal : register(s3);
             [numthreads(2, 1, 1)] void fill(uint3 id : SV_DispatchThreadID) { lut[id.xy] = id.x; }
             [numthreads(1, 1, 1)] void probe() {
                 float2 uv = float2(0.375, 0.5);
-                result.Store3(0, asuint(float3(tex.SampleLevel(point_, uv, 0),
-                    tex.SampleLevel(linear_, uv, 0), tex.SampleLevel(trilinear, uv, 0))));
+                result.Store4(0, asuint(float4(tex.SampleLevel(point_, uv, 0),
+                    tex.SampleLevel(linear_, uv, 0), tex.SampleLevel(trilinear, uv, 0),
+                    tex.SampleCmpLevelZero(less_equal, uv, 0.5))));
             }";
-        /// What the three samples are: the texel left of 0.375, and a
-        /// quarter of the way to the right one.
-        const EXPECTED: [f32; 3] = [0.0, 0.25, 0.25];
+        /// What the four samples are: the texel left of 0.375, a quarter of
+        /// the way to the right one, and for the comparison a quarter of the
+        /// right texel's pass (0.5 <= 1) and none of the left one's (0.5 <= 0).
+        const EXPECTED: [f32; 4] = [0.0, 0.25, 0.25, 0.25];
+        /// The probe's static samplers.
+        const PROBE_SAMPLERS: usize = 4;
         /// Other static samplers the later run makes first.
         const OTHERS: u32 = 10;
         /// The probe samplers' greatest LOD: another one makes other
@@ -1343,7 +1349,7 @@ mod tests {
                     assert!(made, "a first run loaded the probe");
                     store_and_save(&dir);
                     if ordered {
-                        assert_eq!(lines(&list), 3, "the probe's samplers listed");
+                        assert_eq!(lines(&list), PROBE_SAMPLERS, "the probe's samplers listed");
                     }
                 }
                 "load" | "load lost" | "load unprimed" => {
@@ -1352,7 +1358,7 @@ mod tests {
                         ("load", true) => {
                             check(values);
                             assert!(!made, "the probe was made again, not loaded");
-                            assert_eq!(lines(&list), 3 + OTHERS as usize, "the others appended");
+                            assert_eq!(lines(&list), PROBE_SAMPLERS + OTHERS as usize, "the others appended");
                         }
                         ("load lost", true) => {
                             check(values);
@@ -1360,8 +1366,9 @@ mod tests {
                         }
                         ("load unprimed", true) => {
                             assert!(!made, "the control did not load the probe");
-                            println!("sampled (point, linear, trilinear), control: {values:?}");
+                            println!("sampled (point, linear, trilinear, LEQUAL), control: {values:?}");
                             assert_ne!(values, EXPECTED, "the control sampled right without priming");
+                            assert!((values[3] - EXPECTED[3]).abs() >= 1e-3, "the control's LEQUAL comparison sampled right without priming: {values:?}");
                         }
                         // Without the order: such a pipeline is made on NVIDIA.
                         (_, false) => {
@@ -1377,7 +1384,7 @@ mod tests {
                     assert!(made, "a probe with new samplers was loaded");
                     store_and_save(&dir);
                     if ordered {
-                        assert_eq!(lines(&list), 3 + OTHERS as usize + 3, "the new samplers appended");
+                        assert_eq!(lines(&list), PROBE_SAMPLERS + OTHERS as usize + PROBE_SAMPLERS, "the new samplers appended");
                     }
                 }
                 "load appended" => {
@@ -1409,7 +1416,7 @@ mod tests {
 
         /// The probe with its samplers' greatest LOD `max_lod`, after
         /// `_others`: whether it was made (else loaded), and its samples.
-        fn probe(device: &ID3D12Device, max_lod: f32, _others: &[ID3D12RootSignature]) -> (bool, [f32; 3]) {
+        fn probe(device: &ID3D12Device, max_lod: f32, _others: &[ID3D12RootSignature]) -> (bool, [f32; 4]) {
             let (root, blob, unguarded) = root(device, max_lod);
             let code = fxc(windows::core::s!("probe"));
             let loaded = LOADED.load(Ordering::Relaxed);
@@ -1517,6 +1524,10 @@ mod tests {
                 sampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT, 0.0, max_lod),
                 sampler(1, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT, 0.0, max_lod),
                 sampler(2, D3D12_FILTER_MIN_MAG_MIP_LINEAR, 0.0, max_lod),
+                D3D12_STATIC_SAMPLER_DESC {
+                    ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                    ..sampler(3, D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, 0.0, max_lod)
+                },
             ];
             let (root, mut blob, order) =
                 root_signature(device, &params, &samplers, true).expect("the probe's root signature");
@@ -1548,7 +1559,7 @@ mod tests {
         }
 
         /// The three samples `pso` takes.
-        fn sample(device: &ID3D12Device, root: &ID3D12RootSignature, pso: &ID3D12PipelineState) -> [f32; 3] {
+        fn sample(device: &ID3D12Device, root: &ID3D12RootSignature, pso: &ID3D12PipelineState) -> [f32; 4] {
             let fill_code = fxc(windows::core::s!("fill"));
             // SAFETY: plain D3D12 object creation and one list's commands on
             // live objects, read back once the fence says the GPU is done.
@@ -1677,15 +1688,15 @@ mod tests {
                 CloseHandle(event).unwrap();
                 device.GetDeviceRemovedReason().expect("the device is not removed");
                 let mut mapped = std::ptr::null_mut();
-                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 12 }), Some(&mut mapped)).unwrap();
-                let values = mapped.cast::<[f32; 3]>().read();
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut mapped)).unwrap();
+                let values = mapped.cast::<[f32; 4]>().read();
                 readback.Unmap(0, Some(&D3D12_RANGE::default()));
                 values
             }
         }
 
-        fn check(values: [f32; 3]) {
-            println!("sampled (point, linear, trilinear): {values:?}, expected {EXPECTED:?}");
+        fn check(values: [f32; 4]) {
+            println!("sampled (point, linear, trilinear, LEQUAL): {values:?}, expected {EXPECTED:?}");
             for (got, want) in values.into_iter().zip(EXPECTED) {
                 assert!((got - want).abs() < 1e-3, "sampled {values:?}, not {EXPECTED:?}");
             }
