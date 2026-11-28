@@ -446,12 +446,16 @@ fn retake_dropped() {
 /// unpacking dispatches ran in frames that missed some page, so keeping
 /// only what frames without a miss wrote would keep little).
 ///
-/// A kept page is the GPU's alone until the title writes it:
-/// * no retake reaches it ([`drop_withheld`], whole declared ranges too);
-/// * nothing of it goes into title memory by comparing the copy with title
-///   memory (a later copy-back of the page would carry the kept bytes along:
-///   run 162252 with `VICTORY_BVH_ARENA_KEEP`), so later writes to it stay
-///   in the copy as well;
+/// A kept page is the GPU's alone until the title writes it, in the copy
+/// the builder wrote (its keeper):
+/// * no retake reaches it there ([`drop_withheld`], whole declared ranges
+///   too); the other copies holding the page are retaken as ever (what was
+///   withheld of them and stayed would go into title memory with their next
+///   copy-back of the page);
+/// * nothing of it goes into title memory by comparing the keeper with
+///   title memory (a later copy-back of the page would carry the kept bytes
+///   along: run 162252 with `VICTORY_BVH_ARENA_KEEP`), so later writes to
+///   it stay in the copy as well;
 /// * a title write ends it: the copy takes the page from title memory at
 ///   its next refresh, as any page the title wrote.
 // shortcut: the copy takes a page the title wrote whole, over what shaders
@@ -474,12 +478,14 @@ fn keeps_at(level: u8, missed: bool) -> bool {
     }
 }
 
-/// The kept pages ([`keeps_pages`]; page numbers), and since the last frame
-/// line: pages that became kept, kept pages a copy took from title memory
-/// again (the title wrote them), copy-backs not made, retakes not made.
+/// The kept pages ([`keeps_pages`]; page numbers) with the copy each is
+/// kept in (never made alive from here: a copy's last holder is not us) and
+/// its tracker, and since the last frame line: pages that became kept, kept
+/// pages their copy took from title memory again (the title wrote them) or
+/// whose copy is gone, copy-backs not made, retakes not made.
 #[derive(Default)]
 struct Kept {
-    pages: std::collections::BTreeSet<usize>,
+    pages: std::collections::BTreeMap<usize, (std::sync::Weak<Shadow>, crate::watch::Keeper)>,
     entered: u64,
     ended: u64,
     refused: u64,
@@ -495,16 +501,21 @@ fn kept<R>(f: impl FnOnce(&mut Kept) -> R) -> R {
 }
 
 /// The builder's list wrote the 64 KiB page at `address` in `copy`, and the
-/// write does not go into title memory: the page is kept, if the copy is a
-/// large one and the title has not written the page since the copy took it
-/// (then the copy takes the title's bytes at its next refresh anyway). True
-/// if the page is kept now.
-pub(crate) fn keep_page(copy: &Shadow, address: usize) -> bool {
-    if copy.range().1 <= crate::arena::BACK || copy.title_changed(address) == Some(true) {
+/// write does not go into title memory: the page is kept in that copy, if
+/// it is a large one of tracked memory and the title has not written the
+/// page since the copy took it (then the copy takes the title's bytes at
+/// its next refresh anyway; a copy of memory not tracked takes them at
+/// every use). True if the page is kept now.
+pub(crate) fn keep_page(copy: &Arc<Shadow>, address: usize) -> bool {
+    if copy.range().1 <= crate::arena::BACK || copy.title_changed(address) != Some(false) {
         return false;
     }
+    let Some(keeper) = copy.keeper() else {
+        return false;
+    };
     kept(|k| {
-        if k.pages.insert(address / crate::watch::PAGE) {
+        let before = k.pages.insert(address / crate::watch::PAGE, (Arc::downgrade(copy), keeper));
+        if !before.is_some_and(|(c, _)| std::ptr::eq(c.as_ptr(), Arc::as_ptr(copy))) {
             k.entered += 1;
         }
     });
@@ -515,31 +526,37 @@ pub(crate) fn keep_page(copy: &Shadow, address: usize) -> bool {
 /// Whether the 64 KiB page at `address` is kept.
 #[cfg(test)]
 pub(crate) fn kept_page(address: usize) -> bool {
-    KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) && kept(|k| k.pages.contains(&(address / crate::watch::PAGE)))
+    KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) && kept(|k| k.pages.contains_key(&(address / crate::watch::PAGE)))
 }
 
-/// [`kept_page`] for a copy-back of the page out of a copy of `len` bytes,
-/// which is not made then (counted). Small copies hold no kept writes.
-pub(crate) fn kept_from_title(len: u64, address: usize) -> bool {
-    if len <= crate::arena::BACK || !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) {
+/// Whether the page at `address` is kept in `copy`: a copy-back of the page
+/// out of it is not made then (counted). Small copies hold no kept writes.
+pub(crate) fn kept_from_title(copy: &Shadow, address: usize) -> bool {
+    if copy.range().1 <= crate::arena::BACK || !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) {
         return false;
     }
     kept(|k| {
-        let held = k.pages.contains(&(address / crate::watch::PAGE));
+        let held = k.pages.get(&(address / crate::watch::PAGE)).is_some_and(|(c, _)| std::ptr::eq(c.as_ptr(), copy));
         k.refused += u64::from(held);
         held
     })
 }
 
-/// A large copy took `[from, to)` from title memory (the title wrote
-/// there): its pages are kept no longer.
-pub(crate) fn kept_taken(from: usize, to: usize) {
+/// The large copy `copy` took `[from, to)` from title memory (the title
+/// wrote there): the pages kept in it are kept no longer, nor those whose
+/// copy is gone.
+pub(crate) fn kept_taken(copy: &Shadow, from: usize, to: usize) {
     if !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) || from >= to {
         return;
     }
     let page = crate::watch::PAGE;
     kept(|k| {
-        let gone: Vec<usize> = k.pages.range(from / page..to.div_ceil(page)).copied().collect();
+        let gone: Vec<usize> = k
+            .pages
+            .range(from / page..to.div_ceil(page))
+            .filter(|(_, (c, _))| std::ptr::eq(c.as_ptr(), copy) || c.strong_count() == 0)
+            .map(|(&p, _)| p)
+            .collect();
         for p in &gone {
             k.pages.remove(p);
         }
@@ -566,19 +583,30 @@ fn around_pages(address: usize, len: usize, kept: impl Iterator<Item = usize>) -
     out
 }
 
-/// [`crate::watch::retake`] of the range but for its kept pages.
+/// [`crate::watch::retake`] of the range, but of its kept pages only for
+/// the copies they are not kept in. A page whose copy is gone is kept no
+/// longer.
 fn retake_unkept(address: usize, len: usize) {
     if !KEPT_ANY.load(std::sync::atomic::Ordering::Acquire) {
         return crate::watch::retake(address, len);
     }
     let page = crate::watch::PAGE;
-    let ranges = kept(|k| {
-        let inside: Vec<usize> = k.pages.range(address / page..address.saturating_add(len).div_ceil(page)).copied().collect();
-        k.spared += inside.len() as u64;
-        around_pages(address, len, inside.into_iter())
+    let (ranges, keepers) = kept(|k| {
+        let range = address / page..address.saturating_add(len).div_ceil(page);
+        let gone: Vec<usize> = k.pages.range(range.clone()).filter(|(_, (c, _))| c.strong_count() == 0).map(|(&p, _)| p).collect();
+        for p in &gone {
+            k.pages.remove(p);
+        }
+        k.ended += gone.len() as u64;
+        let keepers: Vec<(usize, crate::watch::Keeper)> = k.pages.range(range).map(|(&p, (_, t))| (p, t.clone())).collect();
+        k.spared += keepers.len() as u64;
+        (around_pages(address, len, keepers.iter().map(|k| k.0)), keepers)
     });
     for (a, n) in ranges {
         crate::watch::retake(a, n);
+    }
+    for (p, keeper) in keepers {
+        keeper.retake_others(p);
     }
 }
 

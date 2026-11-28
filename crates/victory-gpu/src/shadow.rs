@@ -590,6 +590,12 @@ impl Shadow {
         self.tracked.as_ref().map(|t| t.changed(page / PAGE))
     }
 
+    /// The copy's tracker, to retake a page in the other copies holding it
+    /// (`crate::memory::keeps_pages`); None for memory not tracked.
+    pub(crate) fn keeper(&self) -> Option<crate::watch::Keeper> {
+        self.tracked.as_ref().map(crate::watch::Tracked::keeper)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base
@@ -617,7 +623,7 @@ impl Shadow {
             return 0;
         }
         // A kept page's bytes stay in the copy (`crate::memory::keeps_pages`).
-        if crate::memory::kept_from_title(self.len, page) {
+        if crate::memory::kept_from_title(self, page) {
             return 0;
         }
         // A title write from here on saves the page's bytes from before it:
@@ -1068,7 +1074,7 @@ impl Shadow {
                 };
                 // A kept page's bytes stay in the copy, and the copy does not
                 // take title memory's there (`crate::memory::keeps_pages`).
-                if host != old && crate::memory::kept_from_title(self.len, start + at) {
+                if host != old && crate::memory::kept_from_title(self, start + at) {
                     at += n;
                     continue;
                 }
@@ -1139,7 +1145,7 @@ impl Shadow {
             return 0;
         }
         // A kept page's bytes stay in the copy (`crate::memory::keeps_pages`).
-        if crate::memory::kept_from_title(self.len, page) {
+        if crate::memory::kept_from_title(self, page) {
             t.unarm(page / PAGE);
             return 0;
         }
@@ -1277,12 +1283,12 @@ impl Shadow {
             copied += self.copy(a, b);
             sync_before(a, b);
             if large {
-                crate::memory::kept_taken(a, b);
+                crate::memory::kept_taken(self, a, b);
             }
         }
         for (a, b) in unmapped {
             if large {
-                crate::memory::kept_taken(a, b);
+                crate::memory::kept_taken(self, a, b);
             }
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
@@ -2856,6 +2862,53 @@ pub(crate) mod tests {
         copy.update(p, len);
         assert_eq!(byte(kept), 0x11, "withheld and dropped as before");
         unregister(p, p as u64);
+    }
+
+    /// A kept page is kept in the copy the builder wrote only. Another copy
+    /// holding the page (a small buffer inside the large one) drops what a
+    /// frame withheld of it as ever: left in it, the bytes went into title
+    /// memory with the small copy's next copy-back of the page (results
+    /// computed while memory was missed), since only the keeper refuses
+    /// that.
+    #[test]
+    fn a_kept_page_is_retaken_in_the_other_copies_holding_it() {
+        let pages = 6;
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, len as u64);
+        register(p + 1, p as u64, PAGE as u64);
+        let (Some(copy), Some(small)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+            unregister(p + 1, p as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&copy, &small));
+        let byte = |c: &Shadow| c.read_host(p as u64 + 16, 1)[0] & 0xff;
+        // Shaders write the page in both copies, the frame withholds both.
+        copy.update(p, len);
+        small.update(p, PAGE);
+        for c in [&copy, &small] {
+            c.writing(p, PAGE, false);
+            c.write_host(p as u64 + 16, &[0x22]);
+            c.keep_writes(p, PAGE);
+        }
+        assert!(crate::memory::keep_page(&copy, p), "kept in the large copy");
+        crate::memory::drop_withheld(p, PAGE);
+        crate::memory::log_frame();
+        copy.update(p, len);
+        small.update(p, PAGE);
+        assert_eq!((byte(&copy), byte(&small)), (0x22, 0x11), "the keeper holds the GPU's byte, the other copy title memory's");
+        assert!(crate::memory::kept_page(p), "still kept");
+        // The title writes the page: kept no longer, in the keeper either.
+        // SAFETY: a byte of our pool (guarded: faults into the handler).
+        unsafe { ((p + 32) as *mut u8).write_volatile(0x33) };
+        copy.update(p, len);
+        assert_eq!(byte(&copy), 0x11, "the keeper took the page the title wrote");
+        assert!(!crate::memory::kept_page(p), "kept no longer");
+        unregister(p, p as u64);
+        unregister(p + 1, p as u64);
     }
 
     /// A page the title wrote since the copy took it is not kept: the copy
