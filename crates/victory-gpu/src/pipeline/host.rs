@@ -592,6 +592,9 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Such pipelines are not kept in the library on every host
+        // (`library::pipeline`).
+        let static_samplers = !samplers.is_empty();
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -611,6 +614,7 @@ impl HostPipeline {
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
+                static_samplers,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -656,12 +660,12 @@ impl HostPipeline {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                    &name,
+                    &name, static_samplers,
                 ),
                 None => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-                    &name,
+                    &name, static_samplers,
                 ),
             };
             let pso = match made {
@@ -746,11 +750,12 @@ impl HostPipeline {
             stream_pipeline(
                 &host.device, &root, vertex, desc.PS, g,
                 Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                &name,
+                &name, static_samplers,
             )
         } else {
             super::library::pipeline(
                 &name,
+                static_samplers,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
                 // SAFETY: as above.
@@ -815,6 +820,7 @@ struct VertexStream {
 }
 
 /// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
+#[allow(clippy::too_many_arguments)] // the stream's parts, and its name and samplers for the library
 fn stream_pipeline<S, D>(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -823,6 +829,7 @@ fn stream_pipeline<S, D>(
     g: &GraphicsState,
     depth: Sub<D>,
     name: &str,
+    static_samplers: bool,
 ) -> windows::core::Result<ID3D12PipelineState> {
     #[repr(C)]
     struct Stream<S, D> {
@@ -862,6 +869,7 @@ fn stream_pipeline<S, D>(
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
+        static_samplers,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
@@ -878,7 +886,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
+pub(super) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
