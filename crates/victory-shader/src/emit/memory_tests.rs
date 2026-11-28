@@ -1317,3 +1317,148 @@ fn a_page_read_coherently_through_its_uav_is_not_marked_written() {
         assert_eq!(marks(&Bc::parse(&on.dxil)), marks(&bc_off), "{parts}: no write mark for the coherent read");
     }
 }
+
+/// senior 142 (Fable Aufruf 22 P4/P15b, after upstream #3584's description
+/// only, no code taken): a program that stores to title memory and loads
+/// the same address again. 64 threads (two wave32) each load a dword, store
+/// it plus 1, load it again (plain or `glc`) and store what they read at
+/// +0x100. Translated with the coherence parts `parts` (0 off, `U | G` =
+/// `VICTORY_BVH_COHERENT` variant b for the stage).
+fn reload_after_own_store(reload_glc: bool, parts: u8) -> HostShader {
+    const GLC: u32 = 1 << 16;
+    // v_lshlrev_b32 v1, 2, v0: the thread's byte offset.
+    let mut w = vec![0x1A << 25 | 1 << 17 | 130];
+    w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    w.push(0x25 << 25 | 2 << 17 | 2 << 9 | 129); // v_add_nc_u32 v2, 1, v2
+    w.extend(global(28, 0, 1, 2, 0, 0)); // global_store_dword v1, v2, s[0:1]
+    let [a, b] = global(12, 3, 1, 0, 0, 0); // global_load_dword v3, v1, s[0:1] (glc)
+    w.extend([if reload_glc { a | GLC } else { a }, b]);
+    w.push(S_WAITCNT_ALL);
+    w.extend(global(28, 0, 1, 3, 0, 0x100)); // global_store_dword v1, v3, s[0:1] offset:0x100
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let l = super::with_coherent(parts, || {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+            host_wave_max: 32,
+            group_x_offset: false,
+            loop_limit: super::loop_limit(),
+        })
+        .expect("lower")
+    });
+    assert!(l.memory && l.memory_writes);
+    HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    }
+}
+
+/// MEASUREMENT (senior 142), not a pass/fail test of a fix: how many of the
+/// 64 threads read back their own store, per translation, on the host GPU.
+/// Prints `reload <plain|glc> parts <n>: fresh f stale s other o` for
+/// `--repeat` (env `VICTORY_S142_REPEAT`, default 20) dispatches each.
+/// Run: `cargo test -p victory-shader --lib reload_after_own_store_measured
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement on the host GPU (senior 142)"]
+fn reload_after_own_store_measured() {
+    use super::{COHERENT_GLOBAL as G, COHERENT_UAV as U};
+    let repeat: usize = std::env::var("VICTORY_S142_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u32; 256];
+    for (i, m) in memory.iter_mut().take(64).enumerate() {
+        *m = 7 + 4096 * i as u32;
+    }
+    let host = Host::new(false).expect("no SM 6.6 hardware device");
+    for (glc, parts) in [(false, 0), (false, U | G), (true, 0), (true, U | G)] {
+        let shader = reload_after_own_store(glc, parts);
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] = [TITLE as u32, (TITLE >> 32) as u32, 0, 0][u.dword as usize];
+            }
+        }
+        let (mut fresh, mut stale, mut other) = (0, 0, 0);
+        let mut first = None;
+        for _ in 0..repeat {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (1, Root::View { srv: true, data: page_table(0, 2) }),
+                            (2, Root::Uav(2 * 4096 / 32)),
+                        ],
+                        views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            for i in 0..64 {
+                assert_eq!(out[0][i], memory[i] + 1, "the store itself");
+                match out[0][64 + i] {
+                    v if v == memory[i] + 1 => fresh += 1,
+                    v if v == memory[i] => stale += 1,
+                    _ => other += 1,
+                }
+            }
+            first.get_or_insert_with(|| out[0][64..68].to_vec());
+        }
+        println!(
+            "reload {} parts {parts}: fresh {fresh} stale {stale} other {other} (of {}), first lanes {:?}",
+            if glc { "glc" } else { "plain" },
+            64 * repeat,
+            first.unwrap_or_default()
+        );
+    }
+}
