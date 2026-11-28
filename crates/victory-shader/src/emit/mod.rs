@@ -465,6 +465,14 @@ pub const COHERENT_UAV: u8 = 1;
 pub const COHERENT_GLOBAL: u8 = 2;
 /// `s_waitcnt_vscnt` as a device-wide UAV fence.
 pub const COHERENT_FENCE: u8 = 4;
+/// With [`COHERENT_UAV`], in a program that stores to memory: every title
+/// memory access goes through the page's UAV with the same properties, not
+/// only the `glc`/`dlc` ones, so a plain load sees what the program itself
+/// stored before it. Through the page's SRV the host takes such a load as
+/// one that no store of the program can change and gave the value from
+/// before the store in every lane (RTX 3070, 1280 of 1280; the console reads
+/// its own store). A program that stores nothing translates as without it.
+pub const COHERENT_ALL: u8 = 8;
 
 /// Diagnostics (T4, local test branch): translations made on this thread
 /// after `set_coherent(true)` read and write title memory coherently where
@@ -480,9 +488,10 @@ pub fn set_coherent(on: bool) {
 }
 
 /// [`set_coherent`] by parts (H-05 separation): [`COHERENT_UAV`],
-/// [`COHERENT_GLOBAL`] (only with the UAV), [`COHERENT_FENCE`]; 0 is off.
+/// [`COHERENT_GLOBAL`] (only with the UAV), [`COHERENT_FENCE`],
+/// [`COHERENT_ALL`] (only with the UAV); 0 is off.
 pub fn set_coherent_parts(parts: u8) {
-    COHERENT.with(|c| c.set(parts & (COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE)));
+    COHERENT.with(|c| c.set(parts & (COHERENT_UAV | COHERENT_GLOBAL | COHERENT_FENCE | COHERENT_ALL)));
 }
 
 /// The parts of [`set_coherent_parts`] on for this thread (0: off).

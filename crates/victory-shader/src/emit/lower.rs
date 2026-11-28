@@ -371,6 +371,9 @@ struct Lower<'a> {
     /// [`super::set_coherent`] is on and the current instruction asks for
     /// coherent memory (`glc` or `dlc`).
     coherent_now: bool,
+    /// [`super::COHERENT_ALL`] is on (with the UAV part) and the program
+    /// stores to memory: all its title memory goes through the page's UAV.
+    coherent_all: bool,
     /// Coherent title memory accesses and device-wide fences made.
     coherent_made: (u32, u32),
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
@@ -757,6 +760,17 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        // Stores and atomics on computed addresses or buffers: all of them
+        // may be title memory ([`Lower::memory`]).
+        let coherent_all = {
+            let parts = super::coherent_parts();
+            parts & super::COHERENT_UAV != 0
+                && parts & super::COHERENT_ALL != 0
+                && insts().any(|i| {
+                    matches!(i.fields, Fields::Flat { .. } | Fields::Buffer { .. })
+                        && (i.name().contains("store") || i.name().contains("atomic"))
+                })
+        };
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
@@ -912,6 +926,7 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             coherent_now: false,
+            coherent_all,
             coherent_made: (0, 0),
             heap: [false; 2],
             src0: None,
@@ -5585,9 +5600,12 @@ impl<'a> Lower<'a> {
         let null = self.s.memory_null();
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if self.coherent_now {
+        let (view, props) = if self.coherent_now || self.coherent_all {
             // Diagnostics (`super::set_coherent`): the UAV, globally
-            // coherent (resource properties bit 14), for reads too.
+            // coherent (resource properties bit 14), for reads too; with
+            // `super::COHERENT_ALL` in a program that stores, for every
+            // access, so a load after the program's own store is not
+            // taken from a view the store cannot change.
             self.coherent_made.0 += 1;
             let one = k(self, 1);
             let global = if super::coherent_parts() & super::COHERENT_GLOBAL != 0 { 0x4000 } else { 0 };

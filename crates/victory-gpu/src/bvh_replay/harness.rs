@@ -2115,7 +2115,8 @@ fn retranslate(
     views: u32,
 ) -> anyhow::Result<()> {
     // H-05 separation: 1/all (UAV, globally coherent, fence), uav, uavgc,
-    // fence; unset or 0: off.
+    // fence; uavgcall is the game's `VICTORY_BVH_COHERENT=3` (uavgc, and
+    // all title memory of a program that stores); unset or 0: off.
     let parts = match std::env::var("VICTORY_SHADER_COHERENT")
         .unwrap_or_default()
         .trim()
@@ -2125,13 +2126,15 @@ fn retranslate(
         "uav" => 1,
         "uavgc" => 3,
         "fence" => 4,
-        v => bail!("VICTORY_SHADER_COHERENT={v}: 0, 1/all, uav, uavgc or fence"),
+        "uavgcall" => 11,
+        v => bail!("VICTORY_SHADER_COHERENT={v}: 0, 1/all, uav, uavgc, uavgcall or fence"),
     };
     let coherent = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         if parts & 1 != 0 { "U" } else { "-" },
         if parts & 2 != 0 { "G" } else { "-" },
-        if parts & 4 != 0 { "F" } else { "-" }
+        if parts & 4 != 0 { "F" } else { "-" },
+        if parts & 8 != 0 { "A" } else { "" }
     );
     let data = std::fs::read(file).with_context(|| format!("{}", file.display()))?;
     let mut found: HashMap<String, Vec<u8>> = HashMap::new();

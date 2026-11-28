@@ -1318,24 +1318,30 @@ fn a_page_read_coherently_through_its_uav_is_not_marked_written() {
     }
 }
 
-/// senior 142 (Fable Aufruf 22 P4/P15b, after upstream #3584's description
-/// only, no code taken): a program that stores to title memory and loads
-/// the same address again. 64 threads (two wave32) each load a dword, store
-/// it plus 1, load it again (plain or `glc`) and store what they read at
-/// +0x100. Translated with the coherence parts `parts` (0 off, `U | G` =
-/// `VICTORY_BVH_COHERENT` variant b for the stage).
-fn reload_after_own_store(reload_glc: bool, parts: u8) -> HostShader {
+/// A program that stores to title memory and loads the same address again
+/// (Fable call 22 points 4 and 15b; after the description of upstream
+/// #3584 only, no code taken; first measured by senior 142): 64 threads
+/// (two wave32) each load a dword, store it plus 1, load it again (plain
+/// or `glc`) and store what they read at +0x100. Without `stores` the
+/// program only loads the dword twice. Lowered with the coherence parts
+/// `parts` (0 off, `U | G` = `VICTORY_BVH_COHERENT=2` for the stage,
+/// `U | G | A` = `3`).
+fn reload_after_own_store_lowered(reload_glc: bool, stores: bool, parts: u8) -> lower::Lowered {
     const GLC: u32 = 1 << 16;
     // v_lshlrev_b32 v1, 2, v0: the thread's byte offset.
     let mut w = vec![0x1A << 25 | 1 << 17 | 130];
     w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
     w.push(S_WAITCNT_ALL);
     w.push(0x25 << 25 | 2 << 17 | 2 << 9 | 129); // v_add_nc_u32 v2, 1, v2
-    w.extend(global(28, 0, 1, 2, 0, 0)); // global_store_dword v1, v2, s[0:1]
+    if stores {
+        w.extend(global(28, 0, 1, 2, 0, 0)); // global_store_dword v1, v2, s[0:1]
+    }
     let [a, b] = global(12, 3, 1, 0, 0, 0); // global_load_dword v3, v1, s[0:1] (glc)
     w.extend([if reload_glc { a | GLC } else { a }, b]);
     w.push(S_WAITCNT_ALL);
-    w.extend(global(28, 0, 1, 3, 0, 0x100)); // global_store_dword v1, v3, s[0:1] offset:0x100
+    if stores {
+        w.extend(global(28, 0, 1, 3, 0, 0x100)); // global_store_dword v1, v3, s[0:1] offset:0x100
+    }
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1356,7 +1362,7 @@ fn reload_after_own_store(reload_glc: bool, parts: u8) -> HostShader {
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let l = super::with_coherent(parts, || {
+    super::with_coherent(parts, || {
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -1377,7 +1383,12 @@ fn reload_after_own_store(reload_glc: bool, parts: u8) -> HostShader {
             loop_limit: super::loop_limit(),
         })
         .expect("lower")
-    });
+    })
+}
+
+/// [`reload_after_own_store_lowered`] with its stores, for the host.
+fn reload_after_own_store(reload_glc: bool, parts: u8) -> HostShader {
+    let l = reload_after_own_store_lowered(reload_glc, true, parts);
     assert!(l.memory && l.memory_writes);
     HostShader {
         stage: HwStage::Cs,
@@ -1397,17 +1408,58 @@ fn reload_after_own_store(reload_glc: bool, parts: u8) -> HostShader {
     }
 }
 
-/// MEASUREMENT (senior 142), not a pass/fail test of a fix: how many of the
-/// 64 threads read back their own store, per translation, on the host GPU.
-/// Prints `reload <plain|glc> parts <n>: fresh f stale s other o` for
-/// `--repeat` (env `VICTORY_S142_REPEAT`, default 20) dispatches each.
-/// Run: `cargo test -p victory-shader --lib reload_after_own_store_measured
-/// -- --ignored --nocapture`.
+/// `COHERENT_ALL` (`VICTORY_BVH_COHERENT=3` for a builder stage), without
+/// a GPU: in a program that stores, every title memory access goes through
+/// the page's UAV (two loads and two stores here), not only the `glc`
+/// ones; a program that stores nothing, and the part without the UAV part,
+/// translate as without it; reads through the UAV are not marked written.
 #[test]
-#[ignore = "measurement on the host GPU (senior 142)"]
-fn reload_after_own_store_measured() {
-    use super::{COHERENT_GLOBAL as G, COHERENT_UAV as U};
-    let repeat: usize = std::env::var("VICTORY_S142_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+fn all_title_memory_of_a_storing_program_goes_through_the_uav() {
+    use super::{COHERENT_ALL as A, COHERENT_GLOBAL as G, COHERENT_UAV as U};
+    let marks = |l: &lower::Lowered| calls_of(&Bc::parse(&l.dxil), "dx.op.atomicBinOp.i32");
+    for glc in [false, true] {
+        let off = reload_after_own_store_lowered(glc, true, 0);
+        let two = reload_after_own_store_lowered(glc, true, U | G);
+        let all = reload_after_own_store_lowered(glc, true, U | G | A);
+        assert_eq!(off.coherent.0, 0, "off");
+        assert_eq!(two.coherent.0, u32::from(glc), "U|G: the glc load only");
+        assert_eq!(all.coherent.0, 4, "U|G|A: both loads and both stores");
+        assert_ne!(all.dxil, two.dxil, "glc {glc}: the part took effect");
+        assert_eq!(reload_after_own_store_lowered(glc, true, A).dxil, off.dxil, "A alone does nothing");
+        assert_eq!(reload_after_own_store_lowered(glc, true, G | A).dxil, off.dxil, "A without the UAV part does nothing");
+        // A program that stores nothing keeps its translation.
+        let reads = reload_after_own_store_lowered(glc, false, U | G);
+        let reads_all = reload_after_own_store_lowered(glc, false, U | G | A);
+        assert_eq!(reads_all.dxil, reads.dxil, "glc {glc}: a program without stores is as without the part");
+        assert_eq!(reads_all.coherent.0, u32::from(glc));
+        // Marks: the stores' as before, none for a load through the UAV.
+        assert_eq!(marks(&all), marks(&off), "glc {glc}: no write mark for a read through the UAV");
+        assert_eq!((all.memory, all.memory_writes), (off.memory, off.memory_writes));
+    }
+    // The stage that reads one page coherently and stores to another: its
+    // load and its store, the marks as with the switch off.
+    let (off, all) = (coherent_read_only(0), coherent_read_only(U | G | A));
+    assert_eq!(all.coherent.0, 2);
+    assert_eq!(marks(&all), marks(&off));
+    #[cfg(windows)]
+    if let Some(text) = super::tests_dump_dxil(&reload_after_own_store_lowered(false, true, U | G | A).dxil) {
+        assert!(text.contains("ResourceProperties { i32 20491, i32 0 }"), "a globally coherent raw UAV");
+        let plain = super::tests_dump_dxil(&reload_after_own_store_lowered(false, true, U | G).dxil).expect("dxc");
+        assert!(plain.contains("ResourceProperties { i32 4107, i32 0 }") && !plain.contains("i32 20491"), "U|G: plain accesses as ever");
+    }
+}
+
+/// On the host GPU: each of 64 threads reads back its own store, in every
+/// dispatch, with `COHERENT_ALL` (`VICTORY_BVH_COHERENT=3` for a builder
+/// stage), for a plain and a `glc` reload. Without the part a plain reload
+/// goes through the page's SRV, which the host may take as unchanged by
+/// the program's store: the counts of those translations are printed, not
+/// judged (RTX 3070: plain 0 fresh of 1280 with parts 0 and `U | G`).
+/// `VICTORY_RELOAD_REPEAT` dispatches each (default 20).
+#[test]
+fn a_load_after_the_programs_own_store_reads_the_store() {
+    use super::{COHERENT_ALL as A, COHERENT_GLOBAL as G, COHERENT_UAV as U};
+    let repeat: usize = std::env::var("VICTORY_RELOAD_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1415,50 +1467,61 @@ fn reload_after_own_store_measured() {
     for (i, m) in memory.iter_mut().take(64).enumerate() {
         *m = 7 + 4096 * i as u32;
     }
-    let host = Host::new(false).expect("no SM 6.6 hardware device");
-    for (glc, parts) in [(false, 0), (false, U | G), (true, 0), (true, U | G)] {
-        let shader = reload_after_own_store(glc, parts);
-        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-        for u in &shader.user_data {
-            if u.root == RootType::Constants {
-                ud[u.index as usize] = [TITLE as u32, (TITLE >> 32) as u32, 0, 0][u.dword as usize];
-            }
-        }
-        let (mut fresh, mut stale, mut other) = (0, 0, 0);
-        let mut first = None;
-        for _ in 0..repeat {
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![
-                            (0, Root::Constants(ud.clone())),
-                            (1, Root::View { srv: true, data: page_table(0, 2) }),
-                            (2, Root::Uav(2 * 4096 / 32)),
-                        ],
-                        views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .expect("dispatch");
-            for i in 0..64 {
-                assert_eq!(out[0][i], memory[i] + 1, "the store itself");
-                match out[0][64 + i] {
-                    v if v == memory[i] + 1 => fresh += 1,
-                    v if v == memory[i] => stale += 1,
-                    _ => other += 1,
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (glc, parts) in [(false, 0), (false, U | G), (true, 0), (true, U | G), (false, U | G | A), (true, U | G | A)] {
+            let shader = reload_after_own_store(glc, parts);
+            let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants {
+                    ud[u.index as usize] = [TITLE as u32, (TITLE >> 32) as u32, 0, 0][u.dword as usize];
                 }
             }
-            first.get_or_insert_with(|| out[0][64..68].to_vec());
+            let (mut fresh, mut stale, mut other) = (0, 0, 0);
+            for _ in 0..repeat {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud.clone())),
+                                (1, Root::View { srv: true, data: page_table(0, 2) }),
+                                (2, Root::Uav(2 * 4096 / 32)),
+                            ],
+                            views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("dispatch");
+                for i in 0..64 {
+                    assert_eq!(out[0][i], memory[i] + 1, "{label}: the store itself");
+                    match out[0][64 + i] {
+                        v if v == memory[i] + 1 => fresh += 1,
+                        v if v == memory[i] => stale += 1,
+                        _ => other += 1,
+                    }
+                }
+            }
+            let kind = if glc { "glc" } else { "plain" };
+            println!("{label}: reload {kind} parts {parts}: fresh {fresh} stale {stale} other {other} (of {})", 64 * repeat);
+            if parts & A != 0 {
+                assert_eq!(
+                    (fresh, stale, other),
+                    (64 * repeat, 0, 0),
+                    "{label}, {kind} reload, parts {parts}: every lane reads its own store"
+                );
+            }
         }
-        println!(
-            "reload {} parts {parts}: fresh {fresh} stale {stale} other {other} (of {}), first lanes {:?}",
-            if glc { "glc" } else { "plain" },
-            64 * repeat,
-            first.unwrap_or_default()
-        );
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device: a_load_after_the_programs_own_store_reads_the_store did not run");
     }
 }

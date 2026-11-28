@@ -95,8 +95,12 @@ pub(crate) fn builder_loop_limit() -> Option<u32> {
 /// accesses read and write through the page's UAV marked globally coherent
 /// instead of its SRV, no fence (`victory_shader::emit::set_coherent_parts`
 /// with [`COHERENT_PARTS`]). Without it the refit's bottom levels came out
-/// invalid in the harness on both cards; with it valid in 70 of 70. Every
-/// other program translates as without the switch.
+/// invalid in the harness on both cards; with it valid in 70 of 70. `3` is
+/// `2`, and a stage that stores reads and writes all its title memory
+/// through that UAV ([`COHERENT_PARTS_ALL`]): through the SRV a plain load
+/// after the stage's own store of the same address gave the value from
+/// before the store (RTX 3070, 1280 of 1280 lanes). Every other program
+/// translates as without the switch.
 #[cfg(windows)]
 pub(crate) fn builder_coherent() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
@@ -107,7 +111,11 @@ pub(crate) fn builder_coherent() -> u8 {
                 level,
                 "VICTORY_BVH_COHERENT: {} translate with globally coherent title memory where the \
                  console bypasses its caches (cached apart)",
-                if level == 1 { "the BVH builder's refit 5552dac6" } else { "all the BVH builder's stages" }
+                match level {
+                    1 => "the BVH builder's refit 5552dac6",
+                    2 => "all the BVH builder's stages",
+                    _ => "all the BVH builder's stages, all title memory of those that store,",
+                }
             );
         }
         level
@@ -118,28 +126,35 @@ pub(crate) fn builder_coherent() -> u8 {
 /// globally coherent; no fence at `s_waitcnt_vscnt`.
 const COHERENT_PARTS: u8 = victory_shader::emit::COHERENT_UAV | victory_shader::emit::COHERENT_GLOBAL;
 
+/// [`COHERENT_PARTS`], and every title memory access of a stage that
+/// stores through the UAV (level 3).
+const COHERENT_PARTS_ALL: u8 = COHERENT_PARTS | victory_shader::emit::COHERENT_ALL;
+
 /// The builder's refit, the one stage the harness showed the switch to make
 /// valid (shader hash prefix, as logged).
 const COHERENT_REFIT: &str = "5552dac6";
 
-/// `VICTORY_BVH_COHERENT` as set: `1` or `2`, anything else off (0).
+/// `VICTORY_BVH_COHERENT` as set: `1`, `2` or `3`, anything else off (0).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn coherent_switch(value: Option<&str>) -> u8 {
     match value.map(str::trim) {
         Some("1") => 1,
         Some("2") => 2,
+        Some("3") => 3,
         _ => 0,
     }
 }
 
 /// The coherence parts a stage translates with (0: none): only the
-/// builder's, at level 1 only its refit, at level 2 all of them
+/// builder's, at level 1 only its refit, at levels 2 and 3 all of them,
+/// at 3 with all the title memory of those that store
 /// ([`builder_coherent`]).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn coherent_translation(builder: bool, hash: &str, level: u8) -> u8 {
     match level {
         1 if builder && hash.starts_with(COHERENT_REFIT) => COHERENT_PARTS,
         2 if builder => COHERENT_PARTS,
+        3 if builder => COHERENT_PARTS_ALL,
         _ => 0,
     }
 }
@@ -908,7 +923,8 @@ mod tests {
         use victory_shader::emit::{COHERENT_FENCE, COHERENT_GLOBAL, COHERENT_UAV};
         assert_eq!(super::coherent_switch(Some("1")), 1);
         assert_eq!(super::coherent_switch(Some(" 2 ")), 2);
-        for off in [None, Some(""), Some("0"), Some("3"), Some("yes"), Some("true")] {
+        assert_eq!(super::coherent_switch(Some("3")), 3);
+        for off in [None, Some(""), Some("0"), Some("4"), Some("yes"), Some("true")] {
             assert_eq!(super::coherent_switch(off), 0, "{off:?}");
         }
         let b = COHERENT_UAV | COHERENT_GLOBAL;
@@ -919,7 +935,11 @@ mod tests {
         assert_eq!(super::coherent_translation(true, other_stage, 1), 0, "1: no other builder stage");
         assert_eq!(super::coherent_translation(true, refit, 2), b, "2: the refit");
         assert_eq!(super::coherent_translation(true, other_stage, 2), b, "2: every builder stage");
-        for level in [0, 1, 2] {
+        let all = b | victory_shader::emit::COHERENT_ALL;
+        assert_eq!(super::COHERENT_PARTS_ALL, all, "3: variant b, all title memory of a stage that stores");
+        assert_eq!(super::coherent_translation(true, refit, 3), all, "3: the refit");
+        assert_eq!(super::coherent_translation(true, other_stage, 3), all, "3: every builder stage");
+        for level in [0, 1, 2, 3] {
             // A title program that happened to share the refit's prefix is
             // still not the builder's.
             assert_eq!(super::coherent_translation(false, refit, level), 0, "not the builder's, {level}");
@@ -932,7 +952,7 @@ mod tests {
         let options =
             victory_shader::emit::Options { view_marks: true, group_x_offset: false, loop_limit: None, thread_limit: false };
         let today = victory_shader::emit::translate_with(&container, options).expect("translates");
-        for level in [1, 2] {
+        for level in [1, 2, 3] {
             let other = crate::shader_cache::translate_container(
                 &container,
                 options,
