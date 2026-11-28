@@ -345,9 +345,6 @@ struct Stats {
     idle_given: u64,
     idle_learnt: u64,
     idle_held_back: u64,
-    /// Sorts of found pages, and those that reused the last one.
-    sorts: u64,
-    sorts_reused: u64,
 }
 
 struct Arena {
@@ -409,10 +406,6 @@ struct Arena {
     /// Title buffers (copies) the builder's root views point into: its
     /// input lists, scanned for structure addresses before it runs.
     inputs: BTreeSet<(u64, u64)>,
-    /// While stopped: the structure pages last found, the generation and
-    /// sizes of `nothing` and `not_title` after they were sorted, and the
-    /// pages they prepared ([`prepare_found`]).
-    found_cache: Option<FoundCache>,
     stage: Option<(ID3D12Resource, usize)>,
     stats: Stats,
 }
@@ -457,7 +450,6 @@ fn new_arena() -> Arena {
         scans: 0,
         scanned_at: BTreeMap::new(),
         inputs: BTreeSet::new(),
-        found_cache: None,
         stage: None,
         stats: Stats::default(),
     }
@@ -940,38 +932,36 @@ pub(crate) fn provide() {
     if builder && crate::arena_scan::scans(scan_mode, idle) {
         let found = scan_inputs(a);
         let known = a.nothing.len() + a.not_title.len();
-        // While the arena is stopped, the same structure pages as last time
-        // with nothing given or learnt since sort as they did then (each
-        // goes on to be refused): not asked about one by one again.
-        let key = (a.generation, a.nothing.len(), a.not_title.len());
-        let cached = found_cached(&a.found_cache, a.stopped.is_some(), key, &found).cloned();
-        a.stats.sorts += 1;
-        a.stats.sorts_reused += u64::from(cached.is_some());
-        let prepared = cached.unwrap_or_else(|| {
-            let dir = &a.dir;
-            let prepared = prepare_found(
-                &found,
-                |p| dir.get(p).is_some(),
-                &mut a.nothing,
-                &mut a.not_title,
-                |p| crate::shadow::holding(p * PAGE).is_some(),
-                |p| memory_at(p * PAGE),
-            );
-            a.found_cache = a.stopped.is_some().then(|| (found, (a.generation, a.nothing.len(), a.not_title.len()), prepared.clone()));
-            prepared
-        });
         let check = idle && scan_mode == crate::arena_scan::Mode::Check;
-        for &(p, _) in &prepared {
-            if wanted.remove(&p) && check && evict_on() && a.misses.get(&p).is_some_and(|e| e.0 >= persist_frames()) {
-                a.stats.idle_held_back += 1;
+        let from = first.len();
+        for page in found {
+            for p in page..page + PREPARED_PAGES {
+                if a.dir.get(p).is_some() || a.nothing.contains(&p) || a.not_title.contains(&p) {
+                    break;
+                }
+                if crate::shadow::holding(p * PAGE).is_some() {
+                    a.not_title.insert(p);
+                    break;
+                }
+                match memory_at(p * PAGE) {
+                    m @ Memory::Committed(..) => {
+                        if wanted.remove(&p) && check && evict_on() && a.misses.get(&p).is_some_and(|e| e.0 >= persist_frames()) {
+                            a.stats.idle_held_back += 1;
+                        }
+                        first.push((p, m));
+                    }
+                    _ => {
+                        a.nothing.insert(p);
+                        break;
+                    }
+                }
             }
         }
         if check {
-            a.stats.idle_prepared += prepared.len() as u64;
+            a.stats.idle_prepared += (first.len() - from) as u64;
             a.stats.idle_learnt += (a.nothing.len() + a.not_title.len() - known) as u64;
-            idle_from = Some(first.len());
+            idle_from = Some(from);
         }
-        first.extend(prepared);
     }
     // Committed memory first, then reserved (zero pages): addresses computed
     // from zeros land in reservations too, and must not take the budget
@@ -1124,61 +1114,6 @@ pub(crate) fn provide() {
     }
 }
 
-/// Structure pages found, the key after they were sorted, and the pages
-/// they prepared ([`found_cached`]).
-type FoundCache = (BTreeSet<u64>, (u64, usize, usize), Vec<(u64, Memory)>);
-
-/// What the structure pages `found` prepared last time, if the arena is
-/// stopped and they and `key` (generation, sizes of `nothing` and
-/// `not_title`) are as they were after they were last sorted.
-fn found_cached<'a>(
-    cache: &'a Option<FoundCache>,
-    stopped: bool,
-    key: (u64, usize, usize),
-    found: &BTreeSet<u64>,
-) -> Option<&'a Vec<(u64, Memory)>> {
-    match cache {
-        Some((f, k, prepared)) if stopped && *k == key && f == found => Some(prepared),
-        _ => None,
-    }
-}
-
-/// The pages structure addresses found in the builder's input lists
-/// prepare (`found`, see [`provide`]), in order: from each found page at
-/// most [`PREPARED_PAGES`], until one has a slot, is known to hold nothing
-/// or no title memory, lies in a copy (`holding`, then known as no title
-/// memory) or holds no committed memory (`memory`, then known to hold
-/// nothing). Each with its memory; a page may come twice (windows overlap).
-fn prepare_found(
-    found: &BTreeSet<u64>,
-    has_slot: impl Fn(u64) -> bool,
-    nothing: &mut HashSet<u64>,
-    not_title: &mut HashSet<u64>,
-    mut holding: impl FnMut(u64) -> bool,
-    mut memory: impl FnMut(u64) -> Memory,
-) -> Vec<(u64, Memory)> {
-    let mut prepared = Vec::new();
-    for &page in found {
-        for p in page..page + PREPARED_PAGES {
-            if has_slot(p) || nothing.contains(&p) || not_title.contains(&p) {
-                break;
-            }
-            if holding(p) {
-                not_title.insert(p);
-                break;
-            }
-            match memory(p) {
-                m @ Memory::Committed(..) => prepared.push((p, m)),
-                _ => {
-                    nothing.insert(p);
-                    break;
-                }
-            }
-        }
-    }
-    prepared
-}
-
 /// Whether a full arena gives pages missed in many frames the slots of pages
 /// no shader wrote (`VICTORY_BVH_ARENA_EVICT=1`, off by default, local
 /// test): the budget filled with pages of addresses computed from zeros in
@@ -1246,8 +1181,7 @@ fn evict_for_persistent(a: &mut Arena, wanted: Vec<(u64, Memory)>, fills: &mut V
         a.watched.remove(&old);
         a.unwatched.remove(&old);
         a.sent.remove(&old);
-        // With the removal: the page tables and the sort kept of found
-        // pages ([`found_cached`]) go by it, also if the add fails.
+        // With the removal: the page tables go by it, also if the add fails.
         a.generation += 1;
         let Ok((slot, _)) = a.dir.add(page) else { continue };
         a.stats.evicted += 1;
@@ -1648,8 +1582,7 @@ pub(crate) fn log_frame() {
         tracing::info!(
             target: "victory_gpu::arena",
             "BVH arena input scan this frame (VICTORY_ARENA_SCAN={}): due {}, with nothing to gain (arena stopped) {} ({}); \
-             check: those prepared {} pages -> given a slot {} (missed by leaving them out), learnt as no memory or no title memory {}, kept from taking a slot back {}; \
-             sorts of found pages {} (reused {})",
+             check: those prepared {} pages -> given a slot {} (missed by leaving them out), learnt as no memory or no title memory {}, kept from taking a slot back {}",
             if check { 2 } else { 1 },
             s.scans_due,
             s.scans_idle,
@@ -1658,8 +1591,6 @@ pub(crate) fn log_frame() {
             s.idle_given,
             s.idle_learnt,
             s.idle_held_back,
-            s.sorts,
-            s.sorts_reused,
         );
     }
     if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs + s.scanned == 0 {
@@ -1917,80 +1848,6 @@ pub(crate) mod tests {
                 }
             }
         }
-    }
-
-    /// The old sort of found structure pages, interleaved with `wanted`
-    /// (reference).
-    #[allow(clippy::type_complexity)]
-    fn prepare_found_old(
-        found: &BTreeSet<u64>,
-        has_slot: impl Fn(u64) -> bool,
-        nothing: &mut HashSet<u64>,
-        not_title: &mut HashSet<u64>,
-        holding: impl Fn(u64) -> bool,
-        memory: impl Fn(u64) -> Memory,
-        wanted: &mut BTreeSet<u64>,
-    ) -> Vec<(u64, Memory)> {
-        let mut first = Vec::new();
-        for &page in found {
-            for p in page..page + PREPARED_PAGES {
-                if has_slot(p) || nothing.contains(&p) || not_title.contains(&p) {
-                    break;
-                }
-                if holding(p) {
-                    not_title.insert(p);
-                    break;
-                }
-                match memory(p) {
-                    m @ Memory::Committed(..) => {
-                        wanted.remove(&p);
-                        first.push((p, m));
-                    }
-                    _ => {
-                        nothing.insert(p);
-                        break;
-                    }
-                }
-            }
-        }
-        first
-    }
-
-    #[test]
-    fn found_pages_sort_as_before_and_a_stopped_arena_reuses_the_sort() {
-        // Pages 100..: slot at 103, copy at 112, nothing committed at 121,
-        // known nothing 130, overlapping windows 140/141.
-        let found: BTreeSet<u64> = [100, 110, 120, 130, 140, 141, 150].into_iter().collect();
-        let has_slot = |p: u64| p == 103;
-        let holding = |p: u64| p == 112;
-        let memory = |p: u64| if p == 121 { Memory::Reserved } else { Memory::Committed((p as usize) << 16, p.is_multiple_of(2)) };
-        let (mut nothing, mut not_title): (HashSet<u64>, HashSet<u64>) = ([130].into_iter().collect(), HashSet::new());
-        let (mut nothing_old, mut not_title_old) = (nothing.clone(), not_title.clone());
-        let mut wanted: BTreeSet<u64> = (95..160).collect();
-        let mut wanted_new = wanted.clone();
-        let old = prepare_found_old(&found, has_slot, &mut nothing_old, &mut not_title_old, holding, memory, &mut wanted);
-        let new = prepare_found(&found, has_slot, &mut nothing, &mut not_title, holding, memory);
-        for &(p, _) in &new {
-            wanted_new.remove(&p);
-        }
-        assert_eq!(new, old, "same pages, same order");
-        assert_eq!((nothing.clone(), not_title.clone(), wanted_new), (nothing_old, not_title_old, wanted));
-        assert_eq!(new.iter().filter(|e| e.0 == 141).count(), 2, "overlapping windows keep their duplicates");
-        // The cache: only stopped, only for the same pages and key.
-        let key = (7, nothing.len(), not_title.len());
-        let cache = Some((found.clone(), key, new.clone()));
-        assert_eq!(found_cached(&cache, true, key, &found), Some(&new));
-        // Sorting again from the state it left gives the same.
-        let again = prepare_found(&found, has_slot, &mut nothing, &mut not_title, holding, memory);
-        assert_eq!(again, new);
-        assert_eq!(found_cached(&cache, false, key, &found), None);
-        assert_eq!(found_cached(&cache, true, (8, key.1, key.2), &found), None);
-        assert_eq!(found_cached(&cache, true, (7, key.1 + 1, key.2), &found), None);
-        assert_eq!(found_cached(&cache, true, (7, key.1, key.2 + 1), &found), None);
-        let mut other = found.clone();
-        other.insert(160);
-        assert_eq!(found_cached(&cache, true, key, &other), None);
-        assert_eq!(found_cached(&None, true, key, &found), None);
     }
 
     /// Micro-benchmark (`--ignored --nocapture`, exclusive slot): 64 MiB
