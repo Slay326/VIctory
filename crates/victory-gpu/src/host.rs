@@ -940,6 +940,10 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// `VICTORY_COST_SPLIT`: where the bound pipeline's class changes, and
+    /// the timestamp heap and read-back buffer for it.
+    split: Mutex<crate::costsplit::Segments>,
+    split_stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -976,6 +980,49 @@ unsafe impl Sync for HostList {}
 pub(crate) fn warn_depth_bounds() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
+
+/// `VICTORY_COST_SPLIT`: the lists writing a timestamp before and after a
+/// submission, where they are read back, and the ticks per second.
+struct SplitStamps {
+    begin: ID3D12CommandList,
+    end: ID3D12CommandList,
+    back: ID3D12Resource,
+    frequency: u64,
+    _keep: (ID3D12QueryHeap, ID3D12CommandAllocator),
+}
+
+// SAFETY: D3D12 objects are free-threaded; the lists only run under the
+// submission lock, one submission at a time.
+unsafe impl Send for SplitStamps {}
+// SAFETY: as above.
+unsafe impl Sync for SplitStamps {}
+
+/// A timestamp query heap of `count` and a read-back buffer for it.
+fn timestamp_heap(device: &ID3D12Device, count: u32) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: count, NodeMask: 0 }, &mut heap)
+            .ok()?;
+        device
+            .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+            .ok()?;
+    }
+    Some((heap?, back?))
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -1277,6 +1324,8 @@ impl Host {
                 builder_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                split: Mutex::default(),
+                split_stamps: OnceLock::new(),
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
@@ -1291,12 +1340,94 @@ impl Host {
         }
     }
 
+    /// `VICTORY_COST_SPLIT`: the two lists writing a timestamp before and
+    /// after a submission's lists (made once; each runs again only after its
+    /// last run finished, every submission being waited for).
+    fn split_stamps(&self) -> Option<&'static SplitStamps> {
+        static STAMPS: OnceLock<Option<SplitStamps>> = OnceLock::new();
+        STAMPS
+            .get_or_init(|| {
+                let (heap, back) = timestamp_heap(&self.device, 2)?;
+                // SAFETY: plain object creation and recording into our new
+                // lists.
+                unsafe {
+                    let frequency = self.queue.GetTimestampFrequency().ok()?;
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                    let begin: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+                    begin.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    begin.Close().ok()?;
+                    let end: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+                    end.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    end.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                    end.Close().ok()?;
+                    Some(SplitStamps {
+                        begin: begin.cast().ok()?,
+                        end: end.cast().ok()?,
+                        back,
+                        frequency,
+                        _keep: (heap, allocator),
+                    })
+                }
+            })
+            .as_ref()
+    }
+
+    /// `VICTORY_COST_SPLIT`: a submission of `group` ran: its preparing and
+    /// waiting (microseconds), its GPU time between the timestamps, and its
+    /// lists' GPU time per class.
+    fn split_add(&self, group: crate::costsplit::Group, runs: &[&HostList], prep: u64, wait: u64) {
+        use crate::costsplit::{Field, add};
+        add(group, Field::Submissions, 1);
+        add(group, Field::Prep, prep);
+        add(group, Field::Wait, wait);
+        let Some(stamps) = self.split_stamps() else {
+            return;
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: 16 };
+        // SAFETY: the read-back buffer the finished end list resolved into.
+        let pair = unsafe {
+            if stamps.back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                None
+            } else {
+                let s = std::slice::from_raw_parts(data.cast::<u64>(), 2);
+                let pair = (s[0], s[1]);
+                stamps.back.Unmap(0, None);
+                Some(pair)
+            }
+        };
+        if let Some((a, b)) = pair
+            && b >= a
+        {
+            add(group, Field::Gpu, crate::costsplit::ticks_us(b - a, stamps.frequency));
+            add(group, Field::Stamped, 1);
+        }
+        // A submission may name a list twice: its time counts once.
+        let mut seen = std::collections::HashSet::new();
+        for list in runs {
+            if seen.insert(*list as *const HostList as usize) {
+                list.split_attribute(stamps.frequency);
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let waiting = crate::prepbd::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // `VICTORY_COST_SPLIT`: the submission's group by what its lists bound.
+        let split = crate::costsplit::enabled().then(|| {
+            let bound = runs.iter().fold(0, |b, l| b | l.split.lock().unwrap_or_else(|e| e.into_inner()).bound());
+            crate::costsplit::group(bound)
+        });
+        if let Some(group) = split {
+            crate::costsplit::set_current(group);
+        }
         crate::prepbd::since(crate::prepbd::Part::LockWait, waiting);
         let started = std::time::Instant::now();
         let breakdown = crate::prepbd::now();
@@ -1439,8 +1570,15 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // `VICTORY_COST_SPLIT`: timestamps before and after the lists.
+            let stamps = split.and_then(|_| self.split_stamps());
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                if i == 0
+                    && let Some(stamps) = stamps
+                {
+                    self.queue.ExecuteCommandLists(&[Some(stamps.begin.clone())]);
+                }
                 self.queue.ExecuteCommandLists(group);
                 // Behind the last of the lists: the bitmaps come down from
                 // the GPU's memory.
@@ -1449,6 +1587,11 @@ impl Host {
                 {
                     self.queue.ExecuteCommandLists(&[Some(marks.clone())]);
                     marks_sent = true;
+                }
+                if i + 1 == groups.len()
+                    && let Some(stamps) = stamps
+                {
+                    self.queue.ExecuteCommandLists(&[Some(stamps.end.clone())]);
                 }
                 let waited = self
                     .queue
@@ -1489,6 +1632,9 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        if let Some(group) = split {
+            self.split_add(group, runs, (prepared - started).as_micros() as u64, gpu.as_micros() as u64);
+        }
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -1652,6 +1798,9 @@ impl Host {
             gt.read_title(0);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(group) = split {
+            crate::costsplit::add(group, crate::costsplit::Field::Back, copying.elapsed().as_micros() as u64);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
@@ -2002,6 +2151,17 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         crate::indirect::end_window(self);
+        // `VICTORY_COST_SPLIT`: the last class segment ends here.
+        if crate::costsplit::enabled()
+            && let Some((heap, back)) = self.split_stamps()
+            && let Some(last) = self.split.lock().unwrap_or_else(|e| e.into_inner()).close()
+        {
+            // SAFETY: an open list, our heap and read-back buffer.
+            unsafe {
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, last);
+                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, last + 1, back, 0);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -2027,6 +2187,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.split.lock().unwrap_or_else(|e| e.into_inner()) = crate::costsplit::Segments::default();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -2291,6 +2452,50 @@ impl HostList {
         if !targets.iter().any(|t| t.0 == resource) {
             targets.push((resource, by.to_owned()));
         }
+    }
+
+    /// `VICTORY_COST_SPLIT`: a pipeline named `name` is bound (`builder`:
+    /// the BVH builder's); a timestamp where the class of work changes.
+    pub(crate) fn split_mark(&self, builder: bool, name: &str) {
+        if !crate::costsplit::enabled() {
+            return;
+        }
+        let Some((heap, _)) = self.split_stamps() else {
+            return;
+        };
+        let class = crate::costsplit::class(builder, name);
+        if let Some(slot) = self.split.lock().unwrap_or_else(|e| e.into_inner()).mark(class) {
+            // SAFETY: an open list and our heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+        }
+    }
+
+    /// `VICTORY_COST_SPLIT`: the timestamp heap and read-back buffer for the
+    /// class changes.
+    fn split_stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        self.split_stamps
+            .get_or_init(|| timestamp_heap(&host()?.device, crate::costsplit::SLOTS))
+            .as_ref()
+    }
+
+    /// `VICTORY_COST_SPLIT`: after the list ran, its GPU time per class.
+    fn split_attribute(&self, frequency: u64) {
+        let split = self.split.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some(n), Some((_, back))) = (split.resolved(), self.split_stamps.get().and_then(Option::as_ref)) else {
+            return;
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: n * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), n).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        split.attribute(&stamps, frequency);
     }
 
     /// Notes a pipeline the list binds.
@@ -3384,6 +3589,7 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             crate::prepbd::log(report_frames);
+            crate::costsplit::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

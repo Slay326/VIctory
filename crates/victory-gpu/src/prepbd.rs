@@ -60,7 +60,9 @@ pub(crate) enum Part {
 }
 const PARTS: usize = 25;
 const _: () = assert!(Part::GpuWriteMark as usize + 1 == PARTS);
-static SUM: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+/// Per submission group (`crate::costsplit`; all in one while that is off).
+static SUM: [[AtomicU64; PARTS]; crate::costsplit::GROUPS] =
+    [const { [const { AtomicU64::new(0) }; PARTS] }; crate::costsplit::GROUPS];
 
 /// Whether the breakdown is on (`VICTORY_PREP_BREAKDOWN=1`; a test sets
 /// its own on its thread).
@@ -81,14 +83,14 @@ pub(crate) fn now() -> Option<std::time::Instant> {
 /// Adds the time since `from` (from [`now`]) to `part`.
 pub(crate) fn since(part: Part, from: Option<std::time::Instant>) {
     if let Some(from) = from {
-        SUM[part as usize].fetch_add(from.elapsed().as_micros() as u64, Relaxed);
+        SUM[crate::costsplit::current()][part as usize].fetch_add(from.elapsed().as_micros() as u64, Relaxed);
     }
 }
 
 /// Adds `n` to `part` (a count or bytes), if the breakdown is on.
 pub(crate) fn add(part: Part, n: u64) {
     if enabled() {
-        SUM[part as usize].fetch_add(n, Relaxed);
+        SUM[crate::costsplit::current()][part as usize].fetch_add(n, Relaxed);
     }
 }
 
@@ -106,9 +108,19 @@ pub(crate) fn span(part: Part) -> Span {
     Span(part, now())
 }
 
-/// Takes the sums since the last call.
+/// Takes the sums since the last call, per group.
+fn take_groups() -> [[u64; PARTS]; crate::costsplit::GROUPS] {
+    std::array::from_fn(|g| std::array::from_fn(|i| SUM[g][i].swap(0, Relaxed)))
+}
+
+/// Takes the sums since the last call, all groups together.
+#[cfg(test)]
 fn take() -> [u64; PARTS] {
-    std::array::from_fn(|i| SUM[i].swap(0, Relaxed))
+    sum_groups(&take_groups())
+}
+
+fn sum_groups(groups: &[[u64; PARTS]; crate::costsplit::GROUPS]) -> [u64; PARTS] {
+    std::array::from_fn(|i| groups.iter().map(|g| g[i]).sum())
 }
 
 /// Logs the sums per frame over `frames` frames, if the breakdown is on.
@@ -116,7 +128,17 @@ pub(crate) fn log(frames: f64) {
     if !enabled() || frames <= 0.0 {
         return;
     }
-    let s = take();
+    let groups = take_groups();
+    log_one("", &sum_groups(&groups), frames);
+    // With `VICTORY_COST_SPLIT`: the same per submission group.
+    if crate::costsplit::enabled() {
+        for (g, name) in crate::costsplit::GROUP_NAMES.iter().enumerate() {
+            log_one(&format!(" ({name} submissions)"), &groups[g], frames);
+        }
+    }
+}
+
+fn log_one(group: &str, s: &[u64; PARTS], frames: f64) {
     let ms = |p: Part| s[p as usize] as f64 / 1e3 / frames;
     let named = [Part::Evict, Part::SyncHeaps, Part::Provide, Part::Uploads, Part::Deferred, Part::LastFlush, Part::Card]
         .iter()
@@ -136,7 +158,7 @@ pub(crate) fn log(frames: f64) {
     .map(|&p| ms(p))
     .sum::<f64>();
     tracing::info!(
-        "prep breakdown per frame: total {:.1} ms (lock wait before it {:.1}); evict {:.1}, heap sync {:.1}, \
+        "prep breakdown per frame{group}: total {:.1} ms (lock wait before it {:.1}); evict {:.1}, heap sync {:.1}, \
          arena {:.1}, heap uploads {:.1}, deferred steps {:.1}, last flush {:.1}, card marks {:.1}, other {:.1}; \
          arena: regions {:.1}, around {:.1}, sort {:.1} (of it scan {:.1}, {:.1} MB), give {:.1}, reads {:.1}, fill {:.1}, \
          refresh {:.1} (watch {:.1}), other {:.1}; arena uploads: reading title memory {:.1}, GPU waits {:.1} ({:.1} waits); \
@@ -222,7 +244,12 @@ pub(crate) mod tests {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sums() -> [u64; PARTS] {
-        std::array::from_fn(|i| SUM[i].load(Relaxed))
+        std::array::from_fn(|i| SUM.iter().map(|g| g[i].load(Relaxed)).sum())
+    }
+
+    /// Allocations made on this thread so far.
+    pub(crate) fn allocations() -> u64 {
+        ALLOCATIONS.with(std::cell::Cell::get)
     }
 
     #[test]

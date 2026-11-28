@@ -27,6 +27,7 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+mod costsplit;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

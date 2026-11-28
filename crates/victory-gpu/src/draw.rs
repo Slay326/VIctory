@@ -658,6 +658,7 @@ impl State {
             }
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
+            list.split_mark(crate::pipeline::is_builder(self.pipeline as This), &p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
