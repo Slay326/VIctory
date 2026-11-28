@@ -382,6 +382,10 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+    /// The serialized root signature of a compute pipeline (the BVH
+    /// builder capture, `crate::bvh_replay`); empty for others.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) root_blob: Vec<u8>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -644,6 +648,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                root_blob: root_blob.to_vec(),
             });
         }
         let Some(g) = g else {
@@ -692,6 +697,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                root_blob: Vec::new(),
             });
         }
 
@@ -795,6 +801,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             marks,
+            root_blob: Vec::new(),
         })
     }
 }
