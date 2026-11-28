@@ -34,6 +34,14 @@
 //! title reads what the console's does.
 //!
 //! `=2`: not the structures of a list that itself missed memory.
+//
+// A structure may lie in several copies (capture C1 of 2026-11-28: three
+// bottom levels of 5.3-5.6 MB, each over two 4 MiB title buffers, one ending
+// in an arena page; they were never put and stayed packed, their instances'
+// boxes empty). Its parts go back each from the copy the page table names
+// for the page ([`owner_of`]), a part no copy holds from the arena's page;
+// the header's part last, so that a part that cannot be written leaves the
+// header packed in title memory.
 // shortcut: a structure unpacked to another address than its source is left
 // as before (counted; none in run 233538: 7,570 of 7,570 binds in place).
 // shortcut: only the header says the stages ran; nodes computed from
@@ -231,13 +239,102 @@ fn title_head(at: u64) -> Option<[u32; 16]> {
     crate::host::read_into(at as *const u8, bytes).then_some(title)
 }
 
-/// A structure to put: its copy, address and bytes, title memory's header
-/// as judged, and the copy's root pointer (dword 12).
-type Chosen = (Arc<Shadow>, u64, usize, [u32; 16], u32);
+/// A part of a structure to put: `[at, at + len)` as a copy holds it, or
+/// as the arena does (its bytes).
+enum Part {
+    Copy(Arc<Shadow>, u64, usize),
+    Arena(u64, Vec<u8>),
+}
+
+/// A structure to put: its parts in address order, its address and bytes,
+/// title memory's header as judged, and the copy's root pointer (dword 12).
+type Chosen = (Vec<Part>, u64, usize, [u32; 16], u32);
+
+/// Of copies with `ranges` (start, bytes), the one the page table names for
+/// the page of `[at, at + len)` (one page's bytes): the smallest that holds
+/// the whole page, else the largest that holds the bytes (`crate::memory`,
+/// `write_table`: larger copies first, a copy holding the whole page takes
+/// it from them).
+fn owner_of(at: u64, len: u64, ranges: impl Iterator<Item = (u64, u64)>) -> Option<usize> {
+    let page = at & !0xffff;
+    let mut best: Option<(bool, u64, usize)> = None;
+    for (k, (start, n)) in ranges.enumerate() {
+        if start > at || at + len > start + n {
+            continue;
+        }
+        let whole = start <= page && page + 0x1_0000 <= start + n;
+        let better = match best {
+            None => true,
+            Some((w, size, _)) => (whole && !w) || (whole == w && if whole { n < size } else { n > size }),
+        };
+        if better {
+            best = Some((whole, n, k));
+        }
+    }
+    best.map(|(_, _, k)| k)
+}
+
+/// The parts of `[at, at + len)`: all of it in `first` (the copy whose
+/// header was judged) if that holds it; else page by page from `first`
+/// where it holds the page's bytes, from the page's copy ([`owner_of`]), or
+/// from the arena (`arena(at, len)`: the bytes it holds there). None if
+/// some part is held by nothing: the GPU did not write the structure whole.
+fn parts(
+    first: &Arc<Shadow>,
+    at: u64,
+    len: usize,
+    copies: &[Arc<Shadow>],
+    arena: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Vec<Part>> {
+    let holds = |c: &Shadow, a: u64, n: usize| {
+        let (from, to) = c.offsets(a as usize, n);
+        to - from == n && c.range().0 <= a
+    };
+    if holds(first, at, len) {
+        return Some(vec![Part::Copy(first.clone(), at, len)]);
+    }
+    let mut out: Vec<Part> = Vec::new();
+    let (mut a, end) = (at, at + len as u64);
+    while a < end {
+        let n = ((a | 0xffff) + 1).min(end) - a;
+        let copy = if holds(first, a, n as usize) {
+            Some(first.clone())
+        } else {
+            owner_of(a, n, copies.iter().map(|c| c.range())).map(|k| copies[k].clone())
+        };
+        match copy {
+            Some(c) => match out.last_mut() {
+                Some(Part::Copy(last, from, bytes)) if Arc::ptr_eq(last, &c) && *from + *bytes as u64 == a => *bytes += n as usize,
+                _ => out.push(Part::Copy(c, a, n as usize)),
+            },
+            None => out.push(Part::Arena(a, arena(a, n as usize).filter(|b| b.len() == n as usize)?)),
+        }
+        a += n;
+    }
+    Some(out)
+}
+
+/// `[at, at + len)` as the arena holds it, if it holds the page.
+fn arena_bytes(at: u64, len: usize) -> Option<Vec<u8>> {
+    let page = at & !0xffff;
+    let (_, bytes) = crate::arena::fetch(&[page]).into_iter().next()?;
+    let o = (at - page) as usize;
+    bytes.get(o..o + len).map(<[u8]>::to_vec)
+}
 
 /// [`back`] at `level` among `copies`: what was done, the addresses put
 /// and those not put.
 fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (Stats, Vec<u64>, Vec<u64>) {
+    back_with(level, pairs, copies, &arena_bytes)
+}
+
+/// [`back_at`] with the arena's bytes from `arena`.
+fn back_with(
+    level: u8,
+    pairs: &[(u64, u64, bool)],
+    copies: &[Arc<Shadow>],
+    arena: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+) -> (Stats, Vec<u64>, Vec<u64>) {
     let mut s = Stats::default();
     let (mut put, mut not) = (Vec::new(), Vec::new());
     // Each destination once (a structure has a bind per stage); a list that
@@ -298,7 +395,14 @@ fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (St
             _ => None,
         });
         match unpacked {
-            Some((i, len)) => chosen.push((asked[k + i].0.clone(), at, len, title, heads[k + i].map_or(0, |gpu| gpu[12]))),
+            Some((i, len)) => match parts(&asked[k + i].0, at, len, copies, arena) {
+                Some(p) => chosen.push((p, at, len, title, heads[k + i].map_or(0, |gpu| gpu[12]))),
+                // A part of it in no copy and not in the arena.
+                None => {
+                    s.unknown += 1;
+                    not.push(at);
+                }
+            },
             None => {
                 match judged[0] {
                     Head::Packed => s.packed += 1,
@@ -313,9 +417,13 @@ fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (St
     // Of copies in the GPU's memory the structures come down, in one fetch.
     let fetch: Vec<(&Shadow, usize, usize)> = chosen
         .iter()
-        .map(|(c, at, len, ..)| {
-            let (from, to) = c.offsets(*at as usize, *len);
-            (&**c, from, to)
+        .flat_map(|(parts, ..)| parts)
+        .filter_map(|part| match part {
+            Part::Copy(c, at, len) => {
+                let (from, to) = c.offsets(*at as usize, *len);
+                Some((&**c, from, to))
+            }
+            Part::Arena(..) => None,
         })
         .collect();
     crate::host::card_fetch(&fetch);
@@ -323,14 +431,7 @@ fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (St
     let mut before = PUT.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     let mut roots: Vec<(Arc<Shadow>, u64, u32)> = Vec::new();
-    for (copy, at, len, title, root) in chosen {
-        // A structure that does not lie in the copy whole is left alone.
-        let (from, to) = copy.offsets(at as usize, len);
-        if to - from != len {
-            s.unknown += 1;
-            not.push(at);
-            continue;
-        }
+    for (parts, at, len, title, root) in chosen {
         // Title memory must still hold the header that was judged: the
         // fetch above is a round trip to the GPU while the title runs, and
         // what it wrote there meanwhile (another structure) stays.
@@ -349,7 +450,20 @@ fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (St
             }
             Some(_) => {}
         }
-        let (bytes, all) = copy.put_range(at as usize, len);
+        // The last part first, the header's last: a part that cannot be
+        // written leaves the header as it was.
+        let (mut bytes, mut all) = (0, true);
+        for part in parts.iter().rev() {
+            let (n, ok) = match part {
+                Part::Copy(copy, from, n) => copy.put_range(*from as usize, *n),
+                Part::Arena(from, held) => crate::shadow::put_bytes(*from as usize, held),
+            };
+            bytes += n;
+            all &= ok;
+            if !ok {
+                break;
+            }
+        }
         if !all {
             s.failed += 1;
             not.push(at);
@@ -372,9 +486,12 @@ fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (St
         #[cfg(feature = "diagnostics")]
         if root & 7 == 5 {
             let end = (u64::from(root & !7) << 3) + 112;
-            if end > len as u64 && end <= len as u64 + 64 {
+            if end > len as u64
+                && end <= len as u64 + 64
+                && let Some(Part::Copy(copy, ..)) = parts.last()
+            {
                 s.past += 1;
-                roots.push((copy, at + len as u64, (end - len as u64) as u32));
+                roots.push((copy.clone(), at + len as u64, (end - len as u64) as u32));
             }
         }
         #[cfg(not(feature = "diagnostics"))]
@@ -672,6 +789,107 @@ mod tests {
         assert_eq!((s.other, s.put), (1, 0), "{s:?}");
         assert_eq!((title_dword(p + AT), title_dword(p + AT + 8), title_byte(p + AT + 64)), (0x8102_0006, ID + 1, 0x11), "the title's structure stays");
         unregister(p, p as u64);
+    }
+
+    /// Fable (BVH proof, capture C1: three bottom levels of 5.3-5.6 MB stayed
+    /// packed, each over two 4 MiB copies): a structure that lies in two
+    /// copies goes into title memory whole, each page's part from the copy
+    /// the page table names for it, and nothing beside it does.
+    #[test]
+    fn a_structure_over_two_copies_goes_back_whole() {
+        let pages = 6;
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        fill(p, len);
+        let half = 3 * PAGE;
+        register(p, p as u64, half as u64);
+        register(p + 1, (p + half) as u64, half as u64);
+        let (Some(a), Some(b)) = (find(p as u64, half as u64), find((p + half) as u64, half as u64)) else {
+            unregister(p + 1, (p + half) as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        // 16 units from 0x200 before the second copy: 8 in each.
+        let units = 16u32;
+        let at = p + half - 0x200;
+        let head = header(0x8102_0006, units, ID);
+        // SAFETY: bytes of the test's memory, not guarded yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes_of(&head).as_ptr(), at as *mut u8, 64) };
+        a.update(p, half);
+        b.update(p + half, half);
+        a.write_host(at as u64, &bytes_of(&header(0x8002_0006, units, ID)));
+        a.write_host(at as u64 + 64, &vec![0x22; 0x200 - 64]);
+        b.write_host((p + half) as u64, &vec![0x33; 0x200]);
+        // Something else of the builder's right after the structure.
+        b.write_host((p + half + 0x200) as u64, &[0x77]);
+        let copies = [a.clone(), b.clone()];
+        let (s, put, not) = back_at(1, &[(at as u64, at as u64, false)], &copies);
+        assert_eq!((s.put, s.unknown, put, not), (1, 0, vec![at as u64], vec![]), "{s:?}");
+        assert_eq!(title_dword(at), 0x8002_0006, "the header unpacked");
+        assert!((at + 64..p + half).all(|x| title_byte(x) == 0x22), "the first copy's part");
+        assert!((p + half..p + half + 0x200).all(|x| title_byte(x) == 0x33), "the second copy's part");
+        assert_eq!((title_byte(at - 1), title_byte(p + half + 0x200)), (0x11, 0x11), "nothing beside the structure");
+        PUT.lock().unwrap().remove(&(at as u64));
+        unregister(p + 1, (p + half) as u64);
+        unregister(p, p as u64);
+    }
+
+    /// A structure whose end lies in no copy: with the arena holding those
+    /// pages their bytes go back from there; with nothing holding them the
+    /// structure stays out whole (its header stays packed in title memory).
+    #[test]
+    fn a_part_in_no_copy_comes_from_the_arena_or_keeps_the_structure_out() {
+        let pages = 6;
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        fill(p, len);
+        let half = 3 * PAGE;
+        register(p, p as u64, half as u64);
+        let Some(a) = find(p as u64, half as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let units = 16u32;
+        let at = p + half - 0x200;
+        // SAFETY: bytes of the test's memory, not guarded yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes_of(&header(0x8102_0006, units, ID)).as_ptr(), at as *mut u8, 64) };
+        a.update(p, half);
+        a.write_host(at as u64, &bytes_of(&header(0x8002_0006, units, ID)));
+        a.write_host(at as u64 + 64, &vec![0x22; 0x200 - 64]);
+        let copies = std::slice::from_ref(&a);
+        let title: Vec<u8> = (0..len).map(|o| title_byte(p + o)).collect();
+        // Nothing holds the second half.
+        let (s, put, not) = back_with(1, &[(at as u64, at as u64, false)], copies, &|_, _| None);
+        assert_eq!((s.put, s.unknown, put, not), (0, 1, vec![], vec![at as u64]), "{s:?}");
+        assert!((0..len).all(|o| title_byte(p + o) == title[o]), "title memory written");
+        // The arena holds it (a page of 0x44).
+        let asked = std::cell::RefCell::new(Vec::new());
+        let arena = |page: u64, n: usize| {
+            asked.borrow_mut().push((page, n));
+            Some(vec![0x44; n])
+        };
+        let (s, put, _) = back_with(1, &[(at as u64, at as u64, false)], copies, &arena);
+        assert_eq!((s.put, put), (1, vec![at as u64]), "{s:?}");
+        assert_eq!(*asked.borrow(), vec![((p + half) as u64, 0x200)]);
+        assert_eq!((title_dword(at), title_byte(at + 64)), (0x8002_0006, 0x22));
+        assert!((p + half..p + half + 0x200).all(|x| title_byte(x) == 0x44), "the arena's part");
+        assert_eq!(title_byte(p + half + 0x200), 0x11, "nothing past the structure");
+        PUT.lock().unwrap().remove(&(at as u64));
+        unregister(p, p as u64);
+    }
+
+    /// The copy the page table names for a page: the smallest one holding
+    /// the whole page, else the largest holding the bytes asked for
+    /// (`crate::memory`'s rule).
+    #[test]
+    fn a_pages_copy_is_the_smallest_holding_it_whole() {
+        let ranges = [(0x10_0000u64, 0x80_0000u64), (0x10_0000, 0x40_0000), (0x50_0000, 0x40_0000), (0x90_8000, 0x1_0000)];
+        let pick = |at: u64, n: u64| owner_of(at, n, ranges.iter().copied());
+        assert_eq!(pick(0x10_0100, 0x100), Some(1), "the 4 MiB copy before the 8 MiB one over it");
+        assert_eq!(pick(0x50_0000, 0x1_0000), Some(2));
+        assert_eq!(pick(0x90_8000, 0x100), Some(3), "a part of the page: the only holder");
+        assert_eq!(pick(0x90_7f00, 0x100), None);
+        assert_eq!(pick(0xa0_0000, 0x100), None);
     }
 
     /// The title wrote another structure there after its header was looked

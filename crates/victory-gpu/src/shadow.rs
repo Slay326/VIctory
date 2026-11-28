@@ -2216,6 +2216,36 @@ impl Arena {
     }
 }
 
+/// `bytes` go into title memory at `at` where they differ from what is
+/// there, by 32-byte lines, each 64 KiB page's part on its own
+/// (`crate::unpacked`: the part of a structure the GPU rewrote in place
+/// that no copy holds, the arena's bytes). Written at the title's address:
+/// a guard there opens as for any write of ours. Returns the bytes of the
+/// lines written, and whether every part could be read and written.
+pub(crate) fn put_bytes(at: usize, bytes: &[u8]) -> (usize, bool) {
+    let (mut written, mut all) = (0, true);
+    TITLE.with(|title| {
+        let mut title = title.borrow_mut();
+        let mut o = 0;
+        while o < bytes.len() {
+            let a = at + o;
+            let n = (PAGE - a % PAGE).min(bytes.len() - o);
+            let host = &bytes[o..o + n];
+            let title = &mut title[..n];
+            o += n;
+            if !crate::host::read_into(a as *const u8, title) {
+                all = false;
+                continue;
+            }
+            let runs = differing_rows(host, title);
+            if write_runs_by(a, host, &runs, None) != Put::Nothing {
+                written += runs.iter().map(|r| r.1 - r.0).sum::<usize>();
+            }
+        }
+    });
+    (written, all)
+}
+
 /// The 64 bytes at each title address as shaders left them in the copy
 /// beside it (`crate::unpacked`, after a submission): of copies in the
 /// GPU's memory fetched from there, all in one fetch, their CPU sides left
