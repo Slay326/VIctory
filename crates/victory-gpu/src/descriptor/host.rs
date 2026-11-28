@@ -1206,9 +1206,8 @@ fn acceleration_addresses() -> bool {
 fn address_entry(view: &View, acceleration: bool) -> [u32; 4] {
     match acceleration_address(view) {
         Some(address) if acceleration => address_words(address),
-        // Not a texture, and no buffer of the title's to take as one.
-        Some(_) => [0; 4],
-        None => texture_words(view)
+        // Switched off, such a view is entered as any other, as before.
+        _ => texture_words(view)
             .unwrap_or_else(|| address_words(buffer_range(view).map_or(0, |(a, _)| a))),
     }
 }
@@ -2460,6 +2459,16 @@ mod tests {
             assert_eq!(address_entry(&view, true), words);
             assert_eq!(address_entry(&view, false), [0; 4], "VICTORY_AS_SRV_ADDRESS=0");
         }
+        // Switched off, a view of this dimension is entered as before the
+        // location was: over a texture's memory, the texture's words.
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4], resource[6], resource[7], resource[9]) = (3, 64, 32, 1 | 1 << 16, 1);
+        let mut placed = [0u32; 16];
+        (placed[1], placed[2], placed[4]) = (11, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0x5f20_7000);
+        let view = View::Placed(false, resource, placed);
+        assert_eq!(address_entry(&view, true), address_words(0x5f20_7000));
+        assert_eq!(Some(address_entry(&view, false)), texture_words(&view), "VICTORY_AS_SRV_ADDRESS=0: as before");
+        assert_ne!(address_entry(&view, false), [0; 4]);
         // Other views without a resource stay 0.
         let mut desc = [0u32; 10];
         (desc[1], desc[2], desc[4], desc[6]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0x5f20_7000, 16);
