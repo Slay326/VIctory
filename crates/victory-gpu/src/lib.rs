@@ -19,6 +19,8 @@
 #[cfg(windows)]
 mod arena;
 #[cfg(windows)]
+mod arena_scan;
+#[cfg(windows)]
 mod bindless;
 #[cfg(windows)]
 mod bvh_gt;

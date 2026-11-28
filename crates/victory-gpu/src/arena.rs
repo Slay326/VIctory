@@ -330,6 +330,21 @@ struct Stats {
     /// found in them (pages).
     scanned: u64,
     found: u64,
+    /// Input scans due (builder submissions), and of them with nothing to
+    /// gain ([`crate::arena_scan::idle`]): left out with
+    /// `VICTORY_ARENA_SCAN=1`.
+    scans_due: u64,
+    scans_idle: u64,
+    /// Check mode (`VICTORY_ARENA_SCAN=2`), of the scans with nothing to
+    /// gain: pages they prepared, of those given a slot (what leaving the
+    /// scan out would miss: none, a stopped arena refuses them), pages they
+    /// learnt hold nothing or no title memory, and prepared pages that
+    /// would have taken a slot back had the scan not taken them out of the
+    /// pages asked for.
+    idle_prepared: u64,
+    idle_given: u64,
+    idle_learnt: u64,
+    idle_held_back: u64,
 }
 
 struct Arena {
@@ -803,11 +818,23 @@ fn region_has_memory(l1: usize) -> bool {
     false
 }
 
-/// Reads title memory `[from, from + dst.len())` into `dst`, 4 KiB at a
-/// time; pieces that cannot be read stay zero.
+/// Reads title memory `[from, from + dst.len())` into `dst`; 4 KiB pieces
+/// that cannot be read stay zero ([`read_pieces`]).
 fn read_title(from: u64, dst: &mut [u8]) {
+    read_pieces(from, dst, |at, piece| crate::host::read_into(at as *const u8, piece));
+}
+
+/// Reads `[from, from + dst.len())` with `read` in one call, and only if
+/// that fails 4 KiB at a time, pieces that cannot be read zero: the same
+/// bytes as 4 KiB at a time always (a range reads whole only if each of its
+/// pieces does), at one system call instead of one per 4 KiB (the builder's
+/// input scan read ~145 MB a frame in 4 KiB calls, run s110-B).
+fn read_pieces(from: u64, dst: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> bool) {
+    if dst.is_empty() || read(from, dst) {
+        return;
+    }
     for (k, piece) in dst.chunks_mut(4096).enumerate() {
-        if !crate::host::read_into((from + 4096 * k as u64) as *const u8, piece) {
+        if !read(from + 4096 * k as u64, piece) {
             piece.fill(0);
         }
     }
@@ -887,8 +914,26 @@ pub(crate) fn provide() {
     // where committed title memory no copy holds lies. Its first run read
     // zeros there and its stages looped for seconds (runs 131349-133206).
     let builder = std::mem::take(&mut a.builder_now);
+    // Check mode: where in `first` the pages of a scan with nothing to gain
+    // start.
+    let mut idle_from: Option<usize> = None;
+    let scan_mode = crate::arena_scan::mode();
+    let idle = builder && crate::arena_scan::idle(a.stopped.is_some(), reads_most() > 0);
     if builder {
+        a.stats.scans_due += 1;
+        a.stats.scans_idle += u64::from(idle);
+    }
+    // The scan only asks for slots (and keeps what the lists point at for
+    // `VICTORY_BVH_ARENA_REFRESH_READS`): no byte of an input list reaches
+    // the GPU through it. A stopped arena refuses every page it finds
+    // (run s132-B2: 351,122 refused, none given, in 1,161 frames after the
+    // stop, at 74-112 ms a frame), so `VICTORY_ARENA_SCAN=1` leaves it out
+    // then. Pages the builder misses still come through `want_pages`.
+    if builder && crate::arena_scan::scans(scan_mode, idle) {
         let found = scan_inputs(a);
+        let known = a.nothing.len() + a.not_title.len();
+        let check = idle && scan_mode == crate::arena_scan::Mode::Check;
+        let from = first.len();
         for page in found {
             for p in page..page + PREPARED_PAGES {
                 if a.dir.get(p).is_some() || a.nothing.contains(&p) || a.not_title.contains(&p) {
@@ -900,7 +945,9 @@ pub(crate) fn provide() {
                 }
                 match memory_at(p * PAGE) {
                     m @ Memory::Committed(..) => {
-                        wanted.remove(&p);
+                        if wanted.remove(&p) && check && evict_on() && a.misses.get(&p).is_some_and(|e| e.0 >= persist_frames()) {
+                            a.stats.idle_held_back += 1;
+                        }
                         first.push((p, m));
                     }
                     _ => {
@@ -909,6 +956,11 @@ pub(crate) fn provide() {
                     }
                 }
             }
+        }
+        if check {
+            a.stats.idle_prepared += (first.len() - from) as u64;
+            a.stats.idle_learnt += (a.nothing.len() + a.not_title.len() - known) as u64;
+            idle_from = Some(from);
         }
     }
     // Committed memory first, then reserved (zero pages): addresses computed
@@ -990,6 +1042,7 @@ pub(crate) fn provide() {
             Ok((slot, _)) => {
                 if k < around_pages {
                     a.stats.around += 1;
+                    a.stats.idle_given += u64::from(idle_from.is_some_and(|from| k >= from));
                 } else {
                     given += 1;
                     a.faults += 1;
@@ -1128,8 +1181,9 @@ fn evict_for_persistent(a: &mut Arena, wanted: Vec<(u64, Memory)>, fills: &mut V
         a.watched.remove(&old);
         a.unwatched.remove(&old);
         a.sent.remove(&old);
-        let Ok((slot, _)) = a.dir.add(page) else { continue };
+        // With the removal: the page tables go by it, also if the add fails.
         a.generation += 1;
+        let Ok((slot, _)) = a.dir.add(page) else { continue };
         a.stats.evicted += 1;
         if let Memory::Committed(base, watched) = memory {
             if watched {
@@ -1522,6 +1576,23 @@ pub(crate) fn log_frame() {
     let s = std::mem::take(&mut a.stats);
     a.faults = 0;
     let no_room = a.no_room.take();
+    let scan_mode = crate::arena_scan::mode();
+    if scan_mode != crate::arena_scan::Mode::Full && s.scans_due > 0 {
+        let check = scan_mode == crate::arena_scan::Mode::Check;
+        tracing::info!(
+            target: "victory_gpu::arena",
+            "BVH arena input scan this frame (VICTORY_ARENA_SCAN={}): due {}, with nothing to gain (arena stopped) {} ({}); \
+             check: those prepared {} pages -> given a slot {} (missed by leaving them out), learnt as no memory or no title memory {}, kept from taking a slot back {}",
+            if check { 2 } else { 1 },
+            s.scans_due,
+            s.scans_idle,
+            if check { "made, check mode" } else { "left out" },
+            s.idle_prepared,
+            s.idle_given,
+            s.idle_learnt,
+            s.idle_held_back,
+        );
+    }
     if s.asked + s.filled + s.zero + s.refused + s.nothing + s.regions + s.writes + s.refreshed + s.around_runs + s.scanned == 0 {
         return;
     }
@@ -1725,5 +1796,119 @@ pub(crate) mod tests {
             VirtualFree(committed as *mut _, 0, MEM_RELEASE);
         }
         assert_eq!(memory_at(reserved), Memory::Free);
+    }
+
+    /// The old reading, 4 KiB at a time (reference).
+    fn read_4k(from: u64, dst: &mut [u8], mut read: impl FnMut(u64, &mut [u8]) -> bool) {
+        for (k, piece) in dst.chunks_mut(4096).enumerate() {
+            if !read(from + 4096 * k as u64, piece) {
+                piece.fill(0);
+            }
+        }
+    }
+
+    /// Memory where some 4 KiB pages cannot be read (a call touching one
+    /// fails after copying the bytes before it, as ReadProcessMemory may),
+    /// counting calls.
+    fn memory_model(bad: &[u64]) -> impl FnMut(u64, &mut [u8]) -> bool + '_ {
+        move |at: u64, dst: &mut [u8]| {
+            for (i, b) in dst.iter_mut().enumerate() {
+                let x = at + i as u64;
+                if bad.contains(&(x / 4096)) {
+                    return false;
+                }
+                *b = (x.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8;
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn a_range_read_whole_gives_the_bytes_of_4k_reads() {
+        // Aligned and unaligned starts, lengths of a piece, less, more, and
+        // with unreadable pages at the start, inside and at the end.
+        let base = 0x7_0000_0000u64;
+        let bads: [&[u64]; 4] = [&[], &[base / 4096 + 1], &[base / 4096], &[base / 4096 + 5, base / 4096 + 6]];
+        for bad in bads {
+            for from in [base, base + 8, base + 4095, base + 4096 * 3 + 100] {
+                for len in [0usize, 1, 4096, 4097, 3 * 4096 + 5, 6 * 4096] {
+                    let (mut new, mut old) = (vec![0xaau8; len], vec![0xaau8; len]);
+                    let mut calls = 0;
+                    let mut model = memory_model(bad);
+                    read_pieces(from, &mut new, |at, d| {
+                        calls += 1;
+                        model(at, d)
+                    });
+                    read_4k(from, &mut old, memory_model(bad));
+                    assert_eq!(new, old, "from {from:#x} len {len} bad {bad:?}");
+                    let touches_bad = (from / 4096..(from + len as u64).div_ceil(4096)).any(|p| bad.contains(&p));
+                    if len > 0 && !touches_bad {
+                        assert_eq!(calls, 1, "one call for a readable range");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Micro-benchmark (`--ignored --nocapture`, exclusive slot): 64 MiB
+    /// of write-watched committed memory read in 4 MiB buffers as the
+    /// input scan does, 4 KiB at a time against whole; the scan's qword
+    /// loop over zeros; `memory_at` per 64 KiB page.
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn bench_reads_and_queries() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const TOTAL: usize = 64 << 20;
+        // SAFETY: a fresh allocation, ours.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as u64;
+        assert_ne!(at, 0);
+        // SAFETY: inside it.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0x11, TOTAL) };
+        let mut buffer = vec![0u8; 4 << 20];
+        let read = |a: u64, d: &mut [u8]| crate::host::read_into(a as *const u8, d);
+        let time = |f: &mut dyn FnMut()| {
+            let mut best = f64::MAX;
+            let mut all = Vec::new();
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                f();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                all.push(ms);
+                best = best.min(ms);
+            }
+            all.sort_by(f64::total_cmp);
+            (best, all[all.len() / 2])
+        };
+        let (b4, m4) = time(&mut || {
+            for k in 0..TOTAL / buffer.len() {
+                read_4k(at + (k * buffer.len()) as u64, &mut buffer, read);
+            }
+        });
+        let (bw, mw) = time(&mut || {
+            for k in 0..TOTAL / buffer.len() {
+                read_pieces(at + (k * buffer.len()) as u64, &mut buffer, read);
+            }
+        });
+        let mut hits = 0u64;
+        let (bl, ml) = time(&mut || {
+            for k in 0..TOTAL / buffer.len() {
+                for q in buffer.as_chunks::<8>().0 {
+                    let v = u64::from_le_bytes(*q);
+                    if (1..256).contains(&(v >> 32)) && v & 0xff == 0 {
+                        hits += 1;
+                    }
+                }
+                std::hint::black_box(k);
+            }
+        });
+        let pages = (TOTAL as u64 / PAGE) as usize;
+        let (bq, mq) = time(&mut || {
+            for k in 0..pages {
+                std::hint::black_box(memory_at(at + k as u64 * PAGE));
+            }
+        });
+        println!("BENCH64MiB read_4k best {b4:.3} median {m4:.3} ms; read_whole best {bw:.3} median {mw:.3} ms; qword_loop best {bl:.3} median {ml:.3} ms (hits {hits}); memory_at x{pages} best {bq:.3} median {mq:.3} ms");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 }
