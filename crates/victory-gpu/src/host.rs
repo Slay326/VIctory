@@ -1179,7 +1179,8 @@ struct Deferred {
     #[cfg(feature = "diagnostics")]
     reader: Vec<crate::bvh_replay::reader::Recorded>,
     #[cfg(feature = "diagnostics")]
-    bvh_bitmaps: Vec<Box<dyn Fn() -> (usize, Vec<u32>) + Send>>,    /// A UAV barrier was recorded since the last recorded dispatch.
+    bvh_bitmaps: Vec<Box<dyn Fn() -> (usize, Vec<u32>) + Send>>,
+    /// A UAV barrier was recorded since the last recorded dispatch.
     #[cfg(feature = "diagnostics")]
     bvh_barrier: bool,
 }

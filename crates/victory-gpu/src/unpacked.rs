@@ -95,19 +95,6 @@ pub(crate) fn pair(name: &str, values: &[u32]) -> Option<(u64, u64)> {
     (header(source) && header(destination)).then_some((source, destination))
 }
 
-/// The 64 KiB pages of a structure of `units` 64-byte units at `at` past
-/// its header's page (none for one that is no bottom level's size): what
-/// must be held, by a copy or the arena, before its stages run. (Asking the
-/// arena for them at the bind with `want_around` did not give them: run
-/// 20261128-113540, five structures of 4.8-5.8 MB still ended in memory
-/// nothing held; the arena gives one window a committed run.)
-#[cfg(test)]
-fn pages_past_header(at: u64, units: u32) -> impl Iterator<Item = u64> {
-    let end = if (1..=MOST).contains(&units) { at + u64::from(units) * 64 } else { at };
-    let first = (at | 0xffff) + 1;
-    (first..end.max(first)).step_by(0x1_0000)
-}
-
 /// Header dword 0, bit 24: the structure is still packed.
 const PACKED: u32 = 1 << 24;
 /// The most 64-byte units a structure put back has (64 MiB).
@@ -521,7 +508,7 @@ fn back_with(
             }
         }
         #[cfg(not(feature = "diagnostics"))]
-        let _ = root;
+        let _ = (root, len);
     }
     drop(before);
     // Once every structure is put (the next one's header may lie there):
@@ -902,22 +889,6 @@ mod tests {
         assert_eq!(title_byte(p + half + 0x200), 0x11, "nothing past the structure");
         PUT.lock().unwrap().remove(&(at as u64));
         unregister(p, p as u64);
-    }
-
-    /// The pages asked of the arena before a structure is unpacked: all
-    /// past its header's page to its end, none for a small one or a size
-    /// that is none.
-    #[test]
-    fn the_pages_past_a_structures_header() {
-        let pages = |at: u64, units: u32| pages_past_header(at, units).collect::<Vec<_>>();
-        // Run 111102: 0x772000100, 0x1568c units: to 0x77255a400.
-        let big = pages(0x7_7200_0100, 0x1_568c);
-        assert_eq!((big.len(), big[0], big[big.len() - 1]), (0x55, 0x7_7201_0000, 0x7_7255_0000));
-        assert_eq!(pages(0x7_7200_0100, 3), Vec::<u64>::new(), "within its header's page");
-        assert_eq!(pages(0x7_7200_ff80, 3), vec![0x7_7201_0000], "64 bytes over the page's end");
-        assert_eq!(pages(0x7_7200_ff80, 2), Vec::<u64>::new(), "ends with the page");
-        assert_eq!(pages(0x7_7200_0100, 0), Vec::<u64>::new());
-        assert_eq!(pages(0x7_7200_0100, MOST + 1), Vec::<u64>::new());
     }
 
     /// The copy the page table names for a page: the smallest one holding

@@ -261,6 +261,12 @@ impl State {
         self.pipeline
     }
 
+    /// The bound pipeline (the title's object).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pipeline(&self) -> usize {
+        self.pipeline
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -331,12 +337,6 @@ impl State {
     /// title list's own), texture states and twins (each segment has its
     /// own, made from the real states at its submission). Clears and copies
     /// are commands, recorded once in the segment they belong to.
-    /// The bound pipeline (the title's object).
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn pipeline(&self) -> usize {
-        self.pipeline
-    }
-
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
