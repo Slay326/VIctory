@@ -441,6 +441,13 @@ struct Own {
     count: u32,
 }
 
+/// The byte offset of the parent link of the box node at `slot` in a
+/// structure with header dwords 13 and 14, as the program computes it in
+/// 32 bits (0x4f8-0x554).
+fn parent_entry(slot: u32, d13: u32, d14: u32) -> u32 {
+    slot.wrapping_sub(d13 >> 6).wrapping_add(d14 >> 2) << 2
+}
+
 /// A structure's node address.
 fn node(base: u64, pointer: u32) -> u64 {
     base + u64::from((pointer & 0x1fff_ffff) >> 3) * 64
@@ -1003,9 +1010,12 @@ impl<'m, M: Memory> Scene<'m, M> {
                 stack.extend(children);
             }
         }
+        // As the program computes it (0x4f8-0x554), in 32 bits: unpacked
+        // bottom levels hold a negative dword 14 (capture C1: 0xfffffec0
+        // with dword 13 = 0x180), which wraps to a table between the header
+        // and the first node, for the box nodes at the structure's end.
         let table = |slot: u32, base: u64, header: &[u32; 16]| -> Option<u32> {
-            let index = u64::from(slot).wrapping_sub(u64::from(header[13] >> 6));
-            self.m.word(base.wrapping_add(u64::from(header[14])).wrapping_add(index.wrapping_mul(4)))
+            self.m.word(base + u64::from(parent_entry(slot, header[13], header[14])))
         };
         for &p in order.iter().rev() {
             let Some((children, b)) = boxes(self.m, self.base, p) else { continue };
@@ -1107,10 +1117,14 @@ impl<'m, M: Memory> Scene<'m, M> {
                         None
                     };
                     let set = if child & 4 == 0 { &mut c.leaf_box } else { &mut c.bottom_box };
+                    let before = (set.small, set.empty);
                     match inner {
                         _ if !bx[k].proper() => set.empty += 1,
                         Some(inner) if inner.proper() => set.count(bx[k].short(&inner), || format!("node {child:#x} of {:#x}", b.base)),
                         _ => set.unknown += 1,
+                    }
+                    if before != (set.small, set.empty) {
+                        *c.unsound_bottoms.entry(format!("{:#x} marks {:#x}", b.base, b.marks)).or_default() += 1;
                     }
                 }
                 holds.insert(p & 0x1fff_ffff, all);
@@ -1227,6 +1241,9 @@ pub struct Check {
     /// The instances whose box is empty or too small, by what their
     /// bottom level is like.
     pub unsound_instances: BTreeMap<String, u32>,
+    /// The bottom levels with a box that is empty or too small: how many
+    /// such boxes each.
+    pub unsound_bottoms: BTreeMap<String, u32>,
 }
 
 impl Check {
@@ -1283,7 +1300,8 @@ impl std::fmt::Display for Check {
             "  transformations agreeing with dwords 0-11: {}, not {}, without a matrix {}",
             self.transform.0, self.transform.1, self.transform.2
         )?;
-        write!(f, "  instances with an empty or too small box, by bottom level: {:?}", self.unsound_instances)
+        writeln!(f, "  instances with an empty or too small box, by bottom level: {:?}", self.unsound_instances)?;
+        write!(f, "  bottom levels with empty or too small boxes ({}): {:?}", self.unsound_bottoms.len(), self.unsound_bottoms)
     }
 }
 
@@ -1932,6 +1950,17 @@ mod tests {
         // Looking down from above wall 0: met from the other side at 4.
         assert_eq!(s.nearest([3.3, 3.4, 9.0], [0.0, 0.0, -1.0], 1000.0).map(|h| h.0), Some(4.0));
         assert_eq!(s.nearest([3.3, 3.4, 9.0], [0.0, 0.0, -1.0], 3.9), None);
+    }
+
+    /// The parent table's entry as the program reads it, in 32 bits: a
+    /// top level's from +0x40 (dword 13 the list's offset), an unpacked
+    /// bottom level's with a negative dword 14 (capture C1, 0xc3de80100:
+    /// dword 13 = 0x180, dword 14 = 0xfffffec0, root at slot 0x9d).
+    #[test]
+    fn the_parent_table_entry_wraps_as_the_program_reads_it() {
+        assert_eq!(parent_entry(0x1070, 0x11580, 0x40), 0x40 + 4 * (0x1070 - 0x456));
+        assert_eq!(parent_entry(0x9d, 0x180, 0xffff_fec0), 0x11c);
+        assert_eq!(parent_entry(0x66, 0x180, 0xffff_fec0), 0x40);
     }
 
     /// Triangles: both sides count, the extent's end does not, an edge is
