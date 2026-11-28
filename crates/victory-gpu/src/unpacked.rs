@@ -231,6 +231,10 @@ fn title_head(at: u64) -> Option<[u32; 16]> {
     crate::host::read_into(at as *const u8, bytes).then_some(title)
 }
 
+/// A structure to put: its copy, address and bytes, title memory's header
+/// as judged, and the copy's root pointer (dword 12).
+type Chosen = (Arc<Shadow>, u64, usize, [u32; 16], u32);
+
 /// [`back`] at `level` among `copies`: what was done, the addresses put
 /// and those not put.
 fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (Stats, Vec<u64>, Vec<u64>) {
@@ -277,7 +281,7 @@ fn back_at(level: u8, pairs: &[(u64, u64, bool)], copies: &[Arc<Shadow>]) -> (St
     let heads = crate::shadow::gpu_heads(&asked);
     // Per structure, the first copy that holds it unpacked over the same
     // structure in title memory; else what the first copy says.
-    let mut chosen: Vec<(Arc<Shadow>, u64, usize, [u32; 16], u32)> = Vec::new();
+    let mut chosen: Vec<Chosen> = Vec::new();
     let mut k = 0;
     while k < asked.len() {
         let at = asked[k].1;
